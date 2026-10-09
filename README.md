@@ -1,8 +1,9 @@
 # Sound Maps (Clearwater)
 
-**Not for navigation.** Sound Maps is a navigation aid for Puget Sound commercial
-fishermen that shows where the bars, flats and channels are today, not where the
-chart said they were at the last survey. It combines public survey data (USGS, NOAA,
+**Not for navigation.** Sound Maps is a situational-awareness overlay for Puget Sound
+commercial fishermen. It is not a navigation device and not a chart. It shows where
+the bars, flats and channels are today, not where the chart said they were at the
+last survey. It combines public survey data (USGS, NOAA,
 USACE) into an offline-first baseline, adds a waterline elevation map built from
 tide-tagged Sentinel-2 passes, and layers a fleet depth and hazard reporting system
 with explicit secrecy tiers: hazards are shared, measurements are shared without
@@ -36,9 +37,11 @@ pytest tests -q
 
 **Mobile (Expo / TypeScript)**
 
+`npm ci` requires a committed `package-lock.json`. Until lockfiles land, use `npm install`.
+
 ```sh
 cd apps/mobile
-npm ci
+npm ci        # or: npm install, until package-lock.json is committed
 npx tsc --noEmit
 npx jest --ci
 ```
@@ -71,6 +74,7 @@ npm test
 ## Data attribution
 
 - Depth and elevation data from USGS, NOAA and USACE are US federal works in the public domain. Sources are cited in the app's data page.
+- Washington State DNR data (CoNED MLLW conversion, Washington Lidar Portal projects) is not federal and carries its own terms; see docs/DATA-LICENSES.md.
 - Contains modified Copernicus Sentinel data [2026]. Sentinel-2 imagery is provided under the Copernicus license.
 - Map data &copy; OpenStreetMap contributors, available under the Open Database License (ODbL).
 

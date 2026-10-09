@@ -18,7 +18,8 @@ permissions:
 
 concurrency:
   group: mobile-ci-${{ github.ref }}
-  cancel-in-progress: true
+  # Never cancel runs on main so every merged commit gets a full result.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   typecheck-and-test:
@@ -36,7 +37,8 @@ jobs:
         with:
           node-version: "22"
 
-      # Use npm ci when a lockfile is committed; otherwise fall back to npm install.
+      # TODO: switch to strict `npm ci` (fail when no lockfile) once
+      # apps/mobile/package-lock.json is committed.
       - name: Install dependencies
         run: |
           if [ -f package-lock.json ]; then

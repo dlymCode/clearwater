@@ -11,16 +11,36 @@ __pycache__/
 .pytest_cache/
 *.pyc
 
+# Python environments and caches
+.venv/
+venv/
+*.egg-info/
+.mypy_cache/
+.ruff_cache/
+
 # Secrets and environment
 .env
 .env.*
 !.env.example
+.dev.vars
+*.p8
+*.p12
+*.pem
+*.keystore
+*.jks
+*.mobileprovision
+google-services.json
 
-# Pipeline data (downloads, intermediate rasters, tiles)
-data/
+# Pipeline data (downloads, intermediate rasters, tiles); anchored so
+# legitimate data/ directories elsewhere (e.g. supabase/seed/data) stay tracked
+/data/
+/pipeline/data/
 *.tif
 *.laz
 *.pmtiles
+
+# Logs
+*.log
 
 # OS and tooling
 .DS_Store

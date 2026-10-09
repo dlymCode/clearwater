@@ -16,7 +16,8 @@ permissions:
 
 concurrency:
   group: pipeline-ci-${{ github.ref }}
-  cancel-in-progress: true
+  # Never cancel runs on main so every merged commit gets a full result.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   test:
@@ -39,5 +40,17 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements-dev.txt
 
+      # TODO: make blocking once the pipeline is ruff-clean.
+      # ruff is expected in requirements-dev.txt (pipeline owner).
+      - name: Lint (ruff)
+        continue-on-error: true
+        run: ruff check .
+
       - name: Run pytest
         run: pytest tests -q
+
+      # Validates the tiles index shape against the JSON Schema.
+      # Stays skipped until the pipeline owner commits the fixture.
+      - name: Validate tiles index schema
+        if: hashFiles('pipeline/tests/fixtures/tiles_index.example.json') != ''
+        run: python -m jsonschema -i tests/fixtures/tiles_index.example.json schemas/tiles_index.schema.json

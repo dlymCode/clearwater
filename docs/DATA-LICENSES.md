@@ -1,6 +1,6 @@
 # Data licenses and attribution
 
-Source list from PRD §Data catalog and §Legal, licensing, liability. Every source is free to use.
+Source list from PRD §Data catalog and §Legal, licensing, liability. Most sources are US federal public domain. Several state and third-party sources have reuse terms still to confirm; see Open items.
 Attribution text must appear on the app's data page and in the release notes.
 
 ## Depth and elevation
@@ -9,6 +9,7 @@ Attribution text must appear on the app's data page and in the release notes.
 | --- | --- | --- | --- | --- |
 | USGS CoNED Puget Sound TBDEM | USGS (ScienceBase; NOAA Digital Coast mirror) | US federal work, public domain | Cite source: USGS Topobathymetric Model of Puget Sound, 1887 to 2017 | NAVD88; convert to MLLW with VDatum before merge |
 | WA DNR CoNED MLLW conversion | WA DNR Nearshore Habitat Program | State agency data; confirm reuse terms with WA DNR before public release | Cite WA DNR and the USGS CoNED model it derives from | Already MLLW; still record vertical CRS metadata |
+| PSLC lidar (sub-source inside CoNED) | Puget Sound Lidar Consortium (PSLC), via the CoNED model | Terms follow the underlying CoNED and PSLC data; confirm with the CoNED publication before reuse | Cite PSLC where the CoNED source attribution lists it | Not a separate download; tracked here because CoNED integrates PSLC lidar |
 | NOAA NCEI CUDEM 1/9" | NOAA NCEI | US federal work, public domain | Cite NOAA NCEI CUDEM | NAVD88 |
 | NOAA BlueTopo | NOAA OCS | US federal work, public domain | Cite NOAA BlueTopo; retain source survey ID and date | MLLW (confirm per tile) |
 | 2014 USACE/USGS Topobathy Lidar: Puget Sound | USACE / USGS via NOAA Digital Coast | US federal work, public domain | Cite source | NAVD88 |
