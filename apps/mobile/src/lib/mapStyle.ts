@@ -1,0 +1,265 @@
+/**
+ * MapLibre style builder (pure JSON; no @maplibre imports so it can be unit-tested in node).
+ * The screen passes the result to <Map mapStyle=...> (typed there with one documented cast).
+ *
+ * Tile contract ASSUMPTIONS (flagged as open questions for the pipeline owner):
+ *  - base.pmtiles   vector. source-layers: land, DEPARE, DEPCNT, SOUNDG, COALNE, BOYLAT, LIGHTS,
+ *                   OBSTRN, WRECKS, CBLSUB, boundaries (props: region_id, kind).
+ *  - depth.pmtiles  raster Terrain-RGB, standard Mapbox formula but values are FEET MLLW (pipeline/tiles.py),
+ *                   z8-z16, tileSize 256. MapLibre treats decoded values as metres, so colour-ramp stops are
+ *                   raw feet and hillshade exaggeration is scaled by 0.3048.
+ *  - depth_meta.pmtiles  per-cell source/date/uncertainty (RGBA), NOT in index.json; sampled by the inspect
+ *                   popup, never drawn.
+ *  - waterline.pmtiles raster Terrain-RGB for elevation. TODO(pipeline): hatching needs a per-cell scene
+ *                   count; the pipeline currently masks cells with < 5 scenes entirely, so there is nothing to
+ *                   hatch yet. The rule below keys on a vector companion layer `waterline_scenes` with an
+ *                   `n` property (n < 5) and starts working once the pipeline ships counts.
+ *  - fleet.pmtiles  vector, source-layer `fleet` (H3 cell polygons) with properties median_ft, n, boats.
+ */
+import {
+  DEPTH_COLOR_RAMP_FT,
+  FLEET_MIN_BOATS,
+  TILE_ZOOM,
+  WATERLINE_MIN_SCENES,
+} from '@clearwater/shared';
+
+export interface LayerToggles {
+  depth: boolean;
+  hillshade: boolean;
+  waterline: boolean;
+  fleet: boolean;
+  boundaries: boolean;
+}
+
+export const DEFAULT_TOGGLES: LayerToggles = {
+  depth: true,
+  hillshade: true,
+  waterline: false,
+  fleet: false,
+  boundaries: true,
+};
+
+/** `pmtiles://file:///.../depth.pmtiles` or `pmtiles://https://signed-url`. Optional layers may be absent. */
+/** MapLibre assumes metres; our values are feet, so shrink hillshade exaggeration by 0.3048. */
+export const HILLSHADE_EXAGGERATION_SCALE = 0.3048;
+
+export interface TileUrls {
+  base: string;
+  depth: string;
+  /** depth_meta.pmtiles (inspect only; not drawn). */
+  depthMeta?: string;
+  waterline?: string;
+  fleet?: string;
+}
+
+export interface StyleLayer {
+  id: string;
+  type: string;
+  source?: string;
+  'source-layer'?: string;
+  filter?: unknown;
+  minzoom?: number;
+  maxzoom?: number;
+  layout?: Record<string, unknown>;
+  paint?: Record<string, unknown>;
+}
+
+export interface StyleSource {
+  type: 'vector' | 'raster' | 'raster-dem';
+  url: string;
+  tileSize?: number;
+  encoding?: 'mapbox' | 'terrarium';
+  minzoom?: number;
+  maxzoom?: number;
+  attribution?: string;
+}
+
+export interface MapStyleJson {
+  version: 8;
+  name: string;
+  glyphs?: string;
+  sources: Record<string, StyleSource>;
+  layers: StyleLayer[];
+}
+
+// --- Depth color ramp ----------------------------------------------------------------------------
+
+/** Fixed ramp (MAP-2): identical online and offline. Depth in ft below MLLW; first stop is drying. */
+export interface LegendStop {
+  /** Depth (ft below MLLW, positive down) at which this color applies exactly. */
+  depthFt: number;
+  color: string;
+  label: string;
+}
+
+const RAMP_COLORS: Record<number, string> = {
+  0: '#e5483f', // 0 ft: at chart datum
+  3: '#f0873a',
+  6: '#f4cf52',
+  10: '#9bd7e6',
+  20: '#4a98d3',
+  40: '#163f7a',
+};
+/** Above datum (bar dries at low water). */
+export const DRYING_COLOR = '#b89a64';
+
+export function depthLegend(): LegendStop[] {
+  const stops: LegendStop[] = [{ depthFt: -3, color: DRYING_COLOR, label: 'Dries' }];
+  DEPTH_COLOR_RAMP_FT.forEach((d, i) => {
+    const next = DEPTH_COLOR_RAMP_FT[i + 1];
+    stops.push({
+      depthFt: d,
+      color: RAMP_COLORS[d] as string,
+      label: next === undefined ? `${d}+ ft` : `${d}-${next} ft`,
+    });
+  });
+  return stops;
+}
+
+/**
+ * color-relief expression over the decoded raster value. The depth tiles carry FEET MLLW (positive up) and
+ * MapLibre treats the value as "metres", so stops are given as raw feet numbers. Depth d ft => value -d.
+ * Stops are ascending: 40 ft deep ... 0 ft (datum) ... +3 ft (dries).
+ */
+export function colorReliefExpression(): unknown[] {
+  const expr: unknown[] = ['interpolate', ['linear'], ['elevation']];
+  const ramp = [...DEPTH_COLOR_RAMP_FT].sort((a, b) => b - a); // deepest first => lowest elevation first
+  expr.push(-ramp[0]! - 10, RAMP_COLORS[ramp[0] as number]); // deeper than 40 ft keeps the deepest color
+  for (const d of ramp) expr.push(-d, RAMP_COLORS[d]);
+  expr.push(3, DRYING_COLOR); // anything that dries by 3 ft or more
+  return expr;
+}
+
+// --- Style --------------------------------------------------------------------------------------
+
+const vis = (on: boolean): Record<string, unknown> => ({ visibility: on ? 'visible' : 'none' });
+
+export interface BuildOptions {
+  /** URL template for locally bundled glyphs (needed for region labels offline). */
+  glyphs?: string;
+  /** Image id registered with <Images> for hatching. */
+  hatchImage?: string;
+  dark?: boolean;
+}
+
+export function buildMapStyle(urls: TileUrls, toggles: LayerToggles = DEFAULT_TOGGLES, opts: BuildOptions = {}): MapStyleJson {
+  const hatch = opts.hatchImage ?? 'hatch';
+  const sources: Record<string, StyleSource> = {
+    base: { type: 'vector', url: urls.base, minzoom: TILE_ZOOM.base.min, maxzoom: TILE_ZOOM.base.max },
+    depth: {
+      type: 'raster-dem',
+      url: urls.depth,
+      encoding: 'mapbox',
+      tileSize: 256,
+      minzoom: TILE_ZOOM.depth.min,
+      maxzoom: TILE_ZOOM.depth.max,
+    },
+  };
+  if (urls.waterline) {
+    sources.waterline = {
+      type: 'raster-dem',
+      url: urls.waterline,
+      encoding: 'mapbox',
+      tileSize: 256,
+      minzoom: TILE_ZOOM.waterline.min,
+      maxzoom: TILE_ZOOM.waterline.max,
+    };
+    sources.waterline_meta = { type: 'vector', url: urls.waterline, minzoom: TILE_ZOOM.waterline.min, maxzoom: TILE_ZOOM.waterline.max };
+  }
+  if (urls.fleet) {
+    sources.fleet = { type: 'vector', url: urls.fleet, minzoom: TILE_ZOOM.fleet.min, maxzoom: TILE_ZOOM.fleet.max };
+  }
+
+  const bg = opts.dark ? '#0b1620' : '#eef1f2';
+  const land = opts.dark ? '#1e2a30' : '#d9dccf';
+  const layers: StyleLayer[] = [
+    { id: 'background', type: 'background', paint: { 'background-color': bg } },
+    { id: 'depth-relief', type: 'color-relief', source: 'depth', layout: vis(toggles.depth), paint: { 'color-relief-color': colorReliefExpression(), 'color-relief-opacity': 0.9 } },
+    { id: 'depth-hillshade', type: 'hillshade', source: 'depth', layout: vis(toggles.hillshade), paint: { 'hillshade-exaggeration': 0.4 * HILLSHADE_EXAGGERATION_SCALE } },
+    { id: 'land', type: 'fill', source: 'base', 'source-layer': 'land', paint: { 'fill-color': land } },
+    { id: 'depcnt', type: 'line', source: 'base', 'source-layer': 'DEPCNT', paint: { 'line-color': '#4a6d8c', 'line-width': 0.6 } },
+    { id: 'coalne', type: 'line', source: 'base', 'source-layer': 'COALNE', paint: { 'line-color': '#222', 'line-width': 1 } },
+    { id: 'cblsub', type: 'line', source: 'base', 'source-layer': 'CBLSUB', paint: { 'line-color': '#8a2be2', 'line-width': 0.8, 'line-dasharray': [4, 2] } },
+    { id: 'obstrn', type: 'circle', source: 'base', 'source-layer': 'OBSTRN', paint: { 'circle-radius': 4, 'circle-color': '#c0392b', 'circle-stroke-width': 1, 'circle-stroke-color': '#fff' } },
+    { id: 'wrecks', type: 'circle', source: 'base', 'source-layer': 'WRECKS', paint: { 'circle-radius': 4, 'circle-color': '#2c3e50', 'circle-stroke-width': 1, 'circle-stroke-color': '#fff' } },
+    { id: 'boylat', type: 'circle', source: 'base', 'source-layer': 'BOYLAT', paint: { 'circle-radius': 3, 'circle-color': '#27ae60' } },
+    { id: 'lights', type: 'circle', source: 'base', 'source-layer': 'LIGHTS', paint: { 'circle-radius': 3, 'circle-color': '#f1c40f' } },
+  ];
+
+  if (urls.waterline) {
+    layers.push(
+      { id: 'waterline-relief', type: 'color-relief', source: 'waterline', layout: vis(toggles.waterline), paint: { 'color-relief-color': colorReliefExpression(), 'color-relief-opacity': 0.85 } },
+      {
+        id: 'waterline-hatch',
+        type: 'fill',
+        source: 'waterline_meta',
+        'source-layer': 'waterline_scenes',
+        filter: ['<', ['get', 'n'], WATERLINE_MIN_SCENES],
+        layout: vis(toggles.waterline),
+        paint: { 'fill-pattern': hatch, 'fill-opacity': 0.8 },
+      },
+    );
+  }
+  if (urls.fleet) {
+    layers.push(
+      {
+        id: 'fleet-solid',
+        type: 'fill',
+        source: 'fleet',
+        'source-layer': 'fleet',
+        filter: ['>=', ['get', 'boats'], FLEET_MIN_BOATS],
+        layout: vis(toggles.fleet),
+        paint: { 'fill-color': '#7b3fe4', 'fill-opacity': 0.45 },
+      },
+      {
+        // Defense in depth: the pipeline only publishes cells with >= 3 boats, but hatch anything below.
+        id: 'fleet-hatch',
+        type: 'fill',
+        source: 'fleet',
+        'source-layer': 'fleet',
+        filter: ['<', ['get', 'boats'], FLEET_MIN_BOATS],
+        layout: vis(toggles.fleet),
+        paint: { 'fill-pattern': hatch, 'fill-opacity': 0.7 },
+      },
+    );
+  }
+
+  layers.push(
+    {
+      id: 'boundaries',
+      type: 'line',
+      source: 'base',
+      'source-layer': 'boundaries',
+      layout: vis(toggles.boundaries),
+      paint: { 'line-color': '#d11a2a', 'line-width': 2.2 },
+    },
+    {
+      id: 'boundary-labels',
+      type: 'symbol',
+      source: 'base',
+      'source-layer': 'boundaries',
+      layout: { ...vis(toggles.boundaries), 'symbol-placement': 'line', 'text-field': ['get', 'region_id'], 'text-size': 14, 'text-font': ['Noto Sans Bold'] },
+      paint: { 'text-color': '#d11a2a', 'text-halo-color': '#fff', 'text-halo-width': 1.5 },
+    },
+  );
+
+  return {
+    version: 8,
+    name: 'Sound Maps',
+    ...(opts.glyphs ? { glyphs: opts.glyphs } : {}),
+    sources,
+    layers,
+  };
+}
+
+/** Ids of layers whose visibility is controlled by each toggle (for tests/UI). */
+export function layersForToggle(style: MapStyleJson, toggle: keyof LayerToggles): StyleLayer[] {
+  const prefixes: Record<keyof LayerToggles, string[]> = {
+    depth: ['depth-relief'],
+    hillshade: ['depth-hillshade'],
+    waterline: ['waterline-'],
+    fleet: ['fleet-'],
+    boundaries: ['boundaries', 'boundary-labels'],
+  };
+  return style.layers.filter((l) => prefixes[toggle].some((p) => l.id.startsWith(p)));
+}

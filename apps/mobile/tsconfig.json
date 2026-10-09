@@ -1,0 +1,17 @@
+{
+  "extends": "expo/tsconfig.base",
+  "compilerOptions": {
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "forceConsistentCasingInFileNames": true,
+    "allowJs": false,
+    "types": ["jest", "node"],
+    "baseUrl": ".",
+    "paths": {
+      "@clearwater/shared": ["../../packages/shared/src/index.ts"]
+    }
+  },
+  "include": ["index.ts", "App.tsx", "app.config.ts", "src/**/*", "__tests__/**/*"]
+}

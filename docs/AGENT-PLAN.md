@@ -161,6 +161,26 @@ Last-known position: rounded to 100 m, ≤ every 5 min, foreground only, retaine
   (`SUPABASE_URL`, `SUPABASE_ANON_KEY`, `R2_*`, `HMAC_SALT_SECRET`, `SENTRY_DSN`).
 - Attribution requirements (OSM ODbL, Copernicus) noted in `docs/DATA-LICENSES.md` (infra).
 
+## Pinned contracts added during the build (addendum)
+
+1. **Terrain-RGB encodes feet MLLW** via the standard Mapbox formula; RGB (0,0,0) = nodata.
+   Hillshade exaggeration in MapLibre scaled by 0.3048 (it assumes meters).
+2. **`depth_meta.pmtiles`** sits at `tiles/<aoi>/<version>/depth_meta.pmtiles` by path
+   convention (not in index.json). Pixel: R = (source_code<<4) | unc_bucket;
+   G,B = uint16 days since 1880-01-01 (= days-since-1970 + 32872); A = 0 means hole.
+   Uncertainty bucket 15 = UNKNOWN exclusively; values ≥ 45 ft clamp to bucket 14.
+   Source of truth: `pipeline/common.py`; mirrored in `packages/shared/src/pipelineEncoding.ts`.
+3. **Tiles index `bytes: 0`** means the product is not available yet; clients treat it as absent.
+4. **Depth upload sign convention: `median_ft` / `p10_ft` are depth BELOW MLLW, positive
+   down** (what a sounder reads; `p10_ft` is the shoal-biased 10th percentile). The
+   baseline rasters are elevation, positive up — any comparison (the server 15 ft hold
+   rule, bias flags) must negate one side: `baseline_depth_ft = -merged_elev_ft`.
+5. **Client-side score parity**: reputations come from `profiles` (readable by all
+   signed-in users per RLS); clients sync profiles for authors/voters they see and use
+   the server's cached `score` as fallback when a reputation is unknown (default 1.0).
+6. **Votes**: clients enqueue optimistically; the server-side `cast_vote` RPC rejects
+   ineligible confirms (>500 m / >24 h); rejection is not an error state in the UI.
+
 ## Definition of done per part
 
 1. Code compiles / imports cleanly; tests pass locally where the toolchain exists
