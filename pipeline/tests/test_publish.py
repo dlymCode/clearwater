@@ -228,3 +228,57 @@ def test_versions_to_prune_counts_from_when_superseded():
 def test_lite_validator_matches_schema_enum():
     assert set(publish.load_schema()["definitions"]["aoi"]["properties"]["aoi"]["enum"]) == set(AOI_SLUGS)
     assert validate({"a": 1}, {"type": "object", "required": ["b"]}) == ["$: missing required 'b'"]
+
+
+def tide_payload(sid, days=30, start=NOW):
+    preds = [{"t": (start + dt.timedelta(minutes=30 * i)).strftime("%Y-%m-%dT%H:%M:%SZ"), "v": 1.0} for i in range(0, days * 48 + 1)]
+    return {"station_id": sid, "name": "x", "datum": "MLLW", "units": "ft", "lat": 47.6, "lon": -122.3, "predictions": preds}
+
+
+def write_tides(d, ids=("9447130", "9448576"), **kw):
+    d.mkdir(parents=True, exist_ok=True)
+    for sid in ids:
+        (d / f"{sid}.json").write_text(json.dumps(tide_payload(sid, **kw)))
+
+
+def test_publish_tides_flat_keys_and_not_in_index(tmp_path):
+    write_tides(tmp_path / "tides")
+    store = FakeStore()
+    keys = publish.publish_tides(tmp_path / "tides", store, now=NOW)
+    assert keys == ["tides/9447130.json", "tides/9448576.json"]
+    assert store.events == [("put_json", k) for k in keys]
+    # tides never enter tiles/index.json
+    make_tree(tmp_path)
+    idx = publish.publish_aoi("skagit", tmp_path, FakeStore(), now=NOW, date_range=("2014-01-01", "2015-01-01"))
+    assert "tides" not in json.dumps(idx)
+
+
+def test_publish_tides_dry_run_uploads_nothing_and_validates(tmp_path):
+    write_tides(tmp_path / "tides")
+    store = FakeStore()
+    assert len(publish.publish_tides(tmp_path / "tides", store, now=NOW, dry_run=True)) == 2 and store.events == []
+
+
+def test_publish_tides_rejects_stale_or_malformed(tmp_path):
+    write_tides(tmp_path / "stale", days=3)
+    with pytest.raises(ValueError, match="stale"):
+        publish.publish_tides(tmp_path / "stale", FakeStore(), now=NOW)
+    write_tides(tmp_path / "ok")
+    bad = tmp_path / "ok" / "1234567.json"
+    bad.write_text(json.dumps(tide_payload("9999999")))  # station_id does not match the file name
+    with pytest.raises(ValueError, match="file name"):
+        publish.publish_tides(tmp_path / "ok", FakeStore(), now=NOW)
+    with pytest.raises(FileNotFoundError):
+        publish.publish_tides(tmp_path / "empty", FakeStore(), now=NOW)
+
+
+def test_r2_tides_are_compact_json():
+    class C:
+        body = None
+
+        def put_object(self, **k):
+            C.body = k["Body"]
+
+    st = publish.R2Store("b", client=C())
+    st.put_json("tides/9447130.json", {"a": [1, 2]})
+    assert C.body == b'{"a":[1,2]}'

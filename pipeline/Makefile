@@ -23,7 +23,7 @@ VALIDATE_FLAGS ?=
 PYRUN = cd $(ROOT) && $(PY) -m
 
 .PHONY: all test lint tides schema-check $(AOIS) run-aoi need-aoi \
-        step-fetch step-laz step-mllw step-align step-meta step-waterline step-merge step-validate step-tiles step-publish
+        step-fetch step-laz step-mllw step-align step-meta step-waterline step-merge step-validate step-tiles step-tides step-publish
 .NOTPARALLEL:
 
 all: $(AOIS)
@@ -31,7 +31,7 @@ all: $(AOIS)
 $(AOIS):
 	$(MAKE) AOI=$@ run-aoi
 
-run-aoi: step-fetch step-laz step-mllw step-align step-meta step-waterline step-merge step-tiles step-validate step-publish
+run-aoi: step-fetch step-laz step-mllw step-align step-meta step-waterline step-merge step-tiles step-validate step-tides step-publish
 
 need-aoi:
 	@test -n "$(AOI)" || (echo "set AOI=<one of: $(AOIS)>" && exit 2)
@@ -67,12 +67,15 @@ step-validate: need-aoi
 step-tiles: need-aoi
 	$(PYRUN) pipeline.tiles --aoi $(AOI) --data-dir $(DATA) --stage all
 
-step-publish: need-aoi
+# Daily tide JSON for all stations (flat, unversioned); step-publish uploads them to R2 tides/<station_id>.json
+step-tides:
+	$(PYRUN) pipeline.fetch_tides --out $(DATA)/tides
+
+step-publish: need-aoi step-tides
 	$(PYRUN) pipeline.publish --aoi $(AOI) --data-dir $(DATA) $(PUBLISH_FLAGS)
 
 # Daily: 30 days of tide predictions, one JSON per station
-tides:
-	$(PYRUN) pipeline.fetch_tides --out $(DATA)/tides
+tides: step-tides
 
 schema-check:
 	cd $(ROOT)/pipeline && $(PY) -m jsonschema -i tests/fixtures/tiles_index.example.json schemas/tiles_index.schema.json

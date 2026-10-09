@@ -9,6 +9,8 @@ The index follows AGENT-PLAN.md exactly and validates against
 ``pipeline/schemas/tiles_index.schema.json``. Products that do not exist yet (e.g. the fleet
 layer before Phase 2, or the waterline layer for an AOI without scenes) are listed with
 ``bytes: 0`` and are NOT uploaded; the app treats ``bytes == 0`` as "not available".
+Tide predictions (``data/tides/<station_id>.json`` from ``fetch_tides``) are uploaded flat to
+``tides/<station_id>.json`` (unversioned: they refresh daily) and are NOT listed in ``tiles/index.json``.
 Old versions are kept for 30 days *after they are superseded* (:func:`versions_to_prune`).
 
 Safety gates (always on, also for a direct ``python -m pipeline.publish``; there is no CLI bypass):
@@ -168,7 +170,8 @@ class R2Store:
         self.client.upload_file(str(local), self.bucket, key, ExtraArgs={"ContentType": "application/octet-stream"})
 
     def put_json(self, key: str, payload: Mapping[str, Any]) -> None:
-        self.client.put_object(Bucket=self.bucket, Key=key, Body=json.dumps(payload, indent=2).encode(),
+        body = json.dumps(payload, separators=(",", ":")) if key.startswith("tides/") else json.dumps(payload, indent=2)
+        self.client.put_object(Bucket=self.bucket, Key=key, Body=body.encode(),
                                ContentType="application/json", CacheControl="no-cache")
 
     def get_json(self, key: str) -> dict | None:
@@ -250,12 +253,53 @@ def publish_aoi(aoi: str, data_dir: Path, store: ObjectStore, *, version: str | 
     return index
 
 
+TIDES_PREFIX = "tides"
+MIN_TIDE_DAYS_AHEAD = 7  # refuse to publish a stale tide file that no longer covers the next week
+
+
+def load_tide_files(tides_dir: Path, now: dt.datetime, min_days_ahead: int = MIN_TIDE_DAYS_AHEAD) -> dict[str, dict]:
+    """Read and sanity-check every ``<station_id>.json`` in ``tides_dir`` -> {station_id: payload}."""
+    files = sorted(Path(tides_dir).glob("*.json"))
+    if not files:
+        raise FileNotFoundError(f"no tide JSON in {tides_dir}: run fetch_tides first")
+    out: dict[str, dict] = {}
+    for f in files:
+        d = json.loads(f.read_text())
+        problems = []
+        if d.get("station_id") != f.stem:
+            problems.append(f"station_id {d.get('station_id')!r} != file name")
+        if d.get("datum") != "MLLW" or d.get("units") != "ft":
+            problems.append("expected datum MLLW / units ft")
+        preds = d.get("predictions") or []
+        if not preds:
+            problems.append("no predictions")
+        else:
+            last = dt.datetime.strptime(preds[-1]["t"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)
+            if last < now + dt.timedelta(days=min_days_ahead):
+                problems.append(f"predictions end {preds[-1]['t']}, less than {min_days_ahead} days ahead (stale)")
+        if problems:
+            raise ValueError(f"{f}: " + "; ".join(problems))
+        out[f.stem] = d
+    return out
+
+
+def publish_tides(tides_dir: Path, store: ObjectStore, *, now: dt.datetime | None = None, dry_run: bool = False) -> list[str]:
+    """Upload every station JSON to ``tides/<station_id>.json`` (flat, overwritten daily). Returns the keys."""
+    payloads = load_tide_files(tides_dir, now or dt.datetime.now(dt.timezone.utc))
+    keys = [f"{TIDES_PREFIX}/{sid}.json" for sid in payloads]
+    if not dry_run:
+        for sid, payload in payloads.items():
+            store.put_json(f"{TIDES_PREFIX}/{sid}.json", payload)
+    return keys
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--aoi", required=True, choices=AOI_SLUGS)
     p.add_argument("--data-dir", type=Path, default=Path("data"))
     p.add_argument("--version")
     p.add_argument("--dry-run", action="store_true", help="build and validate the index locally; upload nothing")
+    p.add_argument("--tides-dir", type=Path, help="tide JSON directory (default: <data-dir>/tides)")
     p.add_argument("--prune", action="store_true", help="delete non-current versions older than 30 days")
     a = p.parse_args(argv)
     s: Any
@@ -266,6 +310,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise
         s = NullStore()  # dry run without credentials: nothing is read from or written to R2
     index = publish_aoi(a.aoi, a.data_dir, s, version=a.version, dry_run=a.dry_run)
+    keys = publish_tides(a.tides_dir or a.data_dir / "tides", s, dry_run=a.dry_run)
+    print(f"tides: {'would upload' if a.dry_run else 'uploaded'} {len(keys)} station files under {TIDES_PREFIX}/")
     if a.prune and not a.dry_run:
         now = dt.datetime.now(dt.timezone.utc)
         current = {x["aoi"]: x["version"] for x in index["aois"]}

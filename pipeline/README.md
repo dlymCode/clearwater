@@ -18,7 +18,7 @@ cd pipeline
 make test                                         # same suite
 make skagit                                       # fetch -> laz -> mllw -> align -> meta -> waterline -> merge -> tiles -> validate -> publish
 make AOI=skagit step-merge                        # any single step
-make tides                                        # daily: 30-day tide predictions, one JSON per station
+make tides                                        # daily: 30-day tide predictions, one JSON per station (data/tides/)
 ```
 
 Steps are modules: `python -m pipeline.<module> --aoi <slug> [--data-dir data]`.
@@ -33,11 +33,21 @@ Steps are modules: `python -m pipeline.<module> --aoi <slug> [--data-dir data]`.
 | 6 merge | `merge` | `merge/merged_{elev,src,date,unc}.tif` |
 | 7 validate | `validate` | `validate/report.{html,json}`; **exit 1 unless every gate below passes** |
 | 8 tiles | `tiles` | `tiles/{depth,depth_meta,waterline,base}.pmtiles` |
-| 9 publish | `publish` | R2 `tiles/<aoi>/<version>/...` + `tiles/index.json` (schema: `schemas/tiles_index.schema.json`) |
+| 9 publish | `publish` | R2 `tiles/<aoi>/<version>/...` + `tiles/index.json` (schema: `schemas/tiles_index.schema.json`), plus flat `tides/<station_id>.json` |
 
 `merged_src` codes (uint8, `common.SOURCES`): 1 bluetopo, 2 ehydro, 3 lidar_ncmp, 4 lidar_2014,
 5 wa_lidar, 6 cudem, 7 coned, 8 waterline (only joins the merge with `--include-waterline`); 0 = hole.
 Layer order in that table is also the final tie-break priority.
+
+## Tides on R2
+
+`make <aoi>` runs `step-tides` (fetch_tides) before `step-publish`; publish then uploads **every** station JSON in
+`data/tides/` to R2 as `tides/<station_id>.json` - flat and unversioned (overwritten daily; the app downloads them through the
+signed-URL worker). They are not listed in `tiles/index.json`. All stations are uploaded, not just those near one AOI, because
+the app picks the nearest station by distance from the lat/lon in each file and the whole set is ~0.5 MB. Each file is checked
+before upload (station_id matches the file name, MLLW/ft, predictions reach at least 7 days ahead); stale or malformed files
+abort the publish. In CI/cron the daily job is just `make tides` + `python -m pipeline.publish --aoi <x>`; for tides only, run
+`fetch_tides` and call `publish.publish_tides(...)`.
 
 ## Gates (all fail closed)
 
