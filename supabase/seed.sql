@@ -1,0 +1,11 @@
+-- Local development seed (runs after migrations on `supabase db reset`).
+-- Intentionally empty of user data: accounts come from Auth, and test fixtures live inside the
+-- rolled-back pgTAP transactions in supabase/tests/database/. Nothing here may contain a secret.
+--
+-- To try the fleet layer locally, load a handful of baseline cells so the 15 ft hold rule has
+-- something to compare against (H3 res-12 ids near Skagit Bay; elevation in ft MLLW, positive up,
+-- i.e. merged_elev: -11.0 means 11 ft of water at MLLW):
+--
+--   insert into public.baseline_cells (cell_id, baseline_elev_ft, source_date) values
+--     ('8c2a1072b59ffff', -11.0, '2014-09-15');
+select 1;

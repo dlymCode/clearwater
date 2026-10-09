@@ -1,0 +1,29 @@
+# Cloudflare Worker: tile-auth. Deploy with `npx wrangler deploy` from this directory.
+# Nothing secret lives here. Set secrets with `wrangler secret put <NAME>`:
+#   R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY   (an R2 API token scoped to READ on the tiles bucket)
+#   SUPABASE_JWT_SECRET                       (only if the project still uses the legacy HS256 secret)
+name = "clearwater-tile-auth"
+main = "src/index.ts"
+compatibility_date = "2025-01-01"
+workers_dev = false
+
+[vars]
+# Non-secret configuration. Replace the placeholders for your project/account.
+SUPABASE_URL = "https://YOUR-PROJECT-REF.supabase.co"
+R2_ACCOUNT_ID = "YOUR_CLOUDFLARE_ACCOUNT_ID"
+R2_BUCKET = "clearwater-tiles"
+# Daily signed-download budget per account, in MB (see README "Quota").
+DAILY_QUOTA_MB = "3000"
+
+# KV namespace holding the per-account daily counters: `wrangler kv namespace create QUOTA`
+[[kv_namespaces]]
+binding = "QUOTA"
+id = "REPLACE_WITH_KV_NAMESPACE_ID"
+
+# Optional but recommended: lets the Worker 404 on missing archives and meter exact sizes.
+[[r2_buckets]]
+binding = "TILES"
+bucket_name = "clearwater-tiles"
+
+# Route the Worker on your tiles hostname, e.g.:
+# routes = [{ pattern = "tiles.example.com/sign*", zone_name = "example.com" }]

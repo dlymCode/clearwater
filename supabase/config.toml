@@ -1,0 +1,108 @@
+# Supabase CLI configuration for local development and CI (`supabase start`, `supabase db reset`,
+# `supabase test db`). Hosted-project settings (Apple provider secret, SMS provider) are set in the
+# dashboard or via environment variables; nothing secret lives in this file.
+# Reference: https://supabase.com/docs/guides/local-development/cli/config
+
+project_id = "clearwater"
+
+[api]
+enabled = true
+port = 54321
+# Only `public` is exposed over PostgREST. Everything the app needs is a table, view or RPC there.
+schemas = ["public"]
+extra_search_path = ["public", "extensions"]
+max_rows = 1000
+
+[db]
+port = 54322
+shadow_port = 54320
+health_timeout = "2m"
+# Must match the hosted project's Postgres major version.
+major_version = 17
+
+[db.pooler]
+enabled = false
+
+[db.migrations]
+enabled = true
+
+[db.seed]
+enabled = true
+sql_paths = ["./seed.sql"]
+
+[realtime]
+enabled = true
+
+[studio]
+enabled = true
+port = 54323
+
+[inbucket]
+enabled = true
+port = 54324
+
+[storage]
+enabled = false
+
+[auth]
+enabled = true
+site_url = "clearwater://auth-callback"
+additional_redirect_urls = ["clearwater://auth-callback"]
+# Access token lifetime in seconds (1 hour). A revoked account's JWT therefore stays valid for
+# at most this long for the tile worker; RLS and the edge functions re-check revocation per request.
+jwt_expiry = 3600
+enable_refresh_token_rotation = true
+refresh_token_reuse_interval = 10
+enable_signup = true
+enable_anonymous_sign_ins = false
+enable_manual_linking = false
+# No passwords: Sign in with Apple and phone OTP only (PRD "Authentication and authorization").
+minimum_password_length = 12
+
+[auth.email]
+enable_signup = false
+enable_confirmations = false
+
+[auth.sms]
+enable_signup = true
+enable_confirmations = true
+template = "Your Sound Maps code is {{ .Code }}"
+max_frequency = "60s"
+
+# Local-only test numbers; production uses the SMS provider configured in the dashboard.
+[auth.sms.test_otp]
+15555550100 = "123456"
+
+[auth.external.apple]
+enabled = true
+client_id = "env(SUPABASE_AUTH_EXTERNAL_APPLE_CLIENT_ID)"
+secret = "env(SUPABASE_AUTH_EXTERNAL_APPLE_SECRET)"
+skip_nonce_check = false
+
+[edge_runtime]
+enabled = true
+policy = "per_worker"
+inspector_port = 8083
+deno_version = 2
+
+# Every function verifies the caller's JWT at the gateway. Functions that must also distinguish
+# a signed-in user from the service role (depth-upload, account-delete, admin) do so in code.
+[functions.depth-upload]
+enabled = true
+verify_jwt = true
+
+[functions.account-delete]
+enabled = true
+verify_jwt = true
+
+[functions.admin]
+enabled = true
+verify_jwt = true
+
+# Invoked weekly by pg_cron + pg_net with the service-role key (see supabase/README.md).
+[functions.reputation-batch]
+enabled = true
+verify_jwt = true
+
+[analytics]
+enabled = false

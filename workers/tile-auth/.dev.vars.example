@@ -1,0 +1,8 @@
+# Copy to .dev.vars for `wrangler dev`. Placeholder names only.
+SUPABASE_URL=https://YOUR-PROJECT-REF.supabase.co
+SUPABASE_JWT_SECRET=
+R2_ACCOUNT_ID=
+R2_BUCKET=clearwater-tiles
+R2_ACCESS_KEY_ID=
+R2_SECRET_ACCESS_KEY=
+DAILY_QUOTA_MB=3000

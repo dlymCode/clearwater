@@ -1,0 +1,244 @@
+-- pgTAP test file for Clearwater. Runs with `supabase test db` (CI) inside one transaction that
+-- is rolled back at the end. The helper block and fixture below are repeated in every file on
+-- purpose: pg_prove runs each file in its own session, so files cannot share temp state.
+begin;
+create extension if not exists pgtap with schema extensions;
+
+-- ---- helpers --------------------------------------------------------------------------
+create schema if not exists tests;
+grant usage on schema tests to anon, authenticated, service_role;
+
+-- Become a signed-in user (JWT claims + Postgres role), as PostgREST does per request.
+create or replace function tests.act_as(p_uid uuid) returns void language plpgsql as $$
+begin
+  perform set_config('request.jwt.claims',
+                     json_build_object('sub', p_uid::text, 'role', 'authenticated')::text, true);
+  perform set_config('role', 'authenticated', true);
+end $$;
+create or replace function tests.act_anon() returns void language plpgsql as $$
+begin
+  perform set_config('request.jwt.claims', json_build_object('role', 'anon')::text, true);
+  perform set_config('role', 'anon', true);
+end $$;
+create or replace function tests.act_service() returns void language plpgsql as $$
+begin
+  perform set_config('request.jwt.claims', json_build_object('role', 'service_role')::text, true);
+  perform set_config('role', 'service_role', true);
+end $$;
+-- Back to the superuser session role (fixture setup / ground-truth reads).
+create or replace function tests.act_admin() returns void language plpgsql as $$
+begin
+  perform set_config('request.jwt.claims', '', true);
+  perform set_config('role', 'postgres', true);
+end $$;
+-- Fixture ids: tests.u(1..4) are users u1..u4; tests.g() is the fixture group.
+create or replace function tests.u(i integer) returns uuid language sql immutable as $$
+  select ('00000000-0000-0000-0000-0000000000a' || i::text)::uuid $$;
+create or replace function tests.g() returns uuid language sql immutable as $$
+  select '00000000-0000-0000-0000-0000000000b1'::uuid $$;
+create or replace function tests.c(i integer) returns uuid language sql immutable as $$
+  select ('00000000-0000-0000-0000-000000000' || lpad(to_hex(3072 + i), 3, '0'))::uuid $$;
+-- Run one DML statement as the current role and return the affected row count.
+create or replace function tests.dml(p_sql text) returns bigint language plpgsql as $$
+declare n bigint;
+begin
+  execute p_sql;
+  get diagnostics n = row_count;
+  return n;
+end $$;
+
+-- ---- fixture (created as the superuser session role) -------------------------------
+-- u1 = group owner, u2 = group member, u3 = signed-in non-member, u4 = bystander
+insert into auth.users (id, email) values
+  ('00000000-0000-0000-0000-0000000000a1', 'u1@example.test'),
+  ('00000000-0000-0000-0000-0000000000a2', 'u2@example.test'),
+  ('00000000-0000-0000-0000-0000000000a3', 'u3@example.test'),
+  ('00000000-0000-0000-0000-0000000000a4', 'u4@example.test');
+insert into public.profiles (id, handle, vessel_name) values
+  ('00000000-0000-0000-0000-0000000000a1', 'owner_one', 'F/V One'),
+  ('00000000-0000-0000-0000-0000000000a2', 'member_two', 'F/V Two'),
+  ('00000000-0000-0000-0000-0000000000a3', 'outsider_three', 'F/V Three'),
+  ('00000000-0000-0000-0000-0000000000a4', 'bystander_four', 'F/V Four');
+-- Group G owned by u1 (the groups trigger makes u1 the owner member), u2 joins as member.
+insert into public.groups (id, name, owner_id) values
+  ('00000000-0000-0000-0000-0000000000b1', 'Skagit Crew', '00000000-0000-0000-0000-0000000000a1');
+insert into public.group_members (group_id, user_id, role) values
+  ('00000000-0000-0000-0000-0000000000b1', '00000000-0000-0000-0000-0000000000a2', 'member');
+
+select plan(65);
+
+create or replace function tests.row(p_cell text, p_day date, p_med float8, p_p10 float8, p_n int, p_hash text)
+returns jsonb language sql immutable as $$
+  select jsonb_build_object('h3_cell', p_cell, 'day', p_day, 'median_ft', p_med, 'p10_ft', p_p10, 'n', p_n, 'uploader_hash', p_hash)
+$$;
+-- cells / hashes (a 64-hex hash per boat per day)
+create or replace function tests.cell(i int) returns text language sql immutable as $$ select '8c2a1072b59ff' || lpad(to_hex(i), 2, '0') $$;
+create or replace function tests.h(c char) returns text language sql immutable as $$ select repeat(c::text, 64) $$;
+
+select tests.act_admin();
+-- baseline is ELEVATION ft MLLW, positive up (merged_elev): -11 means 11 ft of water.
+-- Uploads are DEPTH below MLLW, positive down: the rule compares median_ft with -baseline_elev_ft.
+insert into public.baseline_cells (cell_id, baseline_elev_ft) values
+  (tests.cell(1), -11), (tests.cell(2), -10), (tests.cell(3), -10), (tests.cell(4), -10),
+  (tests.cell(5), -10), (tests.cell(6), -10);
+-- cell(7) intentionally has no baseline.
+
+-- ---- weighted_quantile ----------------------------------------------------------------------------
+select is(public.weighted_quantile(array[10, 20]::float8[], array[1, 3]::float8[], 0.5), 20::float8, 'weighted_quantile: {10,20} weights {1,3} -> 20');
+select is(public.weighted_quantile(array[10, 20]::float8[], array[3, 1]::float8[], 0.5), 10::float8, 'weighted_quantile: weights {3,1} -> 10');
+select is(public.weighted_quantile(array[20, 10, 30]::float8[], array[1, 1, 1]::float8[], 0.5), 20::float8, 'weighted_quantile: unsorted input, equal weights -> middle value');
+select is(public.weighted_quantile(array[5]::float8[], array[7]::float8[], 0.1), 5::float8, 'weighted_quantile: single value');
+
+-- ---- structure: no uid, no sub-day timestamp anywhere in depth_uploads --------------------------------
+select hasnt_column('public', 'depth_uploads', 'user_id', 'depth_uploads has no user_id');
+select hasnt_column('public', 'depth_uploads', 'created_at', 'depth_uploads has no timestamp column');
+select col_type_is('public', 'depth_uploads', 'day', 'date', 'depth_uploads.day is a date (no time of day)');
+
+-- ---- 1. ordinary upload: accepted, aggregated ---------------------------------------------------------------
+select tests.act_service();
+select is((public.ingest_depth_batch(tests.c(1), tests.u(1),
+            jsonb_build_array(tests.row(tests.cell(1), '2026-10-01', 12, 10, 20, tests.h('a'))), '{}')) ->> 'accepted',
+          '1', 'ordinary upload within 15 ft of baseline is accepted');
+select is((select median_ft from public.depth_cells where cell_id = tests.cell(1) and day = '2026-10-01'), 12::float8, 'depth_cells row created with the median');
+select is((select boats from public.depth_cells where cell_id = tests.cell(1)), 1, 'one boat so far');
+
+-- ---- 2./3. held, then released by a second boat that agrees ---------------------------------------------------
+select is((public.ingest_depth_batch(tests.c(2), tests.u(2),
+            jsonb_build_array(tests.row(tests.cell(2), '2026-10-01', 40, 38, 10, tests.h('b'))), '{}')) ->> 'held',
+          '1', 'upload 30 ft off baseline with no other boat is HELD');
+select is((select held_reason from public.depth_uploads where cell_id = tests.cell(2)), 'baseline_disagreement', 'held row carries its reason');
+select is((select count(*) from public.depth_cells where cell_id = tests.cell(2)), 0::bigint, 'held upload is kept in depth_uploads but absent from depth_cells');
+select is((select count(*) from public.depth_uploads where cell_id = tests.cell(2)), 1::bigint, 'held upload is not deleted');
+
+select is((public.ingest_depth_batch(tests.c(3), tests.u(3),
+            jsonb_build_array(tests.row(tests.cell(2), '2026-10-05', 38, 36, 30, tests.h('c'))), '{}')) ->> 'released',
+          '1', 'a second boat 2 ft from the held reading releases it');
+select is((select count(*) from public.depth_uploads where cell_id = tests.cell(2) and held), 0::bigint, 'no rows remain held on that cell');
+select is((select count(*) from public.depth_cells where cell_id = tests.cell(2)), 2::bigint, 'both days now appear in depth_cells (released day + new day)');
+select is((select median_ft from public.depth_cells where cell_id = tests.cell(2) and day = '2026-10-01'), 40::float8, 'released day aggregates from the released upload');
+
+-- weighted aggregate within one day: two boats, same cell and day
+select tests.act_service();
+select lives_ok($$select public.ingest_depth_batch(tests.c(4), tests.u(4),
+            jsonb_build_array(tests.row(tests.cell(2), '2026-10-05', 39, 37, 10, tests.h('d'))), '{}')$$,
+          'a third boat uploads the same cell/day');
+select is((select median_ft from public.depth_cells where cell_id = tests.cell(2) and day = '2026-10-05'), 38::float8,
+          'median is n-weighted: (39, n=10) and (38, n=30) -> 38');
+select is((select p10_ft from public.depth_cells where cell_id = tests.cell(2) and day = '2026-10-05'), 36::float8,
+          'p10 is n-weighted: (37, n=10) and (36, n=30) -> 36');
+select is((select n from public.depth_cells where cell_id = tests.cell(2) and day = '2026-10-05'), 40, 'n sums across uploads');
+select is((select boats from public.depth_cells where cell_id = tests.cell(2) and day = '2026-10-05'), 2, 'boats counts distinct uploader_hash that day');
+
+-- ---- 4. a disagreeing second boat does not release a held reading ---------------------------------------------
+select lives_ok($$select public.ingest_depth_batch(tests.c(5), tests.u(1),
+            jsonb_build_array(tests.row(tests.cell(3), '2026-10-01', 45, 43, 10, tests.h('e'))), '{}')$$, 'boat E uploads 45 ft depth on a 10 ft baseline');
+select lives_ok($$select public.ingest_depth_batch(tests.c(6), tests.u(2),
+            jsonb_build_array(tests.row(tests.cell(3), '2026-10-02', 20, 18, 10, tests.h('f'))), '{}')$$, 'boat F uploads 20 ft (only 10 ft off baseline)');
+select is((select count(*) from public.depth_uploads where cell_id = tests.cell(3) and held), 1::bigint, 'E stays held: F does not agree with it');
+select is((select median_ft from public.depth_cells where cell_id = tests.cell(3)), 20::float8, 'only the non-held reading is published');
+
+-- ---- 5. other boat with a normal reading means the disagreeing upload is not held -------------------------------
+select lives_ok($$select public.ingest_depth_batch(tests.c(7), tests.u(1),
+            jsonb_build_array(tests.row(tests.cell(4), '2026-10-01', 9, 7, 10, tests.h('a'))), '{}')$$, 'boat A logs a normal reading');
+select is((public.ingest_depth_batch(tests.c(8), tests.u(2),
+            jsonb_build_array(tests.row(tests.cell(4), '2026-10-03', 50, 48, 10, tests.h('b'))), '{}')) ->> 'held',
+          '0', 'a disagreeing reading is not held when another boat logged the cell within 90 days (PRD rule)');
+
+-- ---- 6. "another boat" excludes the uploader''s own earlier hashes --------------------------------------------------
+select lives_ok($$select public.ingest_depth_batch(tests.c(9), tests.u(1),
+            jsonb_build_array(tests.row(tests.cell(5), '2026-10-01', 50, 48, 10, tests.h('1'))), array[]::text[])$$,
+          'boat 1 uploads a wild reading on day 1 (held)');
+select is((public.ingest_depth_batch(tests.c(10), tests.u(1),
+            jsonb_build_array(tests.row(tests.cell(5), '2026-10-02', 50, 48, 10, tests.h('2'))), array[tests.h('1')])) ->> 'held',
+          '1', 'same boat on day 2 (different hash, listed in p_self_hashes) cannot corroborate itself');
+select is((select count(*) from public.depth_cells where cell_id = tests.cell(5)), 0::bigint, 'nothing from the self-corroborating boat is published');
+select is((public.ingest_depth_batch(tests.c(11), tests.u(2),
+            jsonb_build_array(tests.row(tests.cell(5), '2026-10-03', 51, 49, 10, tests.h('3'))), '{}')) ->> 'released',
+          '2', 'a genuinely different boat agreeing releases both of the first boat''s held rows');
+
+-- ---- 7. idempotency on the client batch UUID ----------------------------------------------------------------------------
+select is((public.ingest_depth_batch(tests.c(1), tests.u(1),
+            jsonb_build_array(tests.row(tests.cell(1), '2026-10-01', 12, 10, 20, tests.h('a'))), '{}')) ->> 'duplicate',
+          'true', 'replaying a batch UUID is reported as a duplicate');
+select is((select n from public.depth_cells where cell_id = tests.cell(1) and day = '2026-10-01'), 20, 'replay changed nothing (n still 20)');
+select throws_ok($$select public.ingest_depth_batch(tests.c(1), tests.u(2), jsonb_build_array(tests.row(tests.cell(1), '2026-10-01', 12, 10, 20, tests.h('a'))), '{}')$$,
+                 'PT409', null, 'a batch UUID owned by another user is a conflict');
+
+-- ---- 8. held rows do not wait forever: 30-day agreement window ---------------------------------------------------------------
+select lives_ok($$select public.ingest_depth_batch(tests.c(12), tests.u(1),
+            jsonb_build_array(tests.row(tests.cell(6), '2026-08-01', 40, 38, 10, tests.h('4'))), '{}')$$, 'held reading on 2026-08-01');
+select is((public.ingest_depth_batch(tests.c(13), tests.u(2),
+            jsonb_build_array(tests.row(tests.cell(6), '2026-09-20', 40, 38, 10, tests.h('5'))), '{}')) ->> 'held',
+          '1', 'an agreeing reading 50 days later does not release (outside 30 days) and is itself held');
+
+-- ---- 9. no baseline => never held ---------------------------------------------------------------------------------------------
+select is((public.ingest_depth_batch(tests.c(14), tests.u(3),
+            jsonb_build_array(tests.row(tests.cell(7), '2026-10-01', 300, 290, 5, tests.h('6'))), '{}')) ->> 'held',
+          '0', 'a cell with no baseline cannot be held');
+
+-- ---- 10. validation, revoked accounts ------------------------------------------------------------------------------------------
+select throws_ok($$select public.ingest_depth_batch(tests.c(15), tests.u(1), '[]'::jsonb, '{}')$$, 'PT400', null, 'empty rows rejected');
+select throws_ok($$select public.ingest_depth_batch(tests.c(15), tests.u(1), '{}'::jsonb, '{}')$$, 'PT400', null, 'non-array rows rejected');
+select tests.act_admin();
+update public.profiles set revoked_at = now() where id = tests.u(4);
+select tests.act_service();
+select throws_ok($$select public.ingest_depth_batch(tests.c(16), tests.u(4),
+            jsonb_build_array(tests.row(tests.cell(1), '2026-10-01', 12, 10, 20, tests.h('7'))), '{}')$$, 'PT403', null, 'revoked account cannot upload');
+
+-- ---- 11. rate limit: 1 depth batch / 15 min ------------------------------------------------------------------------------------------
+select is((select allowed from public.rate_limit_status(tests.u(1), 'depth_batch')), false, 'rate_limit_status: u1 just uploaded, depth_batch not allowed');
+select ok((select retry_after_s from public.rate_limit_status(tests.u(1), 'depth_batch')) between 1 and 900, 'rate_limit_status: retry_after is within 15 minutes');
+select is((select allowed from public.rate_limit_status(gen_random_uuid(), 'depth_batch')), true, 'rate_limit_status: a user with no batch is allowed');
+
+-- ---- 12. publication threshold: RLS shows cells only with >= 3 boats -------------------------------------------------------------------
+select tests.act_admin();
+select tests.act_as(tests.u(2));
+select is((select count(*) from public.depth_cells where cell_id = tests.cell(1)), 0::bigint, 'client cannot read a 1-boat cell');
+select tests.act_service();
+select lives_ok($$select public.ingest_depth_batch(tests.c(17), tests.u(2), jsonb_build_array(tests.row(tests.cell(1), '2026-10-01', 12, 10, 5, tests.h('8'))), '{}')$$, 'second boat on cell 1');
+select lives_ok($$select public.ingest_depth_batch(tests.c(18), tests.u(3), jsonb_build_array(tests.row(tests.cell(1), '2026-10-01', 13, 11, 5, tests.h('9'))), '{}')$$, 'third boat on cell 1');
+select tests.act_as(tests.u(2));
+select is((select boats from public.depth_cells where cell_id = tests.cell(1) and day = '2026-10-01'), 3, 'client can read the cell once 3 distinct boats contributed');
+
+-- ---- 13. admin hold / release / audit ------------------------------------------------------------------------------------------------------
+select tests.act_service();
+select lives_ok(format($$select public.admin_set_upload_held(tests.u(1), %L, true)$$,
+                 (select id from public.depth_uploads where uploader_hash = tests.h('8') limit 1)),
+          'admin_set_upload_held: hold an upload');
+select is((select boats from public.depth_cells where cell_id = tests.cell(1) and day = '2026-10-01'), 2, 'held upload leaves the aggregate immediately');
+select is((select held_reason from public.depth_uploads where uploader_hash = tests.h('8')), 'admin', 'admin hold has its own reason (never auto-released)');
+select lives_ok(format($$select public.admin_set_upload_held(tests.u(1), %L, false)$$,
+                 (select id from public.depth_uploads where uploader_hash = tests.h('8') limit 1)),
+          'admin_set_upload_held: release it');
+select is((select boats from public.depth_cells where cell_id = tests.cell(1) and day = '2026-10-01'), 3, 'released upload is back in the aggregate');
+select is((select count(*) from public.audit_log where action in ('admin.hold_upload','admin.release_upload') and actor = tests.u(1)),
+          2::bigint, 'both admin actions are in audit_log');
+select throws_ok($$select public.admin_set_upload_held(tests.u(1), gen_random_uuid(), true)$$, 'PT404', null, 'admin_set_upload_held: unknown upload');
+select is((select count(*) from public.admin_list_held(tests.u(1), 100)) > 0, true, 'admin_list_held returns held rows');
+
+-- ---- 14. salt rotation bumps the epoch and is audited ----------------------------------------------------------------------------------------
+select is(public.get_salt_epoch(), 0, 'salt epoch starts at 0');
+select is(public.admin_rotate_salt(tests.u(1)), 1, 'admin_rotate_salt returns the new epoch');
+select is(public.get_salt_epoch(), 1, 'epoch persisted');
+select is((select details ->> 'epoch' from public.audit_log where action = 'admin.rotate_salt'), '1', 'rotation is audited');
+
+-- ---- 15. sign convention: uploads are depth (positive down), baseline is elevation (positive up) ----------
+-- Baseline elevation -11 means 11 ft of water. An upload of +11 agrees; the wrong-signed -11 is 22 ft
+-- off the baseline depth, so it is held.
+select tests.act_admin();
+insert into public.baseline_cells (cell_id, baseline_elev_ft) values (tests.cell(8), -11), (tests.cell(9), 4), (tests.cell(10), -11);
+select tests.act_service();
+select is((public.ingest_depth_batch(tests.c(19), tests.u(1),
+            jsonb_build_array(tests.row(tests.cell(8), '2026-10-01', 11, 9, 5, tests.h('a'))), '{}')) ->> 'held',
+          '0', 'baseline elevation -11 ft agrees with an uploaded depth of +11 ft');
+select is((public.ingest_depth_batch(tests.c(20), tests.u(2),
+            jsonb_build_array(tests.row(tests.cell(10), '2026-10-01', -11, -13, 5, tests.h('b'))), '{}')) ->> 'held',
+          '1', 'a wrong-signed upload (-11 ft depth against 11 ft of water) is 22 ft off and is held');
+select is((public.ingest_depth_batch(tests.c(21), tests.u(3),
+            jsonb_build_array(tests.row(tests.cell(9), '2026-10-01', 30, 28, 5, tests.h('c'))), '{}')) ->> 'held',
+          '1', 'a flat that dries 4 ft (baseline elevation +4 = depth -4) vs an uploaded 30 ft is held');
+select is((select baseline_depth_ft from public.admin_list_held(tests.u(1), 100) where cell_id = tests.cell(9)::text), -4::float8,
+          'admin_list_held reports the baseline as depth (negated elevation: +4 ft elevation -> -4 ft depth)');
+
+select * from finish();
+rollback;
