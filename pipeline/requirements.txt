@@ -3,7 +3,7 @@
 # CLI are system tools (see README), not pip packages.
 numpy>=1.26,<3
 rasterio>=1.3.10
-pyproj>=3.6
+pyproj>=3.8.0
 pystac-client>=0.8
 planetary-computer>=1.0
 boto3>=1.34
