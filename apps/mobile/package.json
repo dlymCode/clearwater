@@ -26,7 +26,7 @@
     "h3-js": "^4.2.1",
     "react": "19.2.3",
     "react-native": "0.87.1",
-    "react-native-get-random-values": "^1.11.0",
+    "react-native-get-random-values": "^2.0.0",
     "react-native-tcp-socket": "^6.4.3",
     "react-native-udp": "^4.1.7",
     "zustand": "^5.0.15"
