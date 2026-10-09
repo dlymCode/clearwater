@@ -1,7 +1,7 @@
 import numpy as np
 
 from pipeline.common import DATE_NODATA
-from pipeline.waterline_dem import ndwi, waterline_dem, usable_mask
+from pipeline.waterline_dem import combine_pass, group_passes, ndwi, usable_mask, waterline_dem
 
 W, H = 60, 3
 TRUE = np.tile(np.linspace(0.2, 7.8, W, dtype=np.float32), (H, 1))  # known tidal ramp, ft MLLW
@@ -82,3 +82,39 @@ def test_always_wet_or_always_dry_cells_masked():
     r = waterline_dem(g, n, s, tides, np.arange(6))
     assert np.isnan(r.elev[0, 0]) and np.isnan(r.elev[0, 2])
     assert abs(r.elev[0, 1] - 2.5) < 0.2
+
+
+def test_group_passes_chains_close_timestamps():
+    t = [0.0, 10.0, 5000.0, 5030.0, 99999.0]
+    assert group_passes(t) == [0, 0, 1, 1, 2]
+    assert group_passes([5030.0, 0.0, 5000.0]) == [1, 0, 1]  # input order preserved
+    assert group_passes([]) == []
+
+
+def test_combine_pass_first_usable_wins():
+    g = np.array([[[0.1]], [[0.3]]], dtype=np.float32)
+    n = np.array([[[0.3]], [[0.05]]], dtype=np.float32)
+    scl = np.array([[[9]], [[4]]], dtype=np.uint8)  # first layer cloudy, second usable
+    gg, nn, ss = combine_pass(g, n, scl)
+    assert (gg[0, 0], nn[0, 0], ss[0, 0]) == (np.float32(0.3), np.float32(0.05), 4)
+
+
+def test_duplicate_scenes_of_one_pass_do_not_inflate_scene_count():
+    g, n, s, t, d = build(TIDES[:4], DAYS[:4])  # 4 distinct passes: below the 5-scene minimum
+    assert np.isnan(waterline_dem(g, n, s, t, d).elev).all()
+    # re-processed duplicates of passes 0 and 1 (same sensing time) would make 6 "scenes"
+    g2 = np.concatenate([g, g[:2]])
+    n2 = np.concatenate([n, n[:2]])
+    s2 = np.concatenate([s, s[:2]])
+    t2, d2 = t + t[:2], list(d) + list(d[:2])
+    naive = waterline_dem(g2, n2, s2, t2, d2)
+    assert np.isfinite(naive.elev).any() and (naive.n == 6).all()  # without de-duplication the count is inflated
+    deduped = waterline_dem(g2, n2, s2, t2, d2, pass_ids=[0, 1, 2, 3, 0, 1])
+    assert np.isnan(deduped.elev).all() and (deduped.n == 4).all()
+
+
+def test_pass_ids_do_not_change_clean_results():
+    g, n, s, t, d = build()
+    a = waterline_dem(g, n, s, t, d)
+    b = waterline_dem(g, n, s, t, d, pass_ids=list(range(12)))
+    assert np.array_equal(a.elev, b.elev, equal_nan=True) and np.array_equal(a.n, b.n)

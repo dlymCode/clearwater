@@ -94,16 +94,55 @@ class WaterlineAccumulator:
         return WaterlineResult(elev, br, date, self.n.copy())
 
 
+def group_passes(times_s: Sequence[float], tol_s: float = 60.0) -> list[int]:
+    """Pass id per scene: scenes whose sensing times chain within ``tol_s`` seconds are one satellite
+    pass (reprocessed duplicates, overlapping granules). Input order is preserved in the result."""
+    order = sorted(range(len(times_s)), key=lambda i: times_s[i])
+    ids = [0] * len(times_s)
+    cur = -1
+    last = None
+    for i in order:
+        if last is None or times_s[i] - last > tol_s:
+            cur += 1
+        ids[i] = cur
+        last = times_s[i]
+    return ids
+
+
+def combine_pass(green: np.ndarray, nir: np.ndarray, scl: np.ndarray,
+                 classes: Sequence[int] = USABLE_SCL) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Merge the scenes of ONE pass ((K,H,W) stacks): per cell the first usable scene wins, otherwise the first."""
+    ok = usable_mask(scl, classes) & np.isfinite(ndwi(green, nir))
+    pick = np.argmax(ok, axis=0)  # first usable layer; 0 when none is usable
+    take = lambda a: np.take_along_axis(a, pick[None], axis=0)[0]  # noqa: E731
+    return take(green), take(nir), take(scl)
+
+
 def waterline_dem(green: np.ndarray, nir: np.ndarray, scl: np.ndarray, tide_ft: Sequence[float],
                   scene_days: Sequence[int], *, ndwi_threshold: float = NDWI_THRESHOLD,
-                  min_scenes: int = MIN_SCENES, max_bracket_ft: float = MAX_BRACKET_FT) -> WaterlineResult:
-    """Stacked form: ``green``/``nir``/``scl`` are (S, H, W); ``tide_ft`` and ``scene_days`` length S."""
+                  min_scenes: int = MIN_SCENES, max_bracket_ft: float = MAX_BRACKET_FT,
+                  pass_ids: Sequence[int] | None = None) -> WaterlineResult:
+    """Stacked form: ``green``/``nir``/``scl`` are (S, H, W); ``tide_ft`` and ``scene_days`` length S.
+
+    ``pass_ids`` (one per scene, see :func:`group_passes`) makes scenes sharing an id count as ONE
+    observation, combined cell by cell before the >= ``min_scenes`` test, so duplicates of the same
+    overpass can never inflate the scene count.
+    """
     green = np.asarray(green)
     if green.ndim != 3 or not (len(tide_ft) == len(scene_days) == green.shape[0]):
         raise ValueError("expected (S,H,W) stacks and per-scene tide/day vectors of length S")
     acc = WaterlineAccumulator(green.shape[1:], ndwi_threshold)
-    for i in range(green.shape[0]):
-        acc.update(green[i], nir[i], scl[i], float(tide_ft[i]), int(scene_days[i]))
+    if pass_ids is None:
+        for i in range(green.shape[0]):
+            acc.update(green[i], nir[i], scl[i], float(tide_ft[i]), int(scene_days[i]))
+        return acc.finalize(min_scenes, max_bracket_ft)
+    if len(pass_ids) != green.shape[0]:
+        raise ValueError("one pass id per scene required")
+    nir, scl = np.asarray(nir), np.asarray(scl)
+    for pid in dict.fromkeys(pass_ids):
+        idx = [i for i, p in enumerate(pass_ids) if p == pid]
+        g, n, c = combine_pass(green[idx], nir[idx], scl[idx])
+        acc.update(g, n, c, float(tide_ft[idx[0]]), int(scene_days[idx[0]]))
     return acc.finalize(min_scenes, max_bracket_ft)
 
 
@@ -138,6 +177,10 @@ def run(aoi: str, data_dir: Path, *, ndwi_threshold: float = NDWI_THRESHOLD, str
         "n": rasterio.open(out_dir / "n.tif", "w", **profile, dtype="uint16"),
     }
     try:
+        import datetime as _dt
+
+        times = [_dt.datetime.fromisoformat(s["datetime"].replace("Z", "+00:00")).timestamp() for s in scenes]
+        pass_of = group_passes(times)
         srcs = []
         for s in scenes:
             vrts = {}
@@ -149,9 +192,14 @@ def run(aoi: str, data_dir: Path, *, ndwi_threshold: float = NDWI_THRESHOLD, str
         for r0 in range(0, grid.nrows, strip_rows):
             win = Window(0, r0, grid.ncols, min(strip_rows, grid.nrows - r0))
             acc = WaterlineAccumulator((int(win.height), grid.ncols), ndwi_threshold)
-            for s, v in srcs:
-                acc.update(v["B03"].read(1, window=win).astype(np.float32), v["B08"].read(1, window=win).astype(np.float32),
-                           v["SCL"].read(1, window=win), s["tide_ft"], days_since_epoch(s["datetime"]))
+            for pid in dict.fromkeys(pass_of):  # one observation per satellite pass, not per scene file
+                members = [srcs[i] for i, p in enumerate(pass_of) if p == pid]
+                g, n, c = combine_pass(
+                    np.stack([v["B03"].read(1, window=win).astype(np.float32) for _, v in members]),
+                    np.stack([v["B08"].read(1, window=win).astype(np.float32) for _, v in members]),
+                    np.stack([v["SCL"].read(1, window=win) for _, v in members]))
+                s0 = members[0][0]
+                acc.update(g, n, c, s0["tide_ft"], days_since_epoch(s0["datetime"]))
             res = acc.finalize(min_scenes)
             for key in ("elev", "bracket", "date", "n"):
                 outs[key].write(getattr(res, key), 1, window=win)

@@ -1,6 +1,7 @@
 import copy
 import datetime as dt
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -28,6 +29,27 @@ class FakeStore:
 
     def get_json(self, key):
         return self.index
+
+
+def make_tree(root, passed=True, aoi="skagit", report_aoi=None):
+    """tiles/*.pmtiles older than the validation report, newer than merged_elev.tif."""
+    tiles = root / aoi / "tiles"
+    tiles.mkdir(parents=True, exist_ok=True)
+    (root / aoi / "merge").mkdir(parents=True, exist_ok=True)
+    (root / aoi / "validate").mkdir(parents=True, exist_ok=True)
+    merged = root / aoi / "merge" / "merged_elev.tif"
+    merged.write_bytes(b"m")
+    files = {"depth.pmtiles": b"d" * 10, "base.pmtiles": b"b" * 4, "depth_meta.pmtiles": b"m"}
+    for name, data in files.items():
+        (tiles / name).write_bytes(data)
+    report = root / aoi / "validate" / "report.json"
+    report.write_text(json.dumps({"aoi": report_aoi or aoi, "gate": {"passed": passed, "reason": "ok" if passed else "p90 too high"}}))
+    t0 = 1_700_000_000
+    os.utime(merged, (t0, t0))
+    for name in files:
+        os.utime(tiles / name, (t0 + 100, t0 + 100))
+    os.utime(report, (t0 + 200, t0 + 200))
+    return tiles, merged, report
 
 
 def test_fixture_validates_against_schema():
@@ -103,11 +125,7 @@ def test_date_range_from_days_ignores_nodata():
 
 
 def test_publish_aoi_uploads_data_before_index(tmp_path):
-    tiles = tmp_path / "skagit" / "tiles"
-    tiles.mkdir(parents=True)
-    (tiles / "depth.pmtiles").write_bytes(b"d" * 10)
-    (tiles / "base.pmtiles").write_bytes(b"b" * 4)
-    (tiles / "depth_meta.pmtiles").write_bytes(b"m")
+    make_tree(tmp_path)
     store = FakeStore()
     idx = publish.publish_aoi("skagit", tmp_path, store, version="2026-10-09T00:00:00Z", now=NOW,
                               date_range=("2014-09-15", "2026-09-30"))
@@ -122,14 +140,56 @@ def test_publish_aoi_uploads_data_before_index(tmp_path):
 
 
 def test_publish_dry_run_and_missing_depth(tmp_path):
-    tiles = tmp_path / "skagit" / "tiles"
-    tiles.mkdir(parents=True)
+    tiles, _, _ = make_tree(tmp_path)
+    (tiles / "depth.pmtiles").unlink()
     with pytest.raises(FileNotFoundError):
         publish.publish_aoi("skagit", tmp_path, FakeStore(), now=NOW, date_range=("2014-01-01", "2015-01-01"))
-    (tiles / "depth.pmtiles").write_bytes(b"x")
+    make_tree(tmp_path)
     s = FakeStore()
     publish.publish_aoi("skagit", tmp_path, s, now=NOW, date_range=("2014-01-01", "2015-01-01"), dry_run=True)
     assert s.events == []
+
+
+def test_publish_refuses_without_or_with_failed_validation(tmp_path):
+    _, _, report = make_tree(tmp_path)
+    report.unlink()
+    store = FakeStore()
+    with pytest.raises(publish.PublishRefused, match="missing"):
+        publish.publish_aoi("skagit", tmp_path, store, now=NOW, date_range=("2014-01-01", "2015-01-01"))
+    make_tree(tmp_path, passed=False)
+    with pytest.raises(publish.PublishRefused, match="gate did not pass"):
+        publish.publish_aoi("skagit", tmp_path, store, now=NOW, date_range=("2014-01-01", "2015-01-01"))
+    make_tree(tmp_path, report_aoi="nisqually")
+    with pytest.raises(publish.PublishRefused, match="AOI"):
+        publish.publish_aoi("skagit", tmp_path, store, now=NOW, date_range=("2014-01-01", "2015-01-01"))
+    (tmp_path / "skagit" / "validate" / "report.json").write_text('{"aoi": "skagit", "gate": {"passed": "yes"}}')
+    with pytest.raises(publish.PublishRefused):  # only literal true counts
+        publish.publish_aoi("skagit", tmp_path, store, now=NOW, date_range=("2014-01-01", "2015-01-01"))
+    assert store.events == []
+
+
+def test_publish_refuses_when_tiles_changed_after_validation(tmp_path):
+    tiles, _, report = make_tree(tmp_path)
+    later = report.stat().st_mtime + 50
+    os.utime(tiles / "depth.pmtiles", (later, later))
+    with pytest.raises(publish.PublishRefused, match="after validation"):
+        publish.publish_aoi("skagit", tmp_path, FakeStore(), now=NOW, date_range=("2014-01-01", "2015-01-01"))
+
+
+def test_publish_refuses_stale_tiles_older_than_merged_elev(tmp_path):
+    tiles, merged, report = make_tree(tmp_path)
+    newer = merged.stat().st_mtime + 1000  # merged raster rebuilt after the tiles (and the report)
+    os.utime(merged, (newer, newer))
+    os.utime(report, (newer + 10, newer + 10))
+    with pytest.raises(publish.PublishRefused, match="older than merged_elev"):
+        publish.publish_aoi("skagit", tmp_path, FakeStore(), now=NOW, date_range=("2014-01-01", "2015-01-01"))
+
+
+def test_direct_cli_has_no_bypass_flag():
+    import inspect
+
+    src = inspect.getsource(publish.main)
+    assert "skip" not in src and "force" not in src
 
 
 def test_r2_store_requires_env_and_uses_injected_client():
@@ -152,11 +212,17 @@ def test_r2_store_requires_env_and_uses_injected_client():
     assert c.calls[0][1][1:3] == ("bucket", "tiles/a/b/x.pmtiles") and c.calls[1] == ("put", "tiles/index.json")
 
 
-def test_versions_to_prune_keeps_current_and_recent():
+def test_versions_to_prune_counts_from_when_superseded():
+    # published 100 days ago but replaced only 19 days ago: still inside its 30-day grace period
     listing = {"skagit": ["2026-07-01T00:00:00Z", "2026-09-20T00:00:00Z", "2026-10-09T00:00:00Z"],
                "nisqually": ["2026-01-01T00:00:00Z"]}
     current = {"skagit": "2026-10-09T00:00:00Z", "nisqually": "2026-01-01T00:00:00Z"}
-    assert publish.versions_to_prune(listing, current, NOW) == [("skagit", "2026-07-01T00:00:00Z")]
+    assert publish.versions_to_prune(listing, current, NOW) == []
+    # superseded 100 days ago -> prunable; its successor (superseded 19 days ago) is kept
+    listing = {"skagit": ["2026-05-01T00:00:00Z", "2026-07-01T00:00:00Z", "2026-09-20T00:00:00Z"]}
+    assert publish.versions_to_prune(listing, {"skagit": "2026-09-20T00:00:00Z"}, NOW) == [("skagit", "2026-05-01T00:00:00Z")]
+    # the current version is never pruned, however old
+    assert publish.versions_to_prune({"skagit": ["2025-01-01T00:00:00Z"]}, {"skagit": "2025-01-01T00:00:00Z"}, NOW) == []
 
 
 def test_lite_validator_matches_schema_enum():

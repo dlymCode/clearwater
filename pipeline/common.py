@@ -11,7 +11,7 @@ import hashlib
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 # --------------------------------------------------------------------------
 # Grid / geodesy contract (AGENT-PLAN.md "Geodesy & grid")
@@ -39,6 +39,26 @@ ZOOMS: dict[str, tuple[int, int]] = {
     "fleet": (10, 16),
 }
 TILE_KINDS: tuple[str, ...] = ("base", "depth", "waterline", "fleet")
+
+#: Expected MHHW height above MLLW (ft) near each AOI's shoreline, used by the mandatory
+#: shoreline datum check in validate.py (window = value +/- SHORELINE_TOL_FT). A forgotten or
+#: sign-flipped NAVD88->MLLW offset moves the shoreline by ~2x the 2.4 ft offset, far outside it.
+#: TODO-verify every value against the NOAA tidal-datum benchmark sheets (S0-4); these are
+#: estimates interpolated from the nearest published stations (Seattle MHHW is 11.36 ft).
+AOI_MHHW_FT: dict[str, float] = {
+    "skagit": 10.0,  # TODO-verify (La Conner / Skagit Bay)
+    "port_susan": 10.8,  # TODO-verify (Stanwood / Port Susan)
+    "snohomish": 11.4,  # TODO-verify (Everett)
+    "padilla_samish": 9.0,  # TODO-verify (Padilla / Samish Bay)
+    "nisqually": 13.7,  # TODO-verify (Nisqually Reach; south Sound range is larger than Seattle)
+}
+SHORELINE_TOL_FT = 1.5
+
+#: Vertical-uncertainty buckets packed into the depth_meta tiles (mobile mirrors these constants).
+#: Index 0..14 are the levels below (a value is rounded UP to the next level; anything >= 45 ft
+#: clamps to index 14 = "45+"). Index 15 means UNKNOWN uncertainty and is used for nothing else.
+UNC_LEVELS_FT: tuple[float, ...] = (0.0, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 7.5, 10.0, 15.0, 20.0, 45.0)
+UNC_UNKNOWN_INDEX = 15
 
 # --------------------------------------------------------------------------
 # Dates
@@ -72,6 +92,10 @@ KNOWN_UNITS = ("m", "ft")
 
 class MissingVerticalCRS(ValueError):
     """Raised when a raster has no (or an unrecognised) vertical CRS metadata."""
+
+
+class MixedMetaError(ValueError):
+    """Files of one source disagree on date/uncertainty metadata in a way we cannot mosaic safely."""
 
 
 def require_vertical_crs(tags: dict[str, str] | None, name: str = "raster") -> tuple[str, str]:
@@ -174,11 +198,16 @@ class ManifestEntry:
 class Manifest:
     """``manifest.json`` for one pipeline step of one AOI (source URL, date, checksum, CRS per file)."""
 
-    def __init__(self, directory: str | Path, aoi: str, step: str = "fetch") -> None:
+    #: kinds whose CRS is read from the file itself when the caller does not supply one
+    RASTER_KINDS = ("dem", "scene_band")
+
+    def __init__(self, directory: str | Path, aoi: str, step: str = "fetch",
+                 crs_reader: Callable[[Path], str | None] | None = None) -> None:
         self.directory = Path(directory)
         self.aoi = aoi
         self.step = step
         self.entries: list[ManifestEntry] = []
+        self.crs_reader = crs_reader or read_raster_crs
 
     @property
     def path(self) -> Path:
@@ -205,6 +234,10 @@ class Manifest:
     ) -> ManifestEntry:
         rel = self._relative(Path(file_path))
         full = self.directory / rel
+        if crs is None and kind in self.RASTER_KINDS:
+            crs = self.crs_reader(full)  # populated from the dataset after download
+            if not crs:
+                raise ValueError(f"{full}: raster has no CRS; refusing to record it in the manifest")
         entry = ManifestEntry(
             path=rel,
             source_url=source_url,
@@ -246,12 +279,39 @@ class Manifest:
         return self.path
 
     @classmethod
-    def load(cls, directory: str | Path, aoi: str, step: str = "fetch") -> "Manifest":
-        m = cls(directory, aoi, step)
+    def load(cls, directory: str | Path, aoi: str, step: str = "fetch",
+             crs_reader: Callable[[Path], str | None] | None = None) -> "Manifest":
+        m = cls(directory, aoi, step, crs_reader)
         if m.path.exists():
             data = json.loads(m.path.read_text())
             m.entries = [ManifestEntry(**f) for f in data.get("files", [])]
         return m
+
+
+def clean_profile(profile: dict[str, Any]) -> dict[str, Any]:
+    """Copy of a rasterio profile without block sizes, so forcing ``tiled=True`` cannot inherit an
+    invalid strip layout (blockysize=1 etc.) from the source file."""
+    out = dict(profile)
+    out.pop("blockxsize", None)
+    out.pop("blockysize", None)
+    return out
+
+
+def read_raster_crs(path: str | Path) -> str | None:
+    """CRS string of a raster on disk (lazy rasterio import)."""
+    import rasterio  # lazy
+
+    with rasterio.open(path) as ds:
+        return ds.crs.to_string() if ds.crs else None
+
+
+def uniform_meta(entries: Iterable["ManifestEntry"]) -> dict[str, Any] | None:
+    """The shared ``meta`` of manifest entries, or None when files of one source disagree
+    (e.g. CUDEM tiles of different version years: dates must then be tracked per file)."""
+    metas = [e.meta for e in entries]
+    if not metas:
+        return {}
+    return metas[0] if all(m == metas[0] for m in metas[1:]) else None
 
 
 def chunks(seq: Iterable[Any], n: int) -> Iterable[list[Any]]:

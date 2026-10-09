@@ -88,3 +88,37 @@ def test_pdal_pipeline_classes_2_and_29_at_1m():
     assert p[1]["type"] == "filters.range"
     assert p[1]["limits"] == "Classification[2:2],Classification[29:29]"
     assert p[2]["type"] == "writers.gdal" and p[2]["resolution"] == 1.0 and p[2]["filename"] == "out.tif"
+
+
+def test_laz_requires_explicit_vertical_crs(tmp_path):
+    import json
+
+    from pipeline.common import MissingVerticalCRS
+
+    fetch = tmp_path / "skagit" / "fetch"
+    fetch.mkdir(parents=True)
+    entry = dict(path="lidar_2014/a.laz", source_url="u", download_date="d", sha256="s", crs=None, bytes=1,
+                 source="lidar_2014", kind="laz", vertical_crs=None, vertical_units="m", meta={})
+    (fetch / "manifest.json").write_text(json.dumps({"aoi": "skagit", "step": "fetch", "files": [entry]}))
+    with pytest.raises(MissingVerticalCRS, match="vertical_crs"):
+        align.stage_laz("skagit", tmp_path)
+    entry.update(vertical_crs="NAVD88", vertical_units=None)
+    (fetch / "manifest.json").write_text(json.dumps({"aoi": "skagit", "step": "fetch", "files": [entry]}))
+    with pytest.raises(MissingVerticalCRS):
+        align.stage_laz("skagit", tmp_path)
+
+
+def test_laz_class_override():
+    assert align.parse_classes("2,29") == (2, 29) and align.parse_classes("2, 40") == (2, 40)
+    p = align.pdal_pipeline("in.laz", "o.tif", classes=(2, 40))["pipeline"][1]
+    assert p["limits"] == "Classification[2:2],Classification[40:40]"
+    with pytest.raises(ValueError):
+        align.parse_classes(" , ")
+
+
+def test_clean_profile_drops_block_sizes():
+    from pipeline.common import clean_profile
+
+    p = {"blockxsize": 512, "blockysize": 1, "tiled": False, "dtype": "float32"}
+    out = clean_profile(p)
+    assert "blockxsize" not in out and "blockysize" not in out and out["dtype"] == "float32" and "blockxsize" in p

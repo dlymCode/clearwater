@@ -27,7 +27,8 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
-from .common import (DATE_NODATA, FT_PER_M, SOURCES, Manifest, days_since_epoch, step_dir)
+from .common import (DATE_NODATA, FT_PER_M, SOURCES, Manifest, MixedMetaError, clean_profile, days_since_epoch,
+                     step_dir)
 
 LIDAR_UNC_FT = 0.5
 EHYDRO_UNC_FT = 0.5
@@ -146,6 +147,33 @@ def build_arrays(source: str, elev: np.ndarray, meta: Mapping[str, Any],
     raise ValueError(f"no date/uncertainty policy for {source!r}")
 
 
+#: Sources whose dates/uncertainty are per-cell rasters shipped with the data: they cannot be rebuilt per file.
+PER_CELL_SOURCES = ("bluetopo", "coned")
+
+
+def mosaic_with_dates(source: str, elevs: Sequence[np.ndarray], metas: Sequence[Mapping[str, Any]],
+                      ref_date: int | None = None):
+    """Combine several separately warped files of ONE source whose per-file metadata differ
+    (e.g. CUDEM tiles of different version years) while keeping each file's own date and
+    uncertainty per cell. Overlaps resolve exactly like the cross-source merge (newest wins,
+    ties to lower uncertainty, then file order). Returns ``(elev, date, unc)``.
+
+    A single mosaic with one date per source would silently stamp the wrong date on some cells
+    and make newest-wins pick the wrong source, so mixed metadata is never collapsed.
+    """
+    from .merge import merge_stack  # local: merge imports common only, avoids import-time coupling
+
+    if source in PER_CELL_SOURCES:
+        raise MixedMetaError(f"{source}: per-cell date rasters cannot be rebuilt per file; "
+                             "provide contributor/uncertainty rasters instead of per-file meta")
+    if not 1 <= len(elevs) <= 255 or len(elevs) != len(metas):
+        raise ValueError("need 1..255 files with one meta dict each")
+    dates, uncs = zip(*(build_arrays(source, e, m) for e, m in zip(elevs, metas)))
+    ref = ref_date if ref_date is not None else days_since_epoch(dt.date.today())
+    res = merge_stack(np.stack(elevs), np.stack(dates), np.stack(uncs), list(range(1, len(elevs) + 1)), ref)
+    return res.elev, res.date, res.unc
+
+
 def _need(meta: Mapping[str, Any], key: str, source: str) -> Any:
     if key not in meta:
         raise ValueError(f"{source}: manifest meta lacks {key!r} (register with --meta '{{\"{key}\": ...}}')")
@@ -160,9 +188,14 @@ def run(aoi: str, data_dir: Path) -> None:
     for source in manifest.sources("dem"):
         sdir = align_dir / source
         meta = manifest.select(source=source)[0].meta
+        if meta.get("per_file_meta"):  # align already wrote date.tif/unc.tif per file
+            for f in ("date.tif", "unc.tif"):
+                if not (sdir / f).exists():
+                    raise FileNotFoundError(f"{sdir / f} missing; rerun `align --stage warp`")
+            continue
         with rasterio.open(sdir / "elev.tif") as ds:
             elev = ds.read(1).astype(np.float32)
-            profile = dict(ds.profile)
+            profile = clean_profile(ds.profile)
         contributor = unc_m = table = None
         if (sdir / "contributor.tif").exists():
             with rasterio.open(sdir / "contributor.tif") as c:
@@ -175,7 +208,7 @@ def run(aoi: str, data_dir: Path) -> None:
         date, unc = build_arrays(source, elev, meta, contributor, unc_m, table)
         for name, arr, dtype, nodata in (("date", date, "int32", DATE_NODATA), ("unc", unc, "float32", float("nan"))):
             prof = dict(profile)
-            prof.update(dtype=dtype, nodata=nodata, count=1, compress="deflate")
+            prof.update(tiled=True, dtype=dtype, nodata=nodata, count=1, compress="deflate")
             with rasterio.open(sdir / f"{name}.tif", "w", **prof) as dst:
                 dst.write(arr, 1)
 

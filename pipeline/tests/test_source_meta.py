@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 
 from pipeline import source_meta as sm
-from pipeline.common import DATE_NODATA, FT_PER_M, days_since_epoch
+from pipeline.common import DATE_NODATA, FT_PER_M, ManifestEntry, MixedMetaError, days_since_epoch, uniform_meta
 
 ELEV = np.array([[1.0, np.nan], [3.0, 4.0]], dtype=np.float32)
 
@@ -46,3 +46,30 @@ def test_build_arrays_dispatch_and_missing_meta():
         sm.build_arrays("bluetopo", ELEV, {})
     with pytest.raises(ValueError):
         sm.build_arrays("nope", ELEV, {})
+
+
+def _entry(meta):
+    return ManifestEntry(path="x.tif", source_url=None, download_date="d", sha256="s", crs="EPSG:32610", bytes=1, source="cudem", meta=meta)
+
+
+def test_uniform_meta_detects_mixed_files():
+    assert uniform_meta([_entry({"version_year": 2023}), _entry({"version_year": 2023})]) == {"version_year": 2023}
+    assert uniform_meta([_entry({"version_year": 2023}), _entry({"version_year": 2024})]) is None
+    assert uniform_meta([]) == {}
+
+
+def test_mosaic_keeps_each_files_own_date_and_unc():
+    # two CUDEM tiles of different version years overlapping in the middle column
+    a = np.array([[1.0, 1.0, np.nan]], dtype=np.float32)
+    b = np.array([[np.nan, 2.0, 2.0]], dtype=np.float32)
+    e, d, u = sm.mosaic_with_dates("cudem", [a, b], [{"version_year": 2023}, {"version_year": 2024}])
+    assert e[0].tolist() == [1.0, 2.0, 2.0]  # overlap -> the newer tile
+    assert d[0].tolist() == [days_since_epoch("2023-01-01"), days_since_epoch("2024-01-01"), days_since_epoch("2024-01-01")]
+    assert u[0].tolist() == [1.0, 1.0, 1.0]
+    # a single collapsed date would have stamped the wrong year on tile A's cell
+    assert d[0, 0] != d[0, 2]
+
+
+def test_mosaic_refuses_per_cell_sources():
+    with pytest.raises(MixedMetaError):
+        sm.mosaic_with_dates("bluetopo", [ELEV, ELEV], [{}, {}])

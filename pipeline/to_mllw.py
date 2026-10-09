@@ -25,8 +25,8 @@ from typing import Protocol, Sequence
 
 import numpy as np
 
-from .common import (FT_PER_M, TARGET_DATUM, TARGET_UNITS, Manifest, MissingVerticalCRS, require_vertical_crs,
-                     step_dir, vertical_tags)
+from .common import (FT_PER_M, TARGET_DATUM, TARGET_UNITS, Manifest, MissingVerticalCRS, clean_profile,
+                     require_vertical_crs, step_dir, vertical_tags)
 
 
 def meters_to_feet(z_m):
@@ -113,7 +113,7 @@ def convert_raster(src_path: str | Path, dst_path: str | Path, provider: OffsetP
         if src_units:
             tags.setdefault("VERTICAL_UNITS", src_units)
         datum, units = require_vertical_crs(tags, str(src_path))  # rejects untagged rasters
-        profile = dict(src.profile)
+        profile = clean_profile(src.profile)
         profile.update(dtype="float32", nodata=float("nan"), count=1, compress="deflate", tiled=True)
         tf = None
         if datum == "NAVD88":

@@ -20,7 +20,8 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
-from .common import CELL_M, WORK_CRS, Manifest, step_dir
+from .common import (CELL_M, WORK_CRS, Manifest, MissingVerticalCRS, require_mllw_ft, step_dir, uniform_meta,
+                     vertical_tags)
 from .geo import Grid, grid_for_lonlat_bbox
 
 RESAMPLING = {"dem": "bilinear", "lidar": "min", "categorical": "near"}
@@ -99,15 +100,40 @@ def aoi_grid(aoi: str) -> Grid:
     return grid_for_lonlat_bbox(AOIS[aoi].bbox, CELL_M)
 
 
-def stage_laz(aoi: str, data_dir: Path) -> None:
-    """Rasterize each fetched LAZ to a 1 m NAVD88 raster and register it (units m, NAVD88) for to_mllw."""
+def parse_classes(text: str) -> tuple[int, ...]:
+    classes = tuple(int(c) for c in text.split(",") if c.strip())
+    if not classes:
+        raise ValueError("no LAZ classes given")
+    return classes
+
+
+def stage_laz(aoi: str, data_dir: Path, classes: Sequence[int] = (GROUND_CLASS, BATHY_CLASS)) -> None:
+    """Rasterize each fetched LAZ to a 1 m raster and register it for to_mllw.
+
+    The LAZ's vertical datum and units must be recorded explicitly in the fetch manifest
+    (``--vertical-crs`` / ``--units`` at registration); there are no defaults, because a guessed
+    datum is exactly the kind of silent 2.4 ft error the pipeline exists to prevent.
+    """
     fetch = Manifest.load(step_dir(data_dir, aoi, "fetch"), aoi, "fetch")
     for e in fetch.select(kind="laz"):
+        if not e.vertical_crs or not e.vertical_units:
+            raise MissingVerticalCRS(f"{e.path}: LAZ manifest entry lacks vertical_crs/vertical_units; "
+                                     "re-register it with --vertical-crs and --units")
         out_tif = fetch.directory / e.source / (Path(e.path).stem + "_1m.tif")
-        run_pdal(pdal_pipeline(fetch.directory / e.path, out_tif), fetch.directory / "pdal" / (Path(e.path).stem + ".json"))
-        fetch.add_file(out_tif, source_url=e.source_url, crs=e.crs, source=e.source, kind="dem",
-                       vertical_crs=e.vertical_crs or "NAVD88", vertical_units=e.vertical_units or "m", meta=e.meta)
+        run_pdal(pdal_pipeline(fetch.directory / e.path, out_tif, classes=classes),
+                 fetch.directory / "pdal" / (Path(e.path).stem + ".json"))
+        fetch.add_file(out_tif, source_url=e.source_url, source=e.source, kind="dem",
+                       vertical_crs=e.vertical_crs, vertical_units=e.vertical_units, meta=e.meta)
     fetch.save()
+
+
+def verify_inputs_mllw(files: Sequence[Path]) -> None:
+    """Every warp input must itself be tagged MLLW/ft (to_mllw wrote it); never re-tag blindly."""
+    import rasterio  # lazy
+
+    for f in files:
+        with rasterio.open(f) as ds:
+            require_mllw_ft(dict(ds.tags()), str(f))
 
 
 def stage_warp(aoi: str, data_dir: Path) -> Manifest:
@@ -116,23 +142,73 @@ def stage_warp(aoi: str, data_dir: Path) -> Manifest:
     grid = aoi_grid(aoi)
     out = Manifest(out_dir, aoi, "align")
     for source in mllw.sources("dem"):
-        files = [mllw.directory / e.path for e in mllw.select(source=source, kind="dem")]
+        entries = mllw.select(source=source, kind="dem")
+        files = [mllw.directory / e.path for e in entries]
+        verify_inputs_mllw(files)
         dst = out_dir / source / "elev.tif"
         dst.parent.mkdir(parents=True, exist_ok=True)
-        run_cmd(warp_command(files, dst, grid, RESAMPLING[kind_of(source)], nodata=float("nan")))
+        shared = uniform_meta(entries)
+        if shared is not None:
+            run_cmd(warp_command(files, dst, grid, RESAMPLING[kind_of(source)], nodata=float("nan")))
+            meta = shared
+        else:
+            # Files of one source carry different dates/uncertainty: warp each alone and mosaic
+            # elevation + per-file date + unc together (never one date for the whole source).
+            _warp_per_file(source, entries, files, dst, grid)
+            meta = {"per_file_meta": True}
         out.add_file(dst, source_url=None, crs=WORK_CRS, source=source, kind="dem",
-                     vertical_crs="MLLW", vertical_units="ft", meta=mllw.select(source=source)[0].meta)
-        # gdalwarp keeps dataset tags only from the first input; re-assert the vertical CRS explicitly.
-        _retag(dst)
+                     vertical_crs="MLLW", vertical_units="ft", meta=meta)
+        _retag(dst)  # inputs verified above; gdalwarp only keeps tags from its first input
     (out_dir / "grid.json").write_text(json.dumps(grid.to_dict(), indent=2))
     out.save()
     return out
 
 
+def _warp_per_file(source: str, entries, files: Sequence[Path], dst: Path, grid: Grid,
+                   strip_rows: int = 1024) -> None:
+    import numpy as np
+    import rasterio  # lazy
+    from rasterio.windows import Window
+
+    from .common import DATE_NODATA, clean_profile
+    from .source_meta import mosaic_with_dates
+
+    tmp_dir = dst.parent / "_perfile"
+    tmp_dir.mkdir(exist_ok=True)
+    warped: list[Path] = []
+    for f in files:
+        w = tmp_dir / f.name
+        run_cmd(warp_command([f], w, grid, RESAMPLING[kind_of(source)], nodata=float("nan")))
+        warped.append(w)
+    metas = [e.meta for e in entries]
+    handles = [rasterio.open(w) for w in warped]
+    try:
+        prof = clean_profile(handles[0].profile)
+        prof.update(count=1, compress="deflate", tiled=True)
+        outs = {
+            "elev": rasterio.open(dst, "w", **{**prof, "dtype": "float32", "nodata": float("nan")}),
+            "date": rasterio.open(dst.with_name("date.tif"), "w", **{**prof, "dtype": "int32", "nodata": DATE_NODATA}),
+            "unc": rasterio.open(dst.with_name("unc.tif"), "w", **{**prof, "dtype": "float32", "nodata": float("nan")}),
+        }
+        try:
+            h, wd = handles[0].height, handles[0].width
+            for r0 in range(0, h, strip_rows):
+                win = Window(0, r0, wd, min(strip_rows, h - r0))
+                elevs = [hd.read(1, window=win).astype(np.float32) for hd in handles]
+                e, d, u = mosaic_with_dates(source, elevs, metas)
+                outs["elev"].write(e, 1, window=win)
+                outs["date"].write(d, 1, window=win)
+                outs["unc"].write(u, 1, window=win)
+        finally:
+            for o in outs.values():
+                o.close()
+    finally:
+        for hd in handles:
+            hd.close()
+
+
 def _retag(path: Path) -> None:
     import rasterio  # lazy
-
-    from .common import vertical_tags
 
     with rasterio.open(path, "r+") as ds:
         ds.update_tags(**vertical_tags())
@@ -143,9 +219,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--aoi", required=True)
     p.add_argument("--data-dir", type=Path, default=Path("data"))
     p.add_argument("--stage", choices=["laz", "warp"], required=True)
+    p.add_argument("--classes", default="2,29",
+                   help="LAZ classification codes to keep (PRD: 2 ground + 29 bathy bottom). ASPRS bathymetry is "
+                        "often class 40; verify against the real LAZ in S0.")
     a = p.parse_args(argv)
     if a.stage == "laz":
-        stage_laz(a.aoi, a.data_dir)
+        stage_laz(a.aoi, a.data_dir, parse_classes(a.classes))
     else:
         stage_warp(a.aoi, a.data_dir)
     return 0

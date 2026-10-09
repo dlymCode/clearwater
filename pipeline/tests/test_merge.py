@@ -115,3 +115,24 @@ def test_rejects_rasters_without_vertical_crs():
         check_vertical_crs({"a": {"VERTICAL_CRS": "NAVD88", "VERTICAL_UNITS": "m"}})
     with pytest.raises(MissingVerticalCRS):
         check_vertical_crs({"a": {"VERTICAL_CRS": "MLLW"}})
+
+
+def test_ten_year_rule_never_changes_newest_wins_outcomes():
+    """As specified, the 10-year rule is redundant with newest-wins (an old source can only win when no
+    recent source covers the cell). This equivalence test protects that intent if merge logic changes:
+    disabling the rule must yield identical output on randomized stacks."""
+    rng = np.random.default_rng(42)
+    for _ in range(25):
+        s_, h, w = int(rng.integers(2, 6)), 6, 7
+        elev = rng.uniform(-10, 10, (s_, h, w)).astype(np.float32)
+        elev[rng.random((s_, h, w)) < 0.3] = np.nan
+        date = (REF - rng.integers(0, 20 * 365, (s_, h, w))).astype(np.int32)  # ages 0..20 years
+        date[rng.random((s_, h, w)) < 0.1] = DATE_NODATA
+        unc = rng.uniform(0.1, 5, (s_, h, w)).astype(np.float32)
+        unc[rng.random((s_, h, w)) < 0.1] = np.nan
+        codes = list(range(1, s_ + 1))
+        with_rule = merge_stack(elev, date, unc, codes, REF)
+        without = merge_stack(elev, date, unc, codes, REF, max_age_days=10**9)
+        for a, b in zip((with_rule.elev, with_rule.src, with_rule.date, with_rule.unc),
+                        (without.elev, without.src, without.date, without.unc)):
+            assert np.array_equal(a, b, equal_nan=True)

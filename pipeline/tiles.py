@@ -18,8 +18,8 @@ Encodings (pure numpy, unit-tested)
     G, B = big-endian uint16 of (days_since_1970 + 32872), i.e. days since 1880-01-01 (to 2059)
     A = 255 valid cell, 0 hole (all other channels 0)
 
-``unc_index`` indexes :data:`UNC_LEVELS_FT` and always rounds *up* (the popup never understates
-uncertainty). Alpha is deliberately not data: browsers premultiply alpha and would destroy RGB.
+``unc_index`` indexes ``common.UNC_LEVELS_FT`` (0..14, rounded *up* so the popup never understates
+uncertainty; anything >= 45 ft clamps to 14 = "45+"). Index 15 means UNKNOWN uncertainty and nothing else. Alpha is deliberately not data: browsers premultiply alpha and would destroy RGB.
 
 Tile resampling MUST be nearest-neighbour: averaging encoded RGB bytes is meaningless.
 Subprocess wrappers (gdalwarp, gdal_translate, tippecanoe, pmtiles, ogr2ogr) only build and
@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import logging
 import shutil
 import subprocess
 import sys
@@ -38,7 +39,7 @@ from typing import Mapping, Sequence
 
 import numpy as np
 
-from .common import DATE_NODATA, OUT_CRS, ZOOMS, step_dir
+from .common import (DATE_NODATA, OUT_CRS, UNC_LEVELS_FT, UNC_UNKNOWN_INDEX, ZOOMS, clean_profile, step_dir)
 
 # ------------------------------------------------------------------ Terrain-RGB
 TERRAIN_BASE = -10000.0
@@ -65,17 +66,17 @@ def decode_terrain_rgb(rgb: np.ndarray) -> np.ndarray:
 
 
 # ------------------------------------------------------------------ source/date/unc pack
-UNC_LEVELS_FT: tuple[float, ...] = (0.0, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 7.5, 10.0, 15.0, 20.0, 30.0, 50.0)
+log = logging.getLogger(__name__)
 _DATE_EPOCH_SHIFT = (dt.date(1970, 1, 1) - dt.date(1880, 1, 1)).days  # 32872
-UNKNOWN_UNC_INDEX = 15  # NaN uncertainty -> highest bucket (50+ ft): "unknown" must not look precise
 
 
 def encode_unc_index(unc_ft: np.ndarray) -> np.ndarray:
+    """Bucket index 0..14 (round up, clamp >= 45 ft to 14); NaN -> 15 (unknown, used for nothing else)."""
     u = np.asarray(unc_ft, dtype=np.float64)
     levels = np.asarray(UNC_LEVELS_FT)
     idx = np.searchsorted(levels, np.where(np.isfinite(u), u, 0.0), side="left")  # smallest level >= u
     idx = np.minimum(idx, len(levels) - 1)
-    return np.where(np.isfinite(u), idx, UNKNOWN_UNC_INDEX).astype(np.uint8)
+    return np.where(np.isfinite(u), idx, UNC_UNKNOWN_INDEX).astype(np.uint8)
 
 
 def pack_source_date(src: np.ndarray, date: np.ndarray, unc_ft: np.ndarray) -> np.ndarray:
@@ -85,7 +86,11 @@ def pack_source_date(src: np.ndarray, date: np.ndarray, unc_ft: np.ndarray) -> n
         raise ValueError("source codes above 15 do not fit in 4 bits")
     date = np.asarray(date).astype(np.int64)
     hole = (src == 0) | (date == DATE_NODATA)
-    d16 = np.clip(date + _DATE_EPOCH_SHIFT, 0, 65535).astype(np.uint16)
+    shifted = date + _DATE_EPOCH_SHIFT
+    clamped = int((~hole & ((shifted < 0) | (shifted > 65535))).sum())
+    if clamped:
+        log.warning("%d cell date(s) outside the packable 1880-01-01..2059-06 range were clamped", clamped)
+    d16 = np.clip(shifted, 0, 65535).astype(np.uint16)
     r = ((src.astype(np.uint8) << 4) | encode_unc_index(unc_ft)).astype(np.uint8)
     out = np.stack([r, (d16 >> 8).astype(np.uint8), (d16 & 0xFF).astype(np.uint8),
                     np.where(hole, 0, 255).astype(np.uint8)], axis=-1)
@@ -97,10 +102,14 @@ def unpack_source_date(rgba: np.ndarray) -> dict[str, np.ndarray]:
     a = np.asarray(rgba)
     valid = a[..., 3] == 255
     d16 = (a[..., 1].astype(np.int64) << 8) | a[..., 2].astype(np.int64)
+    idx = a[..., 0] & 0x0F
+    known = valid & (idx != UNC_UNKNOWN_INDEX)
+    levels = np.asarray(UNC_LEVELS_FT + (np.nan,), dtype=np.float32)  # index 15 -> NaN (unknown)
     return {
         "valid": valid,
         "src": np.where(valid, a[..., 0] >> 4, 0).astype(np.uint8),
-        "unc_ft": np.where(valid, np.asarray(UNC_LEVELS_FT, dtype=np.float32)[a[..., 0] & 0x0F], np.nan).astype(np.float32),
+        "unc_ft": np.where(known, levels[idx], np.nan).astype(np.float32),
+        "unc_unknown": valid & (idx == UNC_UNKNOWN_INDEX),
         "date": np.where(valid, d16 - _DATE_EPOCH_SHIFT, DATE_NODATA).astype(np.int32),
     }
 
@@ -168,12 +177,15 @@ def enc_to_geojson_cmds(enc_cells: Sequence[str | Path], out_dir: str | Path) ->
     return [ogr2ogr_cmd(c, layer, out / f"{Path(c).stem}_{layer}.geojson") for c in enc_cells for layer in ENC_LAYERS]
 
 
-def tippecanoe_cmd(layers: Mapping[str, str | Path], out_pmtiles: str | Path, zmin: int = 8, zmax: int = 16) -> list[str]:
-    """``layers`` maps vector layer name -> GeoJSON path."""
+def tippecanoe_cmd(layers: Mapping[str, str | Path | Sequence[str | Path]], out_pmtiles: str | Path,
+                   zmin: int = 8, zmax: int = 16) -> list[str]:
+    """``layers`` maps vector layer name -> one GeoJSON path or a list of them (one per ENC cell;
+    repeated ``-L name:file`` entries with the same name are combined into a single layer)."""
     cmd = ["tippecanoe", "-o", str(out_pmtiles), "--force", f"-Z{zmin}", f"-z{zmax}", "--drop-densest-as-needed",
            "--extend-zooms-if-still-dropping", "--read-parallel"]
-    for name, path in layers.items():
-        cmd += ["-L", f"{name}:{path}"]
+    for name, paths in layers.items():
+        for path in ([paths] if isinstance(paths, (str, Path)) else paths):
+            cmd += ["-L", f"{name}:{path}"]
     return cmd
 
 
@@ -182,7 +194,7 @@ def _write_rgb_tif(path: Path, arr: np.ndarray, grid_ref: Path) -> None:
     import rasterio  # lazy
 
     with rasterio.open(grid_ref) as ref:
-        prof = dict(ref.profile)
+        prof = clean_profile(ref.profile)
     bands = arr.shape[-1]
     prof.update(dtype="uint8", count=bands, nodata=None, compress="deflate",
                 photometric="RGB" if bands == 3 else None)
@@ -224,6 +236,19 @@ def stage_raster(aoi: str, data_dir: Path) -> list[Path]:
     return made
 
 
+#: Layers whose absence is fatal: no depth areas or shoreline means the base map is unusable.
+REQUIRED_ENC_LAYERS: tuple[str, ...] = ("DEPARE", "COALNE")
+
+
+def collect_layer_files(geojson_dir: Path) -> dict[str, list[Path]]:
+    """Every per-cell GeoJSON for each ENC layer (all cells are tiled; WRECKS/OBSTRN are hazard layers)."""
+    out = {layer: sorted(geojson_dir.glob(f"*_{layer}.geojson")) for layer in ENC_LAYERS}
+    missing = [layer for layer in REQUIRED_ENC_LAYERS if not out[layer]]
+    if missing:
+        raise FileNotFoundError(f"required ENC layer(s) produced no output from any cell: {', '.join(missing)}")
+    return {k: v for k, v in out.items() if v}
+
+
 def stage_vector(aoi: str, data_dir: Path) -> Path:
     enc_dir = step_dir(data_dir, aoi, "fetch") / "enc"
     cells = sorted(enc_dir.glob("*.000"))
@@ -233,9 +258,15 @@ def stage_vector(aoi: str, data_dir: Path) -> Path:
     gj = out / "enc_geojson"
     gj.mkdir(parents=True, exist_ok=True)
     for cmd in enc_to_geojson_cmds(cells, gj):
-        run(cmd, env={"OGR_S57_OPTIONS": S57_OPTIONS})
-    layers = {layer: p for layer in ENC_LAYERS for p in sorted(gj.glob(f"*_{layer}.geojson"))[:1]}
-    # TODO: merge multi-cell layers, add WDFW boundary GeoJSON as extra -L layers. OSM stays in its own file (ODbL).
+        try:
+            run(cmd, env={"OGR_S57_OPTIONS": S57_OPTIONS})
+        except subprocess.CalledProcessError:
+            # A cell legitimately lacks many optional layers (no lights, no wrecks...). Only the
+            # *absence across all cells* of DEPARE/COALNE is fatal (checked below).
+            print(f"note: {cmd[-1]} not extracted from {cmd[-2]}", file=sys.stderr)
+            Path(cmd[-3]).unlink(missing_ok=True)
+    layers = collect_layer_files(gj)
+    # TODO: add WDFW boundary GeoJSON as extra -L layers. OSM stays in its own file (ODbL).
     base = out / "base.pmtiles"
     run(tippecanoe_cmd(layers, base, *ZOOMS["base"]))
     return base

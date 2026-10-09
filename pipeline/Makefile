@@ -14,9 +14,11 @@ DATA    ?= $(ROOT)/data
 RUNS    ?= $(wildcard $(DATA)/ground_truth/$(AOI)/*.csv)
 # VDatum NAVD88->MLLW grid (manual download). Required by step-mllw for NAVD88 rasters.
 GTX     ?=
-# ENC COALNE GeoJSON for the datum sanity check (optional; produced by the tiles vector stage)
+# ENC COALNE GeoJSON for the MANDATORY shoreline datum check (produced by the tiles vector stage)
 COALNE  ?= $(wildcard $(DATA)/$(AOI)/tiles/enc_geojson/*_COALNE.geojson)
 PUBLISH_FLAGS ?=
+# Dev-only overrides for validate: --skip-waterline-gate --skip-shoreline-check (never for a real publish)
+VALIDATE_FLAGS ?=
 
 PYRUN = cd $(ROOT) && $(PY) -m
 
@@ -59,8 +61,8 @@ step-merge: need-aoi
 # Runs after step-tiles only because the shoreline datum check needs the ENC COALNE GeoJSON that
 # the tiles vector stage produces; nothing is uploaded until step-publish, which comes last.
 step-validate: need-aoi
-	@test -n "$(strip $(RUNS))" || (echo "no ground-truth CSVs in $(DATA)/ground_truth/$(AOI)/ (or pass RUNS=...); refusing to publish unvalidated tiles" && exit 2)
-	$(PYRUN) pipeline.validate --aoi $(AOI) --data-dir $(DATA) --runs $(RUNS) $(if $(strip $(COALNE)),--coalne $(firstword $(COALNE)),)
+	@test $(words $(RUNS)) -ge 3 || (echo "need >= 3 ground-truth CSVs in $(DATA)/ground_truth/$(AOI)/ (or pass RUNS=...), found $(words $(RUNS)); refusing to publish unvalidated tiles" && exit 2)
+	$(PYRUN) pipeline.validate --aoi $(AOI) --data-dir $(DATA) --runs $(RUNS) --coalne $(COALNE) $(VALIDATE_FLAGS)
 
 step-tiles: need-aoi
 	$(PYRUN) pipeline.tiles --aoi $(AOI) --data-dir $(DATA) --stage all

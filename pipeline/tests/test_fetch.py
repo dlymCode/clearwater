@@ -17,7 +17,17 @@ MDAPI = {"stations": [
     {"id": "9447659", "name": "Everett", "state": "WA", "lat": 47.9833, "lng": -122.2167},
     {"id": "9447855", "name": "Coupeville", "state": "WA", "lat": 48.2200, "lng": -122.6867},
     {"id": "1111111", "name": "La Conner, Oregon", "state": "OR", "lat": 44.0, "lng": -123.0},
+    {"id": "9447130", "name": "Seattle", "state": "WA", "lat": 47.60264, "lng": -122.33931},
+    {"id": "9444900", "name": "Port Townsend", "state": "WA", "lat": 48.11286, "lng": -122.75950},
+    {"id": "9449880", "name": "Friday Harbor", "state": "WA", "lat": 48.54530, "lng": -123.01250},
+    {"id": "9449424", "name": "Cherry Point", "state": "WA", "lat": 48.86310, "lng": -122.75890},
+    {"id": "9446484", "name": "Tacoma", "state": "WA", "lat": 47.26867, "lng": -122.41333},
+    {"id": "9444090", "name": "Port Angeles", "state": "WA", "lat": 48.12500, "lng": -123.44000},
 ]}
+
+
+def fake_crs(path):
+    return "EPSG:4269"
 
 
 def fake_http_get(url):
@@ -99,17 +109,40 @@ def test_manifest_round_trip(tmp_path):
     (d / "cudem").mkdir(parents=True)
     f = d / "cudem" / "t.tif"
     f.write_bytes(b"hello")
-    m = Manifest(d, "skagit")
-    m.add_file(f, source_url="https://example/t.tif", crs="EPSG:4269", source="cudem", vertical_crs="NAVD88", vertical_units="m")
+    m = Manifest(d, "skagit", crs_reader=fake_crs)
+    m.add_file(f, source_url="https://example/t.tif", source="cudem", vertical_crs="NAVD88", vertical_units="m")
     m.add_file("cudem/t.tif", source_url="https://example/t.tif", source="cudem")  # re-add replaces
     m.save()
     data = json.loads((d / "manifest.json").read_text())
     (e,) = data["files"]
     assert e["path"] == "cudem/t.tif" and e["source_url"] == "https://example/t.tif"
     assert e["sha256"] == "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
-    assert e["download_date"].endswith("Z") and e["bytes"] == 5 and "crs" in e
-    again = Manifest.load(d, "skagit")
+    assert e["download_date"].endswith("Z") and e["bytes"] == 5
+    assert e["crs"] == "EPSG:4269"  # populated from the dataset, never left null
+    again = Manifest.load(d, "skagit", crs_reader=fake_crs)
     assert again.select(source="cudem")[0].sha256 == e["sha256"]
+
+
+def test_manifest_rejects_raster_without_crs(tmp_path):
+    f = tmp_path / "x.tif"
+    f.write_bytes(b"x")
+    m = Manifest(tmp_path, "skagit", crs_reader=lambda p: None)
+    with pytest.raises(ValueError, match="no CRS"):
+        m.add_file(f, source_url="u", source="cudem")
+    # non-raster kinds are not read
+    m.add_file(f, source_url="u", source="enc", kind="other")
+
+
+def test_http_download_is_atomic(tmp_path):
+    src = tmp_path / "remote.bin"
+    src.write_bytes(b"payload")
+    dest = tmp_path / "out" / "f.tif"
+    fb.http_download(src.as_uri(), dest)
+    assert dest.read_bytes() == b"payload" and not list(dest.parent.glob("*.part"))
+    bad = tmp_path / "out" / "g.tif"
+    with pytest.raises(Exception):
+        fb.http_download((tmp_path / "missing.bin").as_uri(), bad)
+    assert not bad.exists() and not list(bad.parent.glob("g.tif*"))
 
 
 # ---------------------------------------------------------------- tides
@@ -182,7 +215,7 @@ def test_run_writes_manifest_and_scenes_with_tide_tags(tmp_path):
     tagger = fb.TideTagger(stations=coops.ALL_STATIONS, http_get=fake_http_get)
     m = fb.run("skagit", tmp_path, today=dt.date(2026, 10, 9), cudem=fb.CudemFetcher(tile_index=index, download=dl),
                bluetopo=fb.BlueTopoFetcher(fetch_fn=bt_fetch), s2=fb.Sentinel2Searcher(client_factory=FakeClient),
-               tagger=tagger, download_scenes=False)
+               tagger=tagger, download_scenes=False, crs_reader=fake_crs)
     assert bt_calls and "desired_area_filename" in bt_calls[0][1]
     mf = json.loads((tmp_path / "skagit" / "fetch" / "manifest.json").read_text())
     by_src = {f["source"]: f for f in mf["files"]}
@@ -190,6 +223,7 @@ def test_run_writes_manifest_and_scenes_with_tide_tags(tmp_path):
     assert by_src["bluetopo"]["vertical_crs"] == "MLLW"
     for f in mf["files"]:
         assert f["sha256"] and f["source_url"] and f["download_date"]
+        assert f["crs"] == "EPSG:4269"  # CRS recorded for every raster file
     scenes = json.loads((tmp_path / "skagit" / "fetch" / "scenes.json").read_text())["scenes"]
     assert [s["id"] for s in scenes] == ["S2_0", "S2_1"]  # sorted by time
     for s in scenes:
@@ -209,8 +243,11 @@ def test_fetch_tides_exact_shape(tmp_path):
     paths = fetch_tides.fetch_all(tmp_path, now=now, days=30, http_get=fake_http_get)
     assert len(paths) == 10
     d = json.loads((tmp_path / "9447130.json").read_text())
-    assert list(d) == ["station_id", "name", "datum", "units", "predictions"]
+    assert list(d) == ["station_id", "name", "datum", "units", "lat", "lon", "predictions"]
     assert d["station_id"] == "9447130" and d["name"] == "Seattle" and d["datum"] == "MLLW" and d["units"] == "ft"
+    assert d["lat"] == pytest.approx(47.60264) and d["lon"] == pytest.approx(-122.33931)  # from the metadata API
+    lc = json.loads((tmp_path / "9448576.json").read_text())
+    assert lc["lat"] == pytest.approx(48.3917) and lc["lon"] == pytest.approx(-122.4950)
     p = d["predictions"]
     assert p[0]["t"] == "2026-10-09T05:00:00Z" and p[-1]["t"] == "2026-11-08T05:00:00Z"
     assert set(p[0]) == {"t", "v"} and isinstance(p[0]["v"], float)

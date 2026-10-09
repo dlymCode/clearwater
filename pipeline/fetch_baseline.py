@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import os
 import re
 import shutil
 import sys
@@ -114,10 +115,18 @@ def select_tiles(tiles: Iterable[TileRecord], bbox: BBox) -> list[TileRecord]:
 
 
 def http_download(url: str, dest: Path, timeout: float = 300.0) -> None:
+    """Atomic download: stream to ``<dest>.part`` and rename on success, so an interrupted run
+    never leaves a truncated file that a rerun would mistake for a finished download."""
     dest.parent.mkdir(parents=True, exist_ok=True)
+    part = dest.with_name(dest.name + ".part")
     req = urllib.request.Request(url, headers={"User-Agent": "clearwater-pipeline"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp, open(dest, "wb") as fh:  # noqa: S310
-        shutil.copyfileobj(resp, fh)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp, open(part, "wb") as fh:  # noqa: S310
+            shutil.copyfileobj(resp, fh)
+        os.replace(part, dest)
+    finally:
+        if part.exists():
+            part.unlink()
 
 
 class CudemFetcher:
@@ -149,7 +158,7 @@ class CudemFetcher:
             if not dest.exists():  # reruns are safe
                 self._download(t.url, dest)
             vy = parse_version_year(t.name)
-            manifest.add_file(dest, source_url=t.url, crs=None, source="cudem", kind="dem",
+            manifest.add_file(dest, source_url=t.url, source="cudem", kind="dem",
                               vertical_crs="NAVD88", vertical_units="m",
                               meta={"version_year": vy} if vy else {})
             paths.append(dest)
@@ -192,7 +201,7 @@ class BlueTopoFetcher:
         found = sorted(root.rglob("*.tiff")) + sorted(root.rglob("*.tif"))
         for p in found:
             # BlueTopo tiles are MLLW metres; the fetcher verifies published checksums itself.
-            manifest.add_file(p, source_url="s3://noaa-ocs-nationalbathymetry-pds/BlueTopo/", crs=None,
+            manifest.add_file(p, source_url="s3://noaa-ocs-nationalbathymetry-pds/BlueTopo/",
                               source="bluetopo", kind="dem", vertical_crs="MLLW", vertical_units="m")
         return found
 
@@ -303,19 +312,28 @@ class Sentinel2Searcher:
                 with rasterio.open(href) as src:
                     b = transform_bounds("EPSG:4326", src.crs, *aoi.bbox)
                     win = from_bounds(*b, transform=src.transform).round_offsets().round_lengths()
-                    data = src.read(1, window=win)
+                    # boundless: an AOI window that spills over the scene edge is padded with 0
+                    # (SCL 0 = no data; B03/B08 0 are excluded by the NDWI denominator test)
+                    data = src.read(1, window=win, boundless=True, fill_value=0)
                     profile = dict(src.profile)
-                    profile.update(height=data.shape[0], width=data.shape[1],
+                    profile.update(driver="GTiff", height=data.shape[0], width=data.shape[1],
                                    transform=src.window_transform(win), compress="deflate")
-                with rasterio.open(dest, "w", **profile) as dst:
+                    for k in ("blockxsize", "blockysize", "tiled"):
+                        profile.pop(k, None)
+                part = dest.with_name(dest.name + ".part")
+                with rasterio.open(part, "w", **profile) as dst:
                     dst.write(data, 1)
-            manifest.add_file(dest, source_url=href.split("?")[0], crs=None, source="sentinel2", kind="scene_band")
+                os.replace(part, dest)
+            manifest.add_file(dest, source_url=href.split("?")[0], source="sentinel2", kind="scene_band")
             scene.files[band] = dest.relative_to(out_dir).as_posix()
 
 
 # ------------------------------------------------------------------ orchestration
 def tag_scenes(scenes: list[SceneRecord], aoi: AOI, tagger: TideTagger, window: tuple[dt.datetime, dt.datetime]) -> None:
     station = tagger.station_for(aoi)
+    if aoi.slug == "nisqually" and station.id == "9446484":
+        print("warning: nisqually scenes are tide-tagged from Tacoma (9446484); select a nearer subordinate "
+              "station from the CO-OPS metadata API (S0 TODO, see coops.py)", file=sys.stderr)
     for s in scenes:
         when = dt.datetime.fromisoformat(s.datetime.replace("Z", "+00:00"))
         if when.tzinfo is None:
@@ -344,12 +362,12 @@ def plan_text(aoi: AOI, interval: str, cudem_tiles: list[TileRecord] | None) -> 
 def run(aoi_slug: str, data_dir: Path, *, skip: set[str] | None = None, today: dt.date | None = None,
         cudem: CudemFetcher | None = None, bluetopo: BlueTopoFetcher | None = None,
         s2: Sentinel2Searcher | None = None, tagger: TideTagger | None = None,
-        download_scenes: bool = True) -> Manifest:
+        download_scenes: bool = True, crs_reader=None) -> Manifest:
     skip = skip or set()
     aoi = AOIS[aoi_slug]
     out = step_dir(data_dir, aoi_slug, "fetch")
     out.mkdir(parents=True, exist_ok=True)
-    manifest = Manifest.load(out, aoi_slug, "fetch")
+    manifest = Manifest.load(out, aoi_slug, "fetch", crs_reader)
     today = today or dt.date.today()
     interval = scene_window(today)
 
@@ -372,7 +390,7 @@ def run(aoi_slug: str, data_dir: Path, *, skip: set[str] | None = None, today: d
 
 def register_manual(aoi_slug: str, data_dir: Path, file_path: Path, *, source: str, source_url: str | None,
                     vertical_crs: str | None, vertical_units: str | None, kind: str = "dem",
-                    meta: dict[str, Any] | None = None) -> Manifest:
+                    meta: dict[str, Any] | None = None, crs_reader=None) -> Manifest:
     """Record a manually downloaded file (CoNED, lidar, eHydro, ...) in the fetch manifest."""
     out = step_dir(data_dir, aoi_slug, "fetch")
     out.mkdir(parents=True, exist_ok=True)
@@ -380,7 +398,7 @@ def register_manual(aoi_slug: str, data_dir: Path, file_path: Path, *, source: s
     dest.parent.mkdir(parents=True, exist_ok=True)
     if file_path.resolve() != dest.resolve():
         shutil.copy2(file_path, dest)
-    manifest = Manifest.load(out, aoi_slug, "fetch")
+    manifest = Manifest.load(out, aoi_slug, "fetch", crs_reader)
     manifest.add_file(dest, source_url=source_url, source=source, kind=kind, vertical_crs=vertical_crs,
                       vertical_units=vertical_units, meta=meta)
     manifest.save()

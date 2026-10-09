@@ -9,7 +9,12 @@ The index follows AGENT-PLAN.md exactly and validates against
 ``pipeline/schemas/tiles_index.schema.json``. Products that do not exist yet (e.g. the fleet
 layer before Phase 2, or the waterline layer for an AOI without scenes) are listed with
 ``bytes: 0`` and are NOT uploaded; the app treats ``bytes == 0`` as "not available".
-Old versions are kept for 30 days (:func:`versions_to_prune`).
+Old versions are kept for 30 days *after they are superseded* (:func:`versions_to_prune`).
+
+Safety gates (always on, also for a direct ``python -m pipeline.publish``; there is no CLI bypass):
+  * ``data/<aoi>/validate/report.json`` must exist, name this AOI and say ``gate.passed: true``;
+  * the report must be NEWER than every tile file being published (validation ran on these tiles);
+  * no tile file may be OLDER than ``merge/merged_elev.tif`` (stale-output guard).
 """
 
 from __future__ import annotations
@@ -81,17 +86,49 @@ def versions_to_prune(listing: Mapping[str, Sequence[str]], current: Mapping[str
                       keep_days: int = RETENTION_DAYS) -> list[tuple[str, str]]:
     """``listing`` = {aoi: [versions on R2]}; ``current`` = {aoi: version in the index}.
 
-    A non-current version is pruned once it is older than ``keep_days`` (age measured from
-    the version stamp, a conservative proxy for when it was superseded).
+    "Old versions stay for 30 days" counts from the moment a version was *superseded*, i.e. from
+    the stamp of the next-newer version, not from its own stamp: a version published 40 days ago
+    but replaced yesterday must still be kept. The current version is never pruned.
     """
     out: list[tuple[str, str]] = []
     for aoi, versions in listing.items():
-        for v in versions:
-            if v == current.get(aoi):
+        ordered = sorted(versions, key=parse_version)
+        for i, v in enumerate(ordered):
+            if v == current.get(aoi) or i + 1 >= len(ordered):
                 continue
-            if now - parse_version(v) > dt.timedelta(days=keep_days):
+            superseded_at = parse_version(ordered[i + 1])
+            if now - superseded_at > dt.timedelta(days=keep_days):
                 out.append((aoi, v))
     return sorted(out)
+
+
+class PublishRefused(RuntimeError):
+    """A safety gate blocked the publish."""
+
+
+def check_publish_gates(aoi: str, data_dir: Path, tile_files: Sequence[Path]) -> None:
+    """Raise :class:`PublishRefused` unless validation passed on exactly these (fresh) tiles."""
+    report_path = step_dir(data_dir, aoi, "validate") / "report.json"
+    if not report_path.exists():
+        raise PublishRefused(f"{report_path} missing: run `validate` before publishing")
+    try:
+        report = json.loads(report_path.read_text())
+    except json.JSONDecodeError as exc:
+        raise PublishRefused(f"{report_path} is not valid JSON: {exc}") from exc
+    if report.get("aoi") not in (None, aoi):
+        raise PublishRefused(f"{report_path} is for AOI {report.get('aoi')!r}, not {aoi!r}")
+    if report.get("gate", {}).get("passed") is not True:
+        raise PublishRefused(f"validation gate did not pass: {report.get('gate', {}).get('reason', 'no gate in report')}")
+    report_mtime = report_path.stat().st_mtime
+    stale_report = [p.name for p in tile_files if p.stat().st_mtime >= report_mtime]
+    if stale_report:
+        raise PublishRefused(f"tiles changed after validation ({', '.join(stale_report)}); rerun validate")
+    merged = step_dir(data_dir, aoi, "merge") / "merged_elev.tif"
+    if not merged.exists():
+        raise PublishRefused(f"{merged} missing")
+    stale_tiles = [p.name for p in tile_files if p.stat().st_mtime < merged.stat().st_mtime]
+    if stale_tiles:
+        raise PublishRefused(f"tiles older than merged_elev.tif ({', '.join(stale_tiles)}); rerun tiles")
 
 
 class ObjectStore(Protocol):
@@ -175,6 +212,7 @@ EXTRA_FILES = ("depth_meta.pmtiles",)
 def publish_aoi(aoi: str, data_dir: Path, store: ObjectStore, *, version: str | None = None,
                 now: dt.datetime | None = None, date_range: tuple[str, str] | None = None,
                 dry_run: bool = False) -> dict:
+    """Validate gates, build the index, upload tiles then the index (dry-run: gates + index only)."""
     now = now or dt.datetime.now(dt.timezone.utc)
     version = version or iso_z(now)
     tiles_dir = step_dir(data_dir, aoi, "tiles")
@@ -191,6 +229,7 @@ def publish_aoi(aoi: str, data_dir: Path, store: ObjectStore, *, version: str | 
             uploads.append((p, f"tiles/{aoi}/{version}/{name}"))
     if not sizes.get("depth"):
         raise FileNotFoundError(f"{tiles_dir}/depth.pmtiles missing: nothing to publish")
+    check_publish_gates(aoi, data_dir, [local for local, _ in uploads])
     if date_range is None:
         import rasterio  # lazy
 

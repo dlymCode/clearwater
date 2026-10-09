@@ -1,6 +1,7 @@
 import datetime as dt
 
 import numpy as np
+import pytest
 
 from pipeline import tiles
 from pipeline.common import DATE_NODATA, ZOOMS, days_since_epoch
@@ -45,12 +46,39 @@ def test_source_date_pack_round_trip():
     assert u["date"][0, 2] == DATE_NODATA
     # uncertainty rounds up to the next bucket, never down
     assert u["unc_ft"][0, 0] == 0.75 and u["unc_ft"][0, 1] == 1.0 and u["unc_ft"][0, 3] == 15.0
+    assert np.isnan(u["unc_ft"][0, 2])  # hole
     assert (packed[0, 2] == 0).all()  # hole: fully transparent, RGB zeroed
 
 
-def test_unknown_uncertainty_is_not_reported_as_precise():
-    packed = tiles.pack_source_date(np.array([[1]], np.uint8), np.array([[20000]], np.int32), np.array([[np.nan]]))
-    assert tiles.unpack_source_date(packed)["unc_ft"][0, 0] == 50.0
+def test_unknown_uncertainty_is_bucket_15_exclusively():
+    packed = tiles.pack_source_date(np.array([[1, 1]], np.uint8), np.array([[20000, 20000]], np.int32),
+                                    np.array([[np.nan, 80.0]]))
+    u = tiles.unpack_source_date(packed)
+    assert packed[0, 0, 0] & 0x0F == 15 and np.isnan(u["unc_ft"][0, 0]) and u["unc_unknown"][0, 0]
+    # a huge-but-known uncertainty clamps to bucket 14 ("45+"), never to the unknown bucket
+    assert packed[0, 1, 0] & 0x0F == 14 and u["unc_ft"][0, 1] == 45.0 and not u["unc_unknown"][0, 1]
+
+
+def test_finite_uncertainty_never_uses_unknown_bucket():
+    from pipeline.common import UNC_LEVELS_FT, UNC_UNKNOWN_INDEX
+
+    idx = tiles.encode_unc_index(np.concatenate([np.linspace(0, 200, 401), np.array(UNC_LEVELS_FT)]))
+    assert idx.max() == 14 and UNC_UNKNOWN_INDEX == 15 and len(UNC_LEVELS_FT) == 15
+    assert tiles.encode_unc_index(np.array([45.0, 44.9, 0.0, 0.01]))[:].tolist() == [14, 14, 0, 1]
+
+
+def test_date_clamp_logs_warning(caplog):
+    import logging
+
+    src = np.array([[1, 1]], np.uint8)
+    date = np.array([[days_since_epoch("1850-01-01"), days_since_epoch("2024-01-01")]], np.int32)
+    with caplog.at_level(logging.WARNING, logger="pipeline.tiles"):
+        tiles.pack_source_date(src, date, np.array([[1.0, 1.0]]))
+    assert any("clamped" in r.message for r in caplog.records)
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="pipeline.tiles"):
+        tiles.pack_source_date(src, np.array([[days_since_epoch("1990-01-01")] * 2], np.int32), np.array([[1.0, 1.0]]))
+    assert not caplog.records
 
 
 def test_date_epoch_shift_is_1880():
@@ -72,3 +100,21 @@ def test_enc_layers_and_tippecanoe():
     assert len(cmds) == 9 and cmds[0][0] == "ogr2ogr" and cmds[0][-1] == "DEPARE"
     t = tiles.tippecanoe_cmd({"DEPARE": "d.geojson", "COALNE": "c.geojson"}, "base.pmtiles", 8, 16)
     assert t[0] == "tippecanoe" and "-Z8" in t and "-z16" in t and t.count("-L") == 2
+
+
+def test_tippecanoe_tiles_every_enc_cell_per_layer(tmp_path):
+    t = tiles.tippecanoe_cmd({"WRECKS": ["a_WRECKS.geojson", "b_WRECKS.geojson"], "DEPARE": "a_DEPARE.geojson"}, "o.pmtiles")
+    assert t.count("-L") == 3 and "WRECKS:a_WRECKS.geojson" in t and "WRECKS:b_WRECKS.geojson" in t
+    for cell in ("US5WA10M", "US5WA11M", "US5WA12M"):
+        for layer in ("DEPARE", "COALNE"):
+            (tmp_path / f"{cell}_{layer}.geojson").write_text("{}")
+    (tmp_path / "US5WA11M_WRECKS.geojson").write_text("{}")  # only one cell has wrecks: fine
+    files = tiles.collect_layer_files(tmp_path)
+    assert len(files["DEPARE"]) == 3 and len(files["COALNE"]) == 3 and len(files["WRECKS"]) == 1
+    assert "LIGHTS" not in files  # optional layers may be absent
+
+
+def test_missing_required_enc_layer_is_fatal(tmp_path):
+    (tmp_path / "x_DEPARE.geojson").write_text("{}")
+    with pytest.raises(FileNotFoundError, match="COALNE"):
+        tiles.collect_layer_files(tmp_path)

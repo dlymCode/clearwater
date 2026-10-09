@@ -1,20 +1,26 @@
 """Step 7 - ground-truth check (Gate 1) plus publish-time sanity checks.
 
-    python -m pipeline.validate --aoi skagit --runs run1.csv run2.csv run3.csv [--coalne coalne.geojson]
+    python -m pipeline.validate --aoi skagit --runs run1.csv run2.csv run3.csv --coalne enc/*_COALNE.geojson
 
-* Compares merged (per source) and waterline elevation against tide-corrected sounder logs.
-  Reports RMSE and 90th-percentile absolute error per source; writes an HTML report.
-* **Exit code 1 if the waterline p90 absolute error exceeds 1.5 ft** (or if there are no
-  waterline samples at all - the gate fails closed; override with ``--skip-waterline-gate``).
-* :func:`shoreline_datum_check`: ENC COALNE cells must sit about +9..+13 ft MLLW in the
-  merged raster (MHHW is ~ +11.4 ft at Seattle) - catches VDatum sign/offset errors.
-* :func:`regression_shallower`: cells that rose by more than 3 ft versus the last published
-  merged raster, listed for manual review.
+Everything below must pass for ``report.json`` to say ``gate.passed: true`` (publish.py refuses
+otherwise). All checks fail closed:
+
+* **Waterline gate** - p90 absolute error vs. the sounder runs must be <= 1.5 ft, from >= 30 waterline
+  samples in total, >= 1 sample from *each* run, and >= 3 runs (PRD: 3 known runs).
+  ``--skip-waterline-gate`` is a dev override.
+* **Shoreline datum check (mandatory)** - merged elevation at ENC COALNE shoreline cells must sit within
+  +/- 1.5 ft of the AOI's expected MHHW (``common.AOI_MHHW_FT``). No COALNE file or too few shoreline
+  cells = failure. ``--skip-shoreline-check`` is a dev override. Catches a forgotten/sign-flipped VDatum offset.
+* **Bias gate** - any NAVD88-derived source (CUDEM, CoNED, lidar) with |mean bias| > 1.5 ft against the
+  runs fails (a constant bias is the signature of a datum error).
+* **Encode consistency** - when ``tiles/depth_rgb.tif`` exists, the *decoded* Terrain-RGB raster sampled
+  at the truth points must match the merged raster (catches encode bugs); absent = warning only.
 
 Run CSV columns: ``time,lat,lon,depth,speed`` (+ optional ``tide_ft``). ``depth`` is feet
 below the surface at ``time``; with a ``tide_ft`` column truth elevation = tide_ft - depth,
 otherwise ``depth`` is taken as already tide-corrected (below MLLW), elevation = -depth.
 ``speed`` is knots; rows under 0.5 kt are dropped (same physical filter as the app).
+Per-source ``coverage`` = fraction of truth points that have a prediction from that source.
 """
 
 from __future__ import annotations
@@ -30,12 +36,19 @@ from typing import Mapping, Sequence
 
 import numpy as np
 
-from .common import SOURCE_BY_CODE, step_dir
+from .common import AOI_MHHW_FT, SHORELINE_TOL_FT, SOURCE_BY_CODE, step_dir, utc_now_iso
 from .geo import Grid, lonlat_to_utm10, sample_grid
 
 P90_GATE_FT = 1.5
 MIN_SPEED_KT = 0.5
-SHORELINE_RANGE_FT = (9.0, 13.0)
+MIN_WATERLINE_SAMPLES = 30
+MIN_RUNS = 3
+BIAS_GATE_FT = 1.5
+MIN_BIAS_SAMPLES = 30
+SHORELINE_MIN_CELLS = 50
+ENCODE_TOL_FT = 0.06  # half the 0.1 ft Terrain-RGB quantum plus float slack
+#: Sources whose raw data are NAVD88 and therefore pass through the VDatum conversion.
+NAVD88_DERIVED = ("cudem", "coned", "lidar_2014", "lidar_ncmp", "wa_lidar")
 
 
 @dataclass
@@ -44,6 +57,14 @@ class TruthPoints:
     lat: np.ndarray
     elev_ft: np.ndarray  # ft MLLW, positive up
     speed_kt: np.ndarray
+    run_id: np.ndarray | None = None  # which ground-truth run each point came from
+    n_runs: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.run_id is None:
+            self.run_id = np.zeros(len(self.lon), dtype=np.int64)
+        if self.n_runs is None:
+            self.n_runs = int(self.run_id.max()) + 1 if len(self.run_id) else 0
 
 
 def load_run_csv(path: str | Path, min_speed_kt: float = MIN_SPEED_KT) -> TruthPoints:
@@ -70,7 +91,9 @@ def load_run_csv(path: str | Path, min_speed_kt: float = MIN_SPEED_KT) -> TruthP
 
 
 def concat_truth(runs: Sequence[TruthPoints]) -> TruthPoints:
-    return TruthPoints(*(np.concatenate([getattr(r, f) for r in runs]) for f in ("lon", "lat", "elev_ft", "speed_kt")))
+    ids = np.concatenate([np.full(len(r.lon), i, dtype=np.int64) for i, r in enumerate(runs)]) if runs else np.zeros(0, np.int64)
+    return TruthPoints(*(np.concatenate([getattr(r, f) for r in runs]) for f in ("lon", "lat", "elev_ft", "speed_kt")),
+                       run_id=ids, n_runs=len(runs))
 
 
 def error_stats(err: np.ndarray) -> dict:
@@ -87,44 +110,99 @@ def error_stats(err: np.ndarray) -> dict:
 class ValidationResult:
     per_source: dict[str, dict] = field(default_factory=dict)
     gate: dict = field(default_factory=dict)
+    checks: dict[str, dict] = field(default_factory=dict)
+    warnings: list[str] = field(default_factory=list)
 
     @property
     def passed(self) -> bool:
         return bool(self.gate.get("passed"))
 
+    def add_check(self, name: str, passed: bool, reason: str, **detail) -> None:
+        self.checks[name] = {"passed": bool(passed), "reason": reason, **detail}
+        self._finalize()
+
+    def _finalize(self) -> None:
+        failures = [f"{n}: {c['reason']}" for n, c in self.checks.items() if not c["passed"]]
+        self.gate["passed"] = not failures and bool(self.checks)
+        self.gate["reason"] = "ok" if self.gate["passed"] else "; ".join(failures) or "no checks ran"
+        self.gate["checks"] = self.checks
+
     def to_dict(self) -> dict:
-        return {"per_source": self.per_source, "gate": self.gate}
+        return {"per_source": self.per_source, "gate": self.gate, "warnings": self.warnings}
 
 
-def evaluate_gate(waterline_stats: dict | None, threshold: float = P90_GATE_FT, enforce: bool = True) -> dict:
-    if waterline_stats is None or not waterline_stats.get("n"):
-        ok = not enforce
-        return {"passed": ok, "threshold_ft": threshold, "waterline_p90_ft": None,
-                "reason": "no waterline samples (gate fails closed)" if enforce else "waterline gate skipped"}
-    p90 = waterline_stats["p90_abs"]
-    ok = p90 <= threshold or not enforce
-    return {"passed": ok, "threshold_ft": threshold, "waterline_p90_ft": p90,
-            "reason": "ok" if p90 <= threshold else f"waterline p90 {p90:.2f} ft > {threshold} ft"}
+def evaluate_waterline(stats: dict | None, per_run_counts: Sequence[int], n_runs: int, *,
+                       threshold: float = P90_GATE_FT, enforce: bool = True,
+                       min_samples: int = MIN_WATERLINE_SAMPLES, min_runs: int = MIN_RUNS) -> dict:
+    """The Gate-1 check. Fails closed on too few runs, too few samples or a run with no sample."""
+    base = {"threshold_ft": threshold, "waterline_p90_ft": None if not stats else stats.get("p90_abs"),
+            "n_samples": 0 if not stats else stats.get("n", 0), "per_run_samples": list(per_run_counts)}
+    if not enforce:
+        return {**base, "passed": True, "reason": "waterline gate skipped"}
+    if not stats or not stats.get("n"):
+        return {**base, "passed": False, "reason": "no waterline samples (gate fails closed)"}
+    problems = []
+    if n_runs < min_runs:
+        problems.append(f"only {n_runs} ground-truth run(s) (< {min_runs})")
+    if stats["n"] < min_samples:
+        problems.append(f"only {stats['n']} waterline samples (< {min_samples})")
+    empty = [i for i, c in enumerate(per_run_counts) if c < 1]
+    if empty:
+        problems.append(f"run(s) {empty} have no waterline sample")
+    if stats["p90_abs"] > threshold:
+        problems.append(f"waterline p90 {stats['p90_abs']:.2f} ft > {threshold} ft")
+    return {**base, "passed": not problems, "reason": "; ".join(problems) or "ok"}
+
+
+def evaluate_bias(per_source: Mapping[str, dict], limit: float = BIAS_GATE_FT,
+                  min_samples: int = MIN_BIAS_SAMPLES) -> dict:
+    """|mean bias| of every NAVD88-derived source must stay within ``limit`` (needs >= min_samples)."""
+    offenders = {n: s["bias"] for n, s in per_source.items()
+                 if n in NAVD88_DERIVED and s["n"] >= min_samples and abs(s["bias"]) > limit}
+    checked = [n for n, s in per_source.items() if n in NAVD88_DERIVED and s["n"] >= min_samples]
+    reason = "ok" if not offenders else "constant bias (datum error?): " + ", ".join(f"{n} {b:+.2f} ft" for n, b in offenders.items())
+    return {"passed": not offenders, "reason": reason, "limit_ft": limit, "sources_checked": checked, "offenders": offenders}
 
 
 def validate(truth: TruthPoints, grid: Grid, merged_elev: np.ndarray, merged_src: np.ndarray | None = None,
-             waterline_elev: np.ndarray | None = None, *, threshold: float = P90_GATE_FT,
-             enforce_waterline: bool = True) -> ValidationResult:
+             waterline_elev: np.ndarray | None = None, depth_decoded: np.ndarray | None = None, *,
+             threshold: float = P90_GATE_FT, enforce_waterline: bool = True, min_runs: int = MIN_RUNS,
+             min_waterline_samples: int = MIN_WATERLINE_SAMPLES) -> ValidationResult:
     x, y = lonlat_to_utm10(truth.lon, truth.lat)
+    total = max(len(truth.lon), 1)
     res = ValidationResult()
     pred = sample_grid(merged_elev, grid, x, y)
     err = pred - truth.elev_ft
-    res.per_source["merged"] = error_stats(err)
+    res.per_source["merged"] = {**error_stats(err), "coverage": float(np.isfinite(pred).sum()) / total}
     if merged_src is not None:
         codes = sample_grid(merged_src.astype(np.float64), grid, x, y, fill=0.0).astype(int)
         for code in sorted(set(codes.tolist()) - {0}):
             name = SOURCE_BY_CODE[code].name if code in SOURCE_BY_CODE else f"code_{code}"
-            res.per_source[name] = error_stats(err[codes == code])
+            sel = codes == code
+            res.per_source[name] = {**error_stats(err[sel]), "coverage": float(sel.sum()) / total}
     wl_stats = None
+    per_run = [0] * (truth.n_runs or 0)
     if waterline_elev is not None:
-        wl_stats = error_stats(sample_grid(waterline_elev, grid, x, y) - truth.elev_ft)
+        wl_pred = sample_grid(waterline_elev, grid, x, y)
+        wl_stats = {**error_stats(wl_pred - truth.elev_ft), "coverage": float(np.isfinite(wl_pred).sum()) / total}
         res.per_source["waterline"] = wl_stats
-    res.gate = evaluate_gate(wl_stats, threshold, enforce_waterline)
+        per_run = np.bincount(truth.run_id[np.isfinite(wl_pred)], minlength=truth.n_runs or 0).tolist()
+    wl = evaluate_waterline(wl_stats, per_run, truth.n_runs or 0, threshold=threshold, enforce=enforce_waterline,
+                            min_samples=min_waterline_samples, min_runs=min_runs)
+    res.gate.update(threshold_ft=threshold, waterline_p90_ft=wl["waterline_p90_ft"])
+    res.checks["waterline"] = wl
+    res.checks["bias"] = evaluate_bias(res.per_source)
+    if depth_decoded is not None:
+        dec = sample_grid(depth_decoded, grid, x, y)
+        res.per_source["depth_tiles_decoded"] = {**error_stats(dec - truth.elev_ft), "coverage": float(np.isfinite(dec).sum()) / total}
+        both = np.isfinite(pred)
+        mismatch = both & (~np.isfinite(dec) | (np.abs(np.nan_to_num(dec) - np.nan_to_num(pred)) > ENCODE_TOL_FT))
+        res.checks["encode_consistency"] = {
+            "passed": not mismatch.any(), "n_checked": int(both.sum()), "n_mismatch": int(mismatch.sum()),
+            "reason": "ok" if not mismatch.any() else f"{int(mismatch.sum())} truth points differ between merged_elev and decoded depth tiles"}
+    else:
+        res.warnings.append("tiles/depth_rgb.tif not found: Terrain-RGB encode consistency was not checked")
+    res._finalize()
     return res
 
 
@@ -159,14 +237,21 @@ def coalne_lines_from_geojson(gj: dict) -> list[list[tuple[float, float]]]:
     return lines
 
 
+def expected_shoreline_window(aoi: str, tol_ft: float = SHORELINE_TOL_FT) -> tuple[float, float]:
+    mhhw = AOI_MHHW_FT[aoi]
+    return (mhhw - tol_ft, mhhw + tol_ft)
+
+
 def shoreline_datum_check(grid: Grid, merged_elev: np.ndarray, lon: np.ndarray, lat: np.ndarray,
-                          expected: tuple[float, float] = SHORELINE_RANGE_FT, min_cells: int = 10,
-                          search_radius_cells: int = 1) -> dict:
-    """Median merged elevation at ENC COALNE shoreline cells must fall inside ``expected`` (ft MLLW).
+                          expected_mhhw_ft: float, tol_ft: float = SHORELINE_TOL_FT,
+                          min_cells: int = SHORELINE_MIN_CELLS, search_radius_cells: int = 1) -> dict:
+    """Median merged elevation at ENC COALNE shoreline cells must be within ``tol_ft`` of the AOI's MHHW.
 
     Each shoreline point looks at its (2r+1)^2 cell neighbourhood and takes the neighbourhood
     maximum, since the charted shoreline can fall a cell or two off the DEM's own waterline.
+    Fewer than ``min_cells`` shoreline cells with data is a failure (fail closed).
     """
+    expected = (expected_mhhw_ft - tol_ft, expected_mhhw_ft + tol_ft)
     x, y = lonlat_to_utm10(lon, lat)
     row, col = grid.xy_to_rowcol(x, y)
     vals = []
@@ -178,13 +263,14 @@ def shoreline_datum_check(grid: Grid, merged_elev: np.ndarray, lon: np.ndarray, 
         if np.isfinite(patch).any():
             vals.append(float(np.nanmax(patch)))
     n = len(vals)
+    base = {"n": n, "expected_mhhw_ft": expected_mhhw_ft, "expected_ft": list(expected)}
     if n < min_cells:
-        return {"passed": False, "n": n, "median_ft": None, "expected_ft": list(expected),
-                "reason": f"only {n} shoreline cells with data (< {min_cells})"}
+        return {**base, "passed": False, "median_ft": None,
+                "reason": f"only {n} shoreline cells with data (< {min_cells}); gate fails closed"}
     med = float(np.median(vals))
     ok = expected[0] <= med <= expected[1]
-    return {"passed": ok, "n": n, "median_ft": med, "expected_ft": list(expected),
-            "reason": "ok" if ok else f"median shoreline {med:.1f} ft MLLW outside {expected} - check VDatum offset/sign"}
+    return {**base, "passed": ok, "median_ft": med,
+            "reason": "ok" if ok else f"median shoreline {med:.1f} ft MLLW outside {expected[0]:.1f}..{expected[1]:.1f} - check VDatum offset/sign"}
 
 
 def regression_shallower(new: np.ndarray, old: np.ndarray, threshold_ft: float = 3.0) -> np.ndarray:
@@ -199,9 +285,16 @@ def render_report_html(result: ValidationResult, title: str = "Clearwater valida
         return "n/a" if v is None else f"{v:.2f}"
 
     rows = "".join(
-        f"<tr><td>{html.escape(name)}</td><td>{s['n']}</td><td>{f(s['rmse'])}</td><td>{f(s['p90_abs'])}</td><td>{f(s['bias'])}</td></tr>"
+        f"<tr><td>{html.escape(name)}</td><td>{s['n']}</td><td>{f(s['rmse'])}</td><td>{f(s['p90_abs'])}</td>"
+        f"<td>{f(s['bias'])}</td><td>{f(s.get('coverage'))}</td></tr>"
         for name, s in result.per_source.items()
     )
+    check_rows = "".join(
+        f"<tr><td>{html.escape(n)}</td><td class='{'PASS' if c['passed'] else 'FAIL'}'>{'PASS' if c['passed'] else 'FAIL'}</td>"
+        f"<td style='text-align:left'>{html.escape(str(c['reason']))}</td></tr>"
+        for n, c in result.checks.items()
+    )
+    warn = "".join(f"<li>{html.escape(w)}</li>" for w in result.warnings)
     g = result.gate
     status = "PASS" if result.passed else "FAIL"
     extra_html = "".join(
@@ -209,12 +302,13 @@ def render_report_html(result: ValidationResult, title: str = "Clearwater valida
     )
     return (
         f"<!doctype html><html><head><meta charset='utf-8'><title>{html.escape(title)}</title>"
-        "<style>body{font:14px system-ui;margin:2em}table{border-collapse:collapse}td,th{border:1px solid #999;padding:4px 10px;text-align:right}"
+        "<style>body{font:14px system-ui;margin:2em}table{border-collapse:collapse;margin-bottom:1em}td,th{border:1px solid #999;padding:4px 10px;text-align:right}"
         "td:first-child,th:first-child{text-align:left}.PASS{color:#060}.FAIL{color:#b00}</style></head><body>"
         f"<h1>{html.escape(title)}</h1><p class='{status}'><b>Gate 1: {status}</b> - {html.escape(str(g.get('reason')))} "
         f"(waterline p90 {f(g.get('waterline_p90_ft'))} ft, limit {g.get('threshold_ft')} ft)</p>"
-        "<table><tr><th>source</th><th>n</th><th>RMSE (ft)</th><th>p90 |err| (ft)</th><th>bias (ft)</th></tr>"
-        f"{rows}</table>{extra_html}</body></html>"
+        f"<h2>Checks</h2><table><tr><th>check</th><th>result</th><th>detail</th></tr>{check_rows}</table>"
+        f"<h2>Per source</h2><table><tr><th>source</th><th>n</th><th>RMSE (ft)</th><th>p90 |err| (ft)</th><th>bias (ft)</th><th>coverage</th></tr>"
+        f"{rows}</table>{('<h2>Warnings</h2><ul>' + warn + '</ul>') if warn else ''}{extra_html}</body></html>"
     )
 
 
@@ -223,15 +317,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--aoi", required=True)
     p.add_argument("--data-dir", type=Path, default=Path("data"))
-    p.add_argument("--runs", type=Path, nargs="+", required=True, help="ground-truth CSVs (time,lat,lon,depth,speed)")
-    p.add_argument("--coalne", type=Path, help="ENC COALNE GeoJSON for the datum sanity check")
-    p.add_argument("--skip-waterline-gate", action="store_true")
+    p.add_argument("--runs", type=Path, nargs="+", required=True, help="ground-truth CSVs (time,lat,lon,depth,speed); >= 3")
+    p.add_argument("--coalne", type=Path, nargs="*", default=[], help="ENC COALNE GeoJSON file(s) for the mandatory datum check")
+    p.add_argument("--skip-waterline-gate", action="store_true", help="dev only")
+    p.add_argument("--skip-shoreline-check", action="store_true", help="dev only")
     a = p.parse_args(argv)
 
     import rasterio  # lazy
 
+    from .tiles import decode_terrain_rgb
+
     merge_dir = step_dir(a.data_dir, a.aoi, "merge")
     wl_path = step_dir(a.data_dir, a.aoi, "waterline") / "elev.tif"
+    rgb_path = step_dir(a.data_dir, a.aoi, "tiles") / "depth_rgb.tif"
     with rasterio.open(merge_dir / "merged_elev.tif") as ds:
         merged = ds.read(1)
         t = ds.transform
@@ -242,22 +340,36 @@ def main(argv: Sequence[str] | None = None) -> int:
     if wl_path.exists():
         with rasterio.open(wl_path) as ds:
             wl = ds.read(1)
+    decoded = None
+    if rgb_path.exists():
+        with rasterio.open(rgb_path) as ds:
+            decoded = decode_terrain_rgb(np.moveaxis(ds.read([1, 2, 3]), 0, -1))
+    else:
+        print(f"warning: {rgb_path} not found; skipping encode-consistency check", file=sys.stderr)
     truth = concat_truth([load_run_csv(r) for r in a.runs])
-    result = validate(truth, grid, merged, src, wl, enforce_waterline=not a.skip_waterline_gate)
+    result = validate(truth, grid, merged, src, wl, decoded, enforce_waterline=not a.skip_waterline_gate)
 
     extras: dict[str, dict] = {}
-    if a.coalne:
-        lines = coalne_lines_from_geojson(json.loads(a.coalne.read_text()))
-        lon, lat = densify_lines(lines)
-        extras["shoreline datum check"] = shoreline_datum_check(grid, merged, lon, lat)
-        if not extras["shoreline datum check"]["passed"]:
-            result.gate["passed"] = False
-            result.gate["reason"] += "; shoreline datum check failed"
+    if a.skip_shoreline_check:
+        result.warnings.append("shoreline datum check skipped (--skip-shoreline-check)")
+        result.add_check("shoreline_datum", True, "skipped")
+    elif not a.coalne:
+        result.add_check("shoreline_datum", False, "no COALNE GeoJSON supplied; the datum check is mandatory (gate fails closed)")
+    else:
+        lines: list = []
+        for f in a.coalne:
+            lines += coalne_lines_from_geojson(json.loads(Path(f).read_text()))
+        lon, lat = densify_lines(lines) if lines else (np.zeros(0), np.zeros(0))
+        chk = shoreline_datum_check(grid, merged, lon, lat, AOI_MHHW_FT[a.aoi])
+        extras["shoreline datum check"] = chk
+        result.add_check("shoreline_datum", chk["passed"], chk["reason"], median_ft=chk["median_ft"], n=chk["n"],
+                         expected_mhhw_ft=chk["expected_mhhw_ft"])
+    result._finalize()
 
     out = step_dir(a.data_dir, a.aoi, "validate")
     out.mkdir(parents=True, exist_ok=True)
     (out / "report.html").write_text(render_report_html(result, f"Clearwater validation - {a.aoi}", extras))
-    (out / "report.json").write_text(json.dumps({**result.to_dict(), **extras}, indent=2))
+    (out / "report.json").write_text(json.dumps({"aoi": a.aoi, "generated_at": utc_now_iso(), **result.to_dict()}, indent=2))
     print(result.gate["reason"])
     return exit_code(result)
 

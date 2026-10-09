@@ -5,7 +5,10 @@
 Output shape (AGENT-PLAN.md, mobile caches it for 30 days)::
 
     {"station_id": "9447130", "name": "Seattle", "datum": "MLLW", "units": "ft",
+     "lat": 47.6026, "lon": -122.3393,
      "predictions": [{"t": "2026-10-09T00:00:00Z", "v": 3.2}, ...]}
+
+``lat``/``lon`` come from the CO-OPS metadata API (the app picks the nearest station by distance).
 
 Predictions are on a regular 30-minute grid (cosine-interpolated between CO-OPS hi/lo
 events, which is all subordinate stations publish) with the exact hi/lo extremes
@@ -36,6 +39,8 @@ def build_payload(station: coops.Station, events: Sequence[coops.Event], start: 
         "name": station.name,
         "datum": "MLLW",
         "units": "ft",
+        "lat": round(station.lat, 5),
+        "lon": round(station.lon, 5),
         "predictions": [{"t": t.strftime("%Y-%m-%dT%H:%M:%SZ"), "v": round(v, 3)} for t, v in pts],
     }
 

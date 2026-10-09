@@ -11,6 +11,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import math
+import sys
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, replace
@@ -52,6 +53,13 @@ REFERENCE_STATIONS: tuple[Station, ...] = (
 )
 
 #: Prediction-only subordinate stations; IDs must be pulled from the metadata API (PRD open question 1).
+#: IDs are deliberately NOT hard-coded: they are resolved by name at runtime.
+#:
+#: TODO(S0, LOUD): the Nisqually AOI currently falls back to the Tacoma reference station
+#: (9446484) because no nearer station is registered here. Tide timing/range differ at the
+#: Nisqually delta, so a nearer subordinate station (e.g. one in Nisqually Reach / Olympia
+#: area) must be selected from the CO-OPS metadata API in S0 and added below before the
+#: Nisqually waterline DEM is trusted.
 SUBORDINATE_STATIONS: tuple[Station, ...] = (
     Station(None, "La Conner", 48.3917, -122.4950, False, "La Conner"),
     Station(None, "Stanwood", 48.2400, -122.3700, False, "Stanwood"),
@@ -82,17 +90,24 @@ def match_station(metadata: dict, search_name: str, state: str = "WA") -> Statio
 def resolve_stations(
     stations: Sequence[Station], http_get: HttpGet = default_http_get
 ) -> tuple[list[Station], list[Station]]:
-    """Fill in missing IDs. Returns (resolved, unresolved)."""
-    need = [s for s in stations if s.id is None]
-    meta: dict = {}
-    if need:
-        url = MDAPI_STATIONS + "?" + urllib.parse.urlencode({"type": "tidepredictions"})
-        meta = json.loads(http_get(url))
+    """Fill in missing IDs and take every station's lat/lon from the CO-OPS metadata API.
+
+    Returns (resolved, unresolved). Stations with a known id that the metadata API does not list
+    keep their approximate registry coordinates (and a warning is printed).
+    """
+    url = MDAPI_STATIONS + "?" + urllib.parse.urlencode({"type": "tidepredictions"})
+    meta = json.loads(http_get(url))
+    by_id = {str(m["id"]): m for m in meta.get("stations", [])}
     resolved: list[Station] = []
     unresolved: list[Station] = []
     for s in stations:
         if s.id is not None:
-            resolved.append(s)
+            m = by_id.get(s.id)
+            if m is None:
+                print(f"warning: station {s.id} ({s.name}) not in CO-OPS metadata; using approximate coordinates", file=sys.stderr)
+                resolved.append(s)
+            else:
+                resolved.append(replace(s, lat=float(m["lat"]), lon=float(m["lng"])))
             continue
         hit = match_station(meta, s.search_name or s.name)
         if hit is None:
