@@ -69,9 +69,9 @@ enable_confirmations = true
 template = "Your Sound Maps code is {{ .Code }}"
 max_frequency = "60s"
 
-# Local-only test numbers; production uses the SMS provider configured in the dashboard.
-[auth.sms.test_otp]
-15555550100 = "123456"
+# NOTE: there is deliberately no [auth.sms.test_otp] table. A fixed phone-number -> OTP mapping pushed
+# with this config would be a known login for that number. For local development, read the OTP from
+# the Inbucket/Studio logs, or add a test_otp table to an UNCOMMITTED supabase/config.local.toml only.
 
 [auth.external.apple]
 enabled = true

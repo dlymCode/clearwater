@@ -14,6 +14,24 @@ export interface DepthUploadDeps {
 
 const HOLD_WINDOW_DAYS = 90;
 
+/** Fisher-Yates with crypto randomness. */
+export function shuffle<T>(items: readonly T[]): T[] {
+  const a = [...items];
+  const buf = new Uint32Array(1);
+  for (let i = a.length - 1; i > 0; i--) {
+    // rejection sampling to avoid modulo bias
+    const limit = Math.floor(0x1_0000_0000 / (i + 1)) * (i + 1);
+    let r: number;
+    do {
+      crypto.getRandomValues(buf);
+      r = buf[0];
+    } while (r >= limit);
+    const j = r % (i + 1);
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
 /**
  * POST /depth-upload
  *
@@ -44,9 +62,15 @@ export async function handleDepthUpload(req: Request, deps: DepthUploadDeps): Pr
     const now = deps.now();
     const batch = parseDepthBatch(body, req.headers.get("idempotency-key"), now);
 
-    const owner = await rpc<string | null>(deps.db, "depth_batch_owner", { p_batch_id: batch.batchId });
-    if (owner) {
-      if (owner.toLowerCase() !== user.id) throw new HttpError(409, "batch_id_conflict", "Batch id already used.");
+    // owner is null once the ledger row has been unlinked from its user (15 minutes after receipt):
+    // any later replay is then simply a duplicate.
+    const seen = await rpc<{ found: boolean; owner: string | null }>(deps.db, "depth_batch_lookup", {
+      p_batch_id: batch.batchId,
+    });
+    if (seen.found) {
+      if (seen.owner && seen.owner.toLowerCase() !== user.id) {
+        throw new HttpError(409, "batch_id_conflict", "Batch id already used.");
+      }
       return json(200, { batch_id: batch.batchId, duplicate: true, rows: batch.rows.length });
     }
 
@@ -59,12 +83,19 @@ export async function handleDepthUpload(req: Request, deps: DepthUploadDeps): Pr
     const days = batch.rows.map((r) => r.day).sort();
     const first = addDays(days[0], -HOLD_WINDOW_DAYS);
     const last = addDays(days[days.length - 1], HOLD_WINDOW_DAYS);
+    const span = dayRange(first, last);
+    // Hashes for the row days use the CURRENT epoch. "Self" hashes cover every epoch 0..current, so a
+    // salt rotation does not make this boat look like a stranger to its own earlier uploads.
     const hashByDay = new Map<string, string>();
-    for (const d of dayRange(first, last)) {
-      hashByDay.set(d, await uploaderHash(deps.secret, user.id, d, epoch));
+    for (const d of span) hashByDay.set(d, await uploaderHash(deps.secret, user.id, d, epoch));
+    const selfHashes = new Set(hashByDay.values());
+    for (let e = 0; e < epoch; e++) {
+      for (const d of span) selfHashes.add(await uploaderHash(deps.secret, user.id, d, e));
     }
 
-    const rows = batch.rows.map((r) => ({ ...r, uploader_hash: hashByDay.get(r.day)! }));
+    // Row order is the order the boat drove its track in; the server must not retain or be able to
+    // infer it, so shuffle before anything is written.
+    const rows = shuffle(batch.rows.map((r) => ({ ...r, uploader_hash: hashByDay.get(r.day)! })));
     const result = await rpc<{ duplicate: boolean; accepted?: number; held?: number }>(
       deps.db,
       "ingest_depth_batch",
@@ -72,7 +103,7 @@ export async function handleDepthUpload(req: Request, deps: DepthUploadDeps): Pr
         p_batch_id: batch.batchId,
         p_user_id: user.id,
         p_rows: rows,
-        p_self_hashes: [...hashByDay.values()],
+        p_self_hashes: [...selfHashes],
       },
     );
 

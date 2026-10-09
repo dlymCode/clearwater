@@ -7,6 +7,8 @@ Deno.test("limits match docs/AGENT-PLAN.md", () => {
   assertEquals(RATE_LIMITS.vote, { max: 60, windowSeconds: 3600 });
   assertEquals(RATE_LIMITS.message, { max: 10, windowSeconds: 60 });
   assertEquals(RATE_LIMITS.depth_batch, { max: 1, windowSeconds: 900 });
+  assertEquals(RATE_LIMITS.join_group, { max: 10, windowSeconds: 900 });
+  assertEquals(RATE_LIMITS.position, { max: 1, windowSeconds: 300 });
 });
 
 Deno.test("30 pings/hour: the 31st is refused", () => {
@@ -48,23 +50,24 @@ Deno.test("checkRateLimit unwraps a row or a single-element array from rpc", asy
 
 Deno.test("enforceRateLimit: null when allowed, 429 + Retry-After when not", async () => {
   const ok = mockDb({
-    rpc: { rate_limit_status: () => ({ allowed: true, used: 0, max_allowed: 1, retry_after_s: 0 }) },
+    rpc: { rate_limit_consume: () => ({ allowed: true, used: 0, max_allowed: 1, retry_after_s: 0 }) },
   });
   assertEquals(await enforceRateLimit(ok, "u", "depth_batch"), null);
 
   const no = mockDb({
-    rpc: { rate_limit_status: () => ({ allowed: false, used: 1, max_allowed: 1, retry_after_s: 421 }) },
+    rpc: { rate_limit_consume: () => ({ allowed: false, used: 1, max_allowed: 1, retry_after_s: 421 }) },
   });
   const res = await enforceRateLimit(no, "u", "depth_batch");
   assert(res);
   assertEquals(res.status, 429);
   assertEquals(res.headers.get("retry-after"), "421");
   assertEquals((await res.json()).error, "rate_limited");
+  assertEquals(no.calls[0].fn, "rate_limit_consume");
   assertEquals(no.calls[0].args, { p_user: "u", p_bucket: "depth_batch" });
 });
 
 Deno.test("a database failure is not swallowed as 'allowed'", async () => {
-  const db = mockDb({ rpc: { rate_limit_status: () => dbError("XX000", "boom") } });
+  const db = mockDb({ rpc: { rate_limit_consume: () => dbError("XX000", "boom") } });
   let threw = false;
   try {
     await enforceRateLimit(db, "u", "depth_batch");

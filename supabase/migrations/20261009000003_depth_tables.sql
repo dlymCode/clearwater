@@ -54,6 +54,9 @@ create table public.depth_uploads (
   constraint depth_uploads_held_reason  check ((held and held_reason in ('baseline_disagreement', 'admin'))
                                                or (not held and held_reason is null))
 );
+-- One row per boat per cell per day: a later upload of the same (hash, cell, day) REPLACES the earlier
+-- one, so a boat cannot stack weight by re-uploading (see ingest_depth_batch).
+create unique index depth_uploads_boat_cell_day_key on public.depth_uploads (uploader_hash, cell_id, day);
 create index depth_uploads_cell_day_idx on public.depth_uploads (cell_id, day);
 create index depth_uploads_held_idx     on public.depth_uploads (cell_id, day) where held;
 create index depth_uploads_day_idx      on public.depth_uploads (day);
@@ -74,12 +77,12 @@ create table public.baseline_cells (
 
 create table public.depth_batches (
   batch_id     uuid primary key,
-  user_id      uuid not null references public.profiles (id) on delete cascade,
+  user_id      uuid references public.profiles (id) on delete cascade,   -- nulled 15 min after receipt
   received_at  timestamptz not null default now(),
   row_count    integer not null default 0,
   held_count   integer not null default 0
 );
-create index depth_batches_user_idx on public.depth_batches (user_id, received_at desc);
+create index depth_batches_unlink_idx on public.depth_batches (received_at) where user_id is not null;
 
 -- 90-day rollups of daily cells older than 180 days (PRD retention table).
 create table public.depth_cell_aggregates (

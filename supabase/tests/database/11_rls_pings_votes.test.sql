@@ -65,7 +65,7 @@ insert into public.groups (id, name, owner_id) values
 insert into public.group_members (group_id, user_id, role) values
   ('00000000-0000-0000-0000-0000000000b1', '00000000-0000-0000-0000-0000000000a2', 'member');
 
-select plan(67);
+select plan(96);
 
 -- Pings: c1 = u1 public, c2 = u1 in group G, c3 = u3 public. Skagit Bay, ~(-122.5, 48.3).
 select tests.act_admin();
@@ -84,6 +84,27 @@ select is((select count(*) from public.pings), 2::bigint, 'pings select: non-mem
 select is((select count(*) from public.pings where id = tests.c(2)), 0::bigint, 'pings select: group ping invisible to non-member');
 select tests.act_anon();
 select throws_ok($$select * from public.pings$$, '42501', null, 'pings select: anon denied');
+
+-- ---- C1: authorship is not selectable from the table at all ------------------------------------------
+select tests.act_as(tests.u(3));
+select throws_ok($$select author_id from public.pings$$, '42501', null, 'pings: author_id is not selectable by a non-author (column privilege)');
+select throws_ok($$select * from public.pings$$, '42501', null, 'pings: select * is denied (it would include author_id)');
+select throws_ok($$select rep_processed_at from public.pings$$, '42501', null, 'pings: rep_processed_at is not selectable');
+select throws_ok($$select id from public.pings where author_id = tests.u(1)$$, '42501', null, 'pings: cannot filter by author_id either (no author-probing oracle)');
+select tests.act_as(tests.u(1));
+select throws_ok($$select author_id from public.pings$$, '42501', null, 'pings: even the author reads authorship via ping_feed, not the table');
+select is((select author_handle from public.ping_feed where id = tests.c(1)), 'owner_one', 'ping_feed: non-anonymous ping shows the handle');
+select is((select author_id from public.ping_feed where id = tests.c(1)), tests.u(1), 'ping_feed: non-anonymous ping shows the author id');
+select tests.act_as(tests.u(4));
+select is((select author_handle from public.ping_feed where id = tests.c(1)), 'owner_one', 'ping_feed: other users see the handle of a non-anonymous ping');
+select is((select count(*) from public.ping_feed where id = tests.c(2)), 0::bigint, 'ping_feed: a group ping does not leak to a non-member');
+select is((select count(*) from public.ping_feed where group_id = tests.g()), 0::bigint, 'ping_feed: filtering by group does not leak either');
+select has_column('public', 'ping_feed', 'author_reputation', 'ping_feed exposes author_reputation');
+select has_column('public', 'ping_feed', 'received_at', 'ping_feed exposes received_at');
+select is((select author_reputation from public.ping_feed where id = tests.c(1)), 1.0::double precision, 'ping_feed: author_reputation for a normal ping');
+select tests.act_anon();
+select throws_ok($$select * from public.ping_feed$$, '42501', null, 'ping_feed: anon denied');
+select tests.act_as(tests.u(3));
 
 -- =============================== pings: insert ================================================
 select tests.act_as(tests.u(1));
@@ -163,6 +184,16 @@ select tests.act_as(tests.u(2));
 select is((select author_id from public.ping_feed where id = tests.c(6)), tests.u(2), 'ping_feed: anonymous ping still shows author to themself');
 
 select tests.act_admin();
+update public.profiles set reputation = 1.13 where id = tests.u(2);
+insert into public.pings (id, author_id, type, geom, anonymous)
+  values (tests.c(8), tests.u(2), 'other', st_setsrid(st_makepoint(-122.4, 48.2), 4326), true);
+select is((select score from public.pings where id = tests.c(8)), 1.25::double precision,
+          'anonymous ping: cached score uses the quantised reputation, not the raw 1.13');
+select tests.act_as(tests.u(3));
+select is((select author_reputation from public.ping_feed where id = tests.c(8)), 1.25::double precision, 'ping_feed: anonymous ping exposes reputation quantised to 0.25');
+select is((select author_handle from public.ping_feed where id = tests.c(8)), null::text, 'ping_feed: anonymous ping never exposes the handle');
+select tests.act_admin();
+update public.profiles set reputation = 1.0 where id = tests.u(2);
 update public.profiles set reputation = 0.25 where id = tests.u(3);
 select tests.act_as(tests.u(4));
 select is((select count(*) from public.pings where id = tests.c(3)), 0::bigint, 'reputation < 0.3: author''s public ping hidden from other users');
@@ -208,7 +239,18 @@ select tests.act_as(tests.u(4));
 select lives_ok($$select * from public.cast_vote(tests.c(1), 1::smallint)$$, 'cast_vote: confirm from ~330 m accepted');
 select ok((select voter_dist_m from public.ping_votes where ping_id = tests.c(1) and voter_id = tests.u(4)) between 200 and 500,
           'cast_vote: mid-range voter distance recorded between 200 and 500 m');
+select tests.act_as(tests.u(3));
+select is((select count(*) from public.ping_votes where ping_id = tests.c(1)), 1::bigint, 'ping_votes select: a voter sees only their own vote rows');
+select is((select count(*) from public.ping_votes where voter_id <> tests.u(3)), 0::bigint, 'ping_votes: other people''s voter_id / distance are not readable');
+select hasnt_column('public', 'ping_votes_feed', 'voter_id', 'ping_votes_feed has no voter_id');
+select hasnt_column('public', 'ping_votes_feed', 'voter_dist_m', 'ping_votes_feed has no distance');
+select columns_are('public', 'ping_votes_feed', array['ping_id','vote','created_at','voter_reputation','weight'], 'ping_votes_feed has exactly the agreed columns');
+select is((select array_agg(weight order by weight) from public.ping_votes_feed where ping_id = tests.c(1)),
+          array[0.0, 0.5, 1.0]::double precision[], 'ping_votes_feed: precomputed weights (far=0, 200-500 m=0.5, <=200 m=1.0)');
+select is((select count(*) from public.ping_votes_feed where ping_id = tests.c(1)), 3::bigint, 'ping_votes_feed: all votes on a public ping are visible (identity-free)');
 select tests.act_as(tests.u(1));
+select is((select count(*) from public.ping_votes where ping_id = tests.c(1)), 0::bigint, 'ping_votes: the ping author cannot read who voted either');
+select is((select count(*) from public.ping_votes_feed where ping_id = tests.c(1)), 3::bigint, 'ping_votes_feed: the author sees the weighted votes');
 select throws_ok($$select * from public.cast_vote(tests.c(1), 1::smallint)$$, 'PT403', null, 'cast_vote: author cannot vote on own ping');
 select tests.act_as(tests.u(2));
 select is((select vote from public.cast_vote(tests.c(1), (-1)::smallint)), 1::smallint, 'cast_vote: repeat vote is idempotent (server wins)');
@@ -237,10 +279,15 @@ select throws_ok($$select * from public.cast_vote(tests.c(7), (-1)::smallint)$$,
 select tests.act_as(tests.u(2));
 select lives_ok($$select * from public.cast_vote(tests.c(7), 1::smallint)$$, 'cast_vote: member confirms a group ping');
 select tests.act_as(tests.u(1));
-select is((select count(*) from public.ping_votes where ping_id = tests.c(7)), 1::bigint, 'ping_votes select: author sees votes on the group ping');
+select is((select count(*) from public.ping_votes_feed where ping_id = tests.c(7)), 1::bigint, 'ping_votes_feed: author sees the vote on the group ping');
+select is((select count(*) from public.ping_votes where ping_id = tests.c(7)), 0::bigint, 'ping_votes: ...but not who cast it');
 select tests.act_as(tests.u(3));
-select is((select count(*) from public.ping_votes where ping_id = tests.c(7)), 0::bigint, 'ping_votes select: non-member cannot see group-ping votes');
-select cmp_ok((select count(*) from public.ping_votes where ping_id = tests.c(1)), '>=', 2::bigint, 'ping_votes select: public-ping votes visible to any signed-in user');
+select is((select count(*) from public.ping_votes_feed where ping_id = tests.c(7)), 0::bigint, 'ping_votes_feed: non-member cannot see group-ping votes');
+select tests.act_anon();
+select throws_ok($$select * from public.ping_votes_feed$$, '42501', null, 'ping_votes_feed: anon denied');
+select tests.act_as(tests.u(2));
+select is((select count(*) from public.ping_votes where ping_id = tests.c(7)), 1::bigint, 'ping_votes: a voter still sees their own vote');
+select tests.act_as(tests.u(3));
 select tests.act_anon();
 select throws_ok($$select * from public.ping_votes$$, '42501', null, 'ping_votes select: anon denied');
 select throws_ok($$select * from public.cast_vote(tests.c(1), 1::smallint)$$, '42501', null, 'cast_vote: anon denied');
@@ -266,6 +313,13 @@ select tests.act_admin();
 update public.profiles set revoked_at = now() where id = tests.u(2);
 select tests.act_as(tests.u(2));
 select throws_ok($$select * from public.cast_vote(tests.c(7), (-1)::smallint)$$, 'PT403', null, 'cast_vote: revoked account denied');
+
+-- ---- misc hardening ------------------------------------------------------------------------------------
+select tests.act_as(tests.u(3));
+select throws_ok($$insert into public.pings (type, geom, expires_at) values ('log', st_setsrid(st_makepoint(-122.4, 48.2), 4326), now() + interval '30 days')$$,
+                 '23514', null, 'pings: expires_at more than 7 days after created_at is rejected');
+select tests.act_admin();
+update public.profiles set revoked_at = null where id = tests.u(2);
 
 select * from finish();
 rollback;

@@ -65,7 +65,7 @@ insert into public.groups (id, name, owner_id) values
 insert into public.group_members (group_id, user_id, role) values
   ('00000000-0000-0000-0000-0000000000b1', '00000000-0000-0000-0000-0000000000a2', 'member');
 
-select plan(65);
+select plan(84);
 
 create or replace function tests.row(p_cell text, p_day date, p_med float8, p_p10 float8, p_n int, p_hash text)
 returns jsonb language sql immutable as $$
@@ -137,12 +137,46 @@ select lives_ok($$select public.ingest_depth_batch(tests.c(6), tests.u(2),
 select is((select count(*) from public.depth_uploads where cell_id = tests.cell(3) and held), 1::bigint, 'E stays held: F does not agree with it');
 select is((select median_ft from public.depth_cells where cell_id = tests.cell(3)), 20::float8, 'only the non-held reading is published');
 
--- ---- 5. other boat with a normal reading means the disagreeing upload is not held -------------------------------
+-- ---- 5. corroboration must AGREE (within 5 ft), an unrelated normal reading no longer suppresses a hold ---------
 select lives_ok($$select public.ingest_depth_batch(tests.c(7), tests.u(1),
             jsonb_build_array(tests.row(tests.cell(4), '2026-10-01', 9, 7, 10, tests.h('a'))), '{}')$$, 'boat A logs a normal reading');
 select is((public.ingest_depth_batch(tests.c(8), tests.u(2),
             jsonb_build_array(tests.row(tests.cell(4), '2026-10-03', 50, 48, 10, tests.h('b'))), '{}')) ->> 'held',
-          '0', 'a disagreeing reading is not held when another boat logged the cell within 90 days (PRD rule)');
+          '1', 'S3: a wild reading stays held even though another boat logged a normal reading in the cell');
+select is((select count(*) from public.depth_cells where cell_id = tests.cell(4) and median_ft = 50), 0::bigint, 'S3: the held wild reading is not published');
+
+-- a non-held reading from another boat WITHIN 5 ft does corroborate (cell 11 had no baseline when boat X logged it)
+select tests.act_admin();
+select tests.act_service();
+select lives_ok($$select public.ingest_depth_batch(tests.c(30), tests.u(1),
+            jsonb_build_array(tests.row(tests.cell(11), '2026-10-01', 50, 48, 10, tests.h('a'))), '{}')$$, 'boat X logs 50 ft in a cell that has no baseline yet (accepted)');
+select tests.act_admin();
+insert into public.baseline_cells (cell_id, baseline_elev_ft) values (tests.cell(11), -10);
+select tests.act_service();
+select is((public.ingest_depth_batch(tests.c(31), tests.u(2),
+            jsonb_build_array(tests.row(tests.cell(11), '2026-10-02', 52, 50, 10, tests.h('b'))), '{}')) ->> 'held',
+          '0', 'a disagreeing reading 2 ft from another boat''s accepted reading is corroborated, not held');
+select is((public.ingest_depth_batch(tests.c(32), tests.u(3),
+            jsonb_build_array(tests.row(tests.cell(11), '2026-10-03', 80, 78, 10, tests.h('c'))), '{}')) ->> 'held',
+          '1', 'a disagreeing reading 28 ft from every other boat stays held');
+
+-- ---- M4. one boat, one row per (cell, day): re-sending replaces, it cannot stack weight -------------------
+select tests.act_admin();
+insert into public.baseline_cells (cell_id, baseline_elev_ft) values (tests.cell(12), -10);
+select tests.act_service();
+select lives_ok($$select public.ingest_depth_batch(tests.c(33), tests.u(1),
+            jsonb_build_array(tests.row(tests.cell(12), '2026-10-01', 10, 8, 40, tests.h('a'))), '{}')$$, 'honest boat A: 10 ft, n=40');
+select lives_ok($$select public.ingest_depth_batch(tests.c(34), tests.u(1),
+            jsonb_build_array(tests.row(tests.cell(12), '2026-10-01', 11, 9, 45, tests.h('a'))), '{}')$$, 'honest boat A re-sends the same cell/day in a new batch');
+select is((select count(*) from public.depth_uploads where cell_id = tests.cell(12)), 1::bigint, 'M4: the re-send replaced the row (unique per boat/cell/day)');
+select is((select median_ft from public.depth_uploads where cell_id = tests.cell(12)), 11::float8, 'M4: replacement carries the new values');
+select lives_ok($$select public.ingest_depth_batch(tests.c(35), tests.u(2),
+            jsonb_build_array(tests.row(tests.cell(12), '2026-10-01', 12, 10, 60, tests.h('b'))), '{}')$$, 'honest boat B: 12 ft, n=60');
+select lives_ok($$select public.ingest_depth_batch(tests.c(36), tests.u(3),
+            jsonb_build_array(tests.row(tests.cell(12), '2026-10-01', 24, 22, 86400, tests.h('c'))), '{}')$$, 'attacker C claims n = 86400 at 24 ft (14 ft off the baseline: accepted, below the 15 ft hold line)');
+select is((select median_ft from public.depth_cells where cell_id = tests.cell(12) and day = '2026-10-01'), 12::float8,
+          'M4: weights are capped at 100 per boat (45, 60, 100), so one boat with n = 86400 cannot move the median (12, not 24)');
+select is((select n from public.depth_cells where cell_id = tests.cell(12) and day = '2026-10-01'), 205, 'M4: n in the aggregate is the capped sum 45 + 60 + 100');
 
 -- ---- 6. "another boat" excludes the uploader''s own earlier hashes --------------------------------------------------
 select lives_ok($$select public.ingest_depth_batch(tests.c(9), tests.u(1),
@@ -185,10 +219,23 @@ select tests.act_service();
 select throws_ok($$select public.ingest_depth_batch(tests.c(16), tests.u(4),
             jsonb_build_array(tests.row(tests.cell(1), '2026-10-01', 12, 10, 20, tests.h('7'))), '{}')$$, 'PT403', null, 'revoked account cannot upload');
 
--- ---- 11. rate limit: 1 depth batch / 15 min ------------------------------------------------------------------------------------------
-select is((select allowed from public.rate_limit_status(tests.u(1), 'depth_batch')), false, 'rate_limit_status: u1 just uploaded, depth_batch not allowed');
+-- ---- 11. rate limit: 1 depth batch / 15 min (consumed by the edge function, counted in rate_events) -------------------
+select is((select allowed from public.rate_limit_consume(tests.u(1), 'depth_batch')), true, 'rate_limit_consume: first batch allowed');
+select is((select allowed from public.rate_limit_consume(tests.u(1), 'depth_batch')), false, 'rate_limit_consume: second batch inside 15 min refused');
 select ok((select retry_after_s from public.rate_limit_status(tests.u(1), 'depth_batch')) between 1 and 900, 'rate_limit_status: retry_after is within 15 minutes');
-select is((select allowed from public.rate_limit_status(gen_random_uuid(), 'depth_batch')), true, 'rate_limit_status: a user with no batch is allowed');
+select is((select allowed from public.rate_limit_status(gen_random_uuid(), 'depth_batch')), true, 'rate_limit_status: a user with no events is allowed');
+select is((select count(*) from public.rate_events where user_id = tests.u(1) and bucket = 'depth_batch'), 1::bigint, 'only the allowed attempt was recorded');
+
+-- ---- S5. the batch ledger forgets who sent a batch after 15 minutes --------------------------------------------------
+select is((public.depth_batch_lookup(tests.c(1))) ->> 'found', 'true', 'depth_batch_lookup: known batch');
+select is((public.depth_batch_lookup(gen_random_uuid())) ->> 'found', 'false', 'depth_batch_lookup: unknown batch');
+select tests.act_admin();
+update public.depth_batches set received_at = now() - interval '16 minutes' where batch_id = tests.c(2);
+select tests.act_service();
+select lives_ok($$select public.ingest_depth_batch(tests.c(40), tests.u(3), jsonb_build_array(tests.row(tests.cell(7), '2026-10-02', 300, 290, 5, tests.h('d'))), '{}')$$, 'any later ingest unlinks stale ledger rows');
+select is((select user_id from public.depth_batches where batch_id = tests.c(2)), null::uuid, 'S5: user_id is nulled once the 15-minute window has passed');
+select is((public.ingest_depth_batch(tests.c(2), tests.u(2), jsonb_build_array(tests.row(tests.cell(1), '2026-10-01', 12, 10, 20, tests.h('a'))), '{}')) ->> 'duplicate',
+          'true', 'S5: a replay of an unlinked batch is a plain duplicate (no ownership leak, no 409)');
 
 -- ---- 12. publication threshold: RLS shows cells only with >= 3 boats -------------------------------------------------------------------
 select tests.act_admin();

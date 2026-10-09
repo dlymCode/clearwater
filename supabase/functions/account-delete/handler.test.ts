@@ -56,3 +56,10 @@ Deno.test("if the data deletion fails the auth user is left alone so the user ca
 Deno.test("405 for GET", async () => {
   assertEquals((await handleAccountDelete(authed("GET", "tok"), { db: mockDb({ users: { tok: UID } }) })).status, 405);
 });
+
+Deno.test("S1: a revoked account is refused (403) and nothing is deleted", async () => {
+  const db = mockDb({ users: { tok: UID }, rpc: { delete_account_data: () => dbError("PT403", "account_revoked") } });
+  const res = await handleAccountDelete(authed("POST", "tok"), { db });
+  assertEquals(res.status, 403);
+  assertEquals(db.deletedUsers.length, 0);
+});

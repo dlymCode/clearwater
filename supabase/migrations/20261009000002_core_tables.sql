@@ -74,6 +74,7 @@ create table public.pings (
   constraint pings_created_sane  check (created_at >= timestamptz '2020-01-01 00:00:00+00'
                                         and created_at <= received_at + interval '168 hours'),
   constraint pings_expires_after check (expires_at > created_at),
+  constraint pings_expires_cap   check (expires_at <= created_at + interval '168 hours'),
   constraint pings_tide_sane     check (tide_ft is null or tide_ft between -10 and 30),
   constraint pings_anon_public   check (not anonymous or group_id is null)
 );
@@ -84,6 +85,7 @@ create index pings_author_idx     on public.pings (author_id, received_at desc);
 create index pings_updated_at_idx on public.pings (updated_at);
 create index pings_rep_pending_idx on public.pings (received_at) where rep_processed_at is null;
 
+comment on column public.pings.author_id is 'NOT selectable by clients (column privilege). Clients read public.ping_feed, which masks it for anonymous pings.';
 comment on column public.pings.score is 'Cache only. Authoritative value is public.score_ping(id, at); clients recompute from timestamps.';
 
 -- ping_votes ----------------------------------------------------------------------
@@ -121,7 +123,8 @@ create index messages_created_idx       on public.messages (created_at);
 create table public.last_positions (
   user_id     uuid primary key references public.profiles (id) on delete cascade,
   geom        extensions.geometry(Point, 4326) not null,
-  updated_at  timestamptz not null default now()
+  updated_at  timestamptz not null default now(),
+  constraint last_positions_salish check (public.in_salish_sea(geom))
 );
 create index last_positions_updated_idx on public.last_positions (updated_at);
 
@@ -138,6 +141,17 @@ create table public.audit_log (
 create index audit_log_created_idx on public.audit_log (created_at desc);
 create index audit_log_action_idx  on public.audit_log (action, created_at desc);
 
+-- rate_events: append-only ledger behind every rate limit (service/definer access only). Counting
+-- events rather than surviving rows means deleting a ping and re-posting it does not reset a limit.
+create table public.rate_events (
+  id       bigint generated always as identity primary key,
+  user_id  uuid not null,
+  bucket   text not null,
+  at       timestamptz not null default now()
+);
+create index rate_events_lookup_idx on public.rate_events (user_id, bucket, at desc);
+create index rate_events_at_idx on public.rate_events (at);
+
 -- app_config (service role only) ------------------------------------------------------
 create table public.app_config (
   key         text primary key,
@@ -146,11 +160,13 @@ create table public.app_config (
 );
 insert into public.app_config (key, value) values ('hmac_salt_epoch', '0'::jsonb);
 
--- Supabase Realtime for group channels + new pings (additive to cursor sync).
+-- Supabase Realtime for the group channel only (additive to cursor sync). pings and ping_votes are
+-- deliberately NOT published: Realtime streams whole rows (author_id, voter_id, voter_dist_m), which
+-- would defeat the column-level privacy below. Clients poll ping_feed / ping_votes_feed instead.
 do $$
 begin
   if exists (select 1 from pg_publication where pubname = 'supabase_realtime') then
-    alter publication supabase_realtime add table public.messages, public.pings, public.ping_votes;
+    alter publication supabase_realtime add table public.messages;
   end if;
 end
 $$;

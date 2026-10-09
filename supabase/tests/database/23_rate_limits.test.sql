@@ -65,9 +65,10 @@ insert into public.groups (id, name, owner_id) values
 insert into public.group_members (group_id, user_id, role) values
   ('00000000-0000-0000-0000-0000000000b1', '00000000-0000-0000-0000-0000000000a2', 'member');
 
-select plan(19);
+select plan(35);
 
--- 30 pings/h, 60 votes/h, 10 messages/min, 1 depth batch / 15 min -> HTTP 429 (SQLSTATE PT429).
+-- 30 pings/h, 60 votes/h, 10 messages/min, 1 depth batch / 15 min, 10 join attempts / 15 min,
+-- 1 position / 5 min -> HTTP 429 (SQLSTATE PT429). Counted from the append-only rate_events ledger.
 select tests.act_admin();
 insert into auth.users (id, email) select tests.u(i), 'v' || i || '@example.test' from generate_series(5, 8) i;
 insert into public.profiles (id, handle) select tests.u(i), 'voter_' || i from generate_series(5, 8) i;
@@ -82,14 +83,37 @@ select throws_ok($$insert into public.pings (type, geom) values ('log', st_setsr
 select tests.act_as(tests.u(2));
 select lives_ok($$insert into public.pings (type, geom) values ('log', st_setsrid(st_makepoint(-122.5, 48.3), 4326))$$,
                 'limits are per user: another user is unaffected');
+
+-- M3: a bulk insert cannot sneak past the limit inside one statement
+select throws_ok($$insert into public.pings (type, geom)
+                   select 'log', st_setsrid(st_makepoint(-122.5, 48.3), 4326) from generate_series(1, 31)$$,
+                 'PT429', null, 'M3: a single 31-row INSERT is refused (limit is enforced per row, not per statement)');
+select is((select count(*) from public.pings), 31::bigint, 'M3: the refused bulk insert stored nothing (31 = u1''s 30 + u2''s 1)');
+
+-- M3: deleting and re-posting does not reset the window
+select tests.act_as(tests.u(1));
+select is(tests.dml($$delete from public.pings$$), 30::bigint, 'u1 deletes their own 30 pings (RLS limits the delete to the author)');
+select throws_ok($$insert into public.pings (type, geom) values ('log', st_setsrid(st_makepoint(-122.5, 48.3), 4326))$$,
+                 'PT429', null, 'M3: delete-and-repost does not reset the limit (events are counted, not surviving rows)');
+
+-- retries of an existing client UUID do not consume budget
+select tests.act_as(tests.u(3));
+select lives_ok($$insert into public.pings (id, type, geom) values (tests.c(1), 'log', st_setsrid(st_makepoint(-122.5, 48.3), 4326))$$, 'u3 posts one ping');
+select lives_ok($$insert into public.pings (id, type, geom) select tests.c(1), 'log', st_setsrid(st_makepoint(-122.5, 48.3), 4326) from generate_series(1, 5)
+                  on conflict (id) do nothing$$, 'five replays of the same client UUID');
 select tests.act_admin();
-select is((select retry_after_s from public.rate_limit_status(tests.u(1), 'ping')) between 1 and 3600, true, 'retry_after_s is reported');
-update public.pings set received_at = now() - interval '61 minutes' where author_id = tests.u(1);
+select is((select count(*) from public.rate_events where user_id = tests.u(3) and bucket = 'ping'), 1::bigint, 'replays of an existing row are not counted');
+
+-- window slides
+update public.rate_events set at = now() - interval '61 minutes' where user_id = tests.u(1) and bucket = 'ping';
+select is((select retry_after_s from public.rate_limit_status(tests.u(2), 'ping')), 0, 'retry_after_s is 0 while under the limit');
 select tests.act_as(tests.u(1));
 select lives_ok($$insert into public.pings (type, geom) values ('log', st_setsrid(st_makepoint(-122.5, 48.3), 4326))$$,
-                'the window slides: pings older than an hour no longer count');
--- service role / seed data are not limited
+                'the window slides: events older than an hour no longer count');
 select tests.act_admin();
+select ok((select retry_after_s from public.rate_limit_status(tests.u(1), 'ping')) = 0, 'u1 has 1 event in the window: still allowed');
+
+-- service role / seed data are not limited
 select lives_ok($$insert into public.pings (author_id, type, geom)
                   select tests.u(3), 'log', st_setsrid(st_makepoint(-122.5, 48.3), 4326) from generate_series(1, 40)$$,
                 'service/superuser inserts (no JWT subject) are not rate limited');
@@ -100,35 +124,47 @@ select lives_ok($$insert into public.messages (group_id, body) select tests.g(),
                 '10 messages in a minute are accepted');
 select throws_ok($$insert into public.messages (group_id, body) values (tests.g(), 'one too many')$$,
                  'PT429', null, 'the 11th message in a minute returns 429');
+select is(tests.dml($$delete from public.messages where author_id = tests.u(1)$$), 10::bigint, 'u1 deletes their messages');
+select throws_ok($$insert into public.messages (group_id, body) values (tests.g(), 'repost')$$,
+                 'PT429', null, 'M3: message delete-and-repost does not reset the limit');
 select tests.act_as(tests.u(2));
 select lives_ok($$insert into public.messages (group_id, body) values (tests.g(), 'other user fine')$$, 'messages: limit is per user');
 select tests.act_admin();
-update public.messages set received_at = now() - interval '2 minutes' where author_id = tests.u(1);
+update public.rate_events set at = now() - interval '2 minutes' where user_id = tests.u(1) and bucket = 'message';
 select tests.act_as(tests.u(1));
 select lives_ok($$insert into public.messages (group_id, body) values (tests.g(), 'window slid')$$, 'messages: window slides after a minute');
 
 -- ---- votes: 60/h -------------------------------------------------------------------------------------------------------
--- 61 pings by u3 (inserted by the superuser) + positions so u5 is eligible to vote on all of them.
 select tests.act_admin();
 insert into public.pings (author_id, type, geom)
   select tests.u(4), 'log', st_setsrid(st_makepoint(-122.5, 48.3), 4326) from generate_series(1, 61);
 insert into public.last_positions (user_id, geom) values (tests.u(5), st_setsrid(st_makepoint(-122.5, 48.3), 4326));
+create temp table _vp as select id from public.pings where author_id = tests.u(4);
+grant select on _vp to authenticated;
 select tests.act_as(tests.u(5));
-select lives_ok($$select public.cast_vote(p.id, 1::smallint) from (select id from public.pings where author_id = tests.u(4) order by id limit 60) p$$,
+select lives_ok($$select public.cast_vote(p.id, 1::smallint) from (select id from _vp order by id limit 60) p$$,
                 '60 votes in an hour are accepted');
-select throws_ok($$select public.cast_vote(p.id, 1::smallint) from (select id from public.pings where author_id = tests.u(4) order by id offset 60 limit 1) p$$,
+select throws_ok($$select public.cast_vote(p.id, 1::smallint) from (select id from _vp order by id offset 60 limit 1) p$$,
                  'PT429', null, 'the 61st vote in an hour returns 429');
 
--- ---- depth batches / edge-function view of the same limiter ------------------------------------------------------------
+-- ---- depth batches / join / position: same ledger, same limiter ---------------------------------------------------------
 select tests.act_service();
-select is((select allowed from public.rate_limit_status(tests.u(1), 'depth_batch')), true, 'rate_limit_status: depth_batch allowed with no batch');
-insert into public.depth_batches (batch_id, user_id) values (gen_random_uuid(), tests.u(1));
-select is((select allowed from public.rate_limit_status(tests.u(1), 'depth_batch')), false, 'rate_limit_status: second batch inside 15 min refused');
+select is((select allowed from public.rate_limit_consume(tests.u(1), 'depth_batch')), true, 'depth_batch: first batch allowed');
+select is((select allowed from public.rate_limit_consume(tests.u(1), 'depth_batch')), false, 'depth_batch: second batch inside 15 min refused');
 select is((select max_allowed from public.rate_limit_status(tests.u(1), 'depth_batch')), 1, 'depth_batch limit is 1');
 select is((select max_allowed from public.rate_limit_status(tests.u(1), 'ping')), 30, 'ping limit is 30');
 select is((select max_allowed from public.rate_limit_status(tests.u(1), 'vote')), 60, 'vote limit is 60');
 select is((select max_allowed from public.rate_limit_status(tests.u(1), 'message')), 10, 'message limit is 10');
+select is((select max_allowed from public.rate_limit_status(tests.u(1), 'join_group')), 10, 'join_group limit is 10 per 15 min');
+select is((select max_allowed from public.rate_limit_status(tests.u(1), 'position')), 1, 'position limit is 1 per 5 min');
 select throws_ok($$select * from public.rate_limit_status(tests.u(1), 'nonsense')$$, '22023', null, 'unknown bucket is an error');
+
+-- the ledger itself is service-only
+select tests.act_as(tests.u(1));
+select throws_ok($$select * from public.rate_events$$, '42501', null, 'rate_events: not readable by clients');
+select throws_ok($$delete from public.rate_events$$, '42501', null, 'rate_events: not deletable by clients (cannot reset own limits)');
+select throws_ok($$insert into public.rate_events (user_id, bucket) values (tests.u(1), 'ping')$$, '42501', null, 'rate_events: not writable by clients');
+select throws_ok($$select public.rate_limit_consume(tests.u(1), 'ping')$$, '42501', null, 'rate_limit_consume: not callable by clients');
 
 select * from finish();
 rollback;

@@ -6,7 +6,8 @@
 --   depth_uploads    180 days (same horizon as the daily cells they feed); baseline-held rows
 --                    that never found a second boat are purged after 30 days
 --   last_positions   24 hours
---   messages         90 days
+--   messages         90 days (by server receipt time, so a device clock cannot extend it)
+--   rate_events      2 hours (the longest window is 1 h)
 --   depth_batches    7 days (idempotency window; carries a uid, so it is not kept longer)
 --
 -- All functions take an explicit "now" so pgTAP can run them against fixtures.
@@ -37,6 +38,7 @@ begin
     select c.cell_id, public.depth_bucket_start(c.day) as bs, c.median_ft, c.p10_ft, c.n, c.boats
       from public.depth_cells c
      where c.day < p_today - 180
+       and c.boats >= 3        -- cells never publishable (< 3 boats) are deleted, not rolled up
   ),
   keys as (select distinct cell_id, bs from old),
   samples as (
@@ -83,6 +85,10 @@ declare
 begin
   delete from public.last_positions where updated_at < p_now - interval '24 hours';
   get diagnostics v_n = row_count;
+  -- same 15-minute housekeeping job: expire rate-limit events and unlink old depth batch ledger rows
+  delete from public.rate_events where at < p_now - interval '2 hours';
+  update public.depth_batches set user_id = null
+   where user_id is not null and received_at < p_now - interval '15 minutes';
   return v_n;
 end
 $$;
@@ -121,7 +127,7 @@ begin
   delete from public.pings where received_at < p_now - interval '1 year';
   get diagnostics v_pings = row_count;
 
-  delete from public.messages where created_at < p_now - interval '90 days';
+  delete from public.messages where received_at < p_now - interval '90 days';
   get diagnostics v_messages = row_count;
 
   v_positions := public.purge_last_positions(p_now);

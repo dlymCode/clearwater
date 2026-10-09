@@ -1,9 +1,11 @@
 // Rate-limit middleware (docs/AGENT-PLAN.md: 30 pings/h, 60 votes/h, 10 msgs/min,
 // 1 depth batch / 15 min, per user -> HTTP 429).
 //
-// Single source of truth for the counting is SQL: public.rate_limit_status(user, bucket), which the
-// BEFORE INSERT triggers on pings / ping_votes / messages also call, so direct PostgREST writes are
-// limited identically. Edge functions use this module for the buckets they front (depth_batch).
+// Single source of truth for the counting is SQL: the append-only public.rate_events ledger with
+// rate_limit_status() (peek) and rate_limit_consume() (check + record, serialised per user+bucket).
+// The BEFORE INSERT triggers on pings / ping_votes / messages call the same functions, so direct
+// PostgREST writes are limited identically. Edge functions use this module for the buckets they
+// front (depth_batch).
 import { type Db, rpc } from "./db.ts";
 import { json } from "./http.ts";
 
@@ -12,6 +14,8 @@ export const RATE_LIMITS = {
   vote: { max: 60, windowSeconds: 3600 },
   message: { max: 10, windowSeconds: 60 },
   depth_batch: { max: 1, windowSeconds: 900 },
+  join_group: { max: 10, windowSeconds: 900 },
+  position: { max: 1, windowSeconds: 300 },
 } as const;
 
 export type Bucket = keyof typeof RATE_LIMITS;
@@ -42,16 +46,31 @@ export function slidingWindowDecision(
   return { allowed, used: inWindow.length, max_allowed: max, retry_after_s: retry };
 }
 
-export async function checkRateLimit(db: Db, userId: string, bucket: Bucket): Promise<RateLimitStatus> {
-  const data = await rpc<RateLimitStatus | RateLimitStatus[]>(db, "rate_limit_status", {
+async function callLimiter(
+  db: Db,
+  fn: "rate_limit_status" | "rate_limit_consume",
+  userId: string,
+  bucket: Bucket,
+): Promise<RateLimitStatus> {
+  const data = await rpc<RateLimitStatus | RateLimitStatus[]>(db, fn, {
     p_user: userId,
     p_bucket: bucket,
   });
   const row = Array.isArray(data) ? data[0] : data;
   if (!row || typeof row.allowed !== "boolean") {
-    throw new Error("rate_limit_status returned an unexpected shape");
+    throw new Error(`${fn} returned an unexpected shape`);
   }
   return row;
+}
+
+/** Peek: does not record anything. */
+export function checkRateLimit(db: Db, userId: string, bucket: Bucket): Promise<RateLimitStatus> {
+  return callLimiter(db, "rate_limit_status", userId, bucket);
+}
+
+/** Check and, when allowed, record one event atomically (race-free per user and bucket). */
+export function consumeRateLimit(db: Db, userId: string, bucket: Bucket): Promise<RateLimitStatus> {
+  return callLimiter(db, "rate_limit_consume", userId, bucket);
 }
 
 export function rateLimitResponse(status: RateLimitStatus, bucket: Bucket): Response {
@@ -66,8 +85,8 @@ export function rateLimitResponse(status: RateLimitStatus, bucket: Bucket): Resp
   );
 }
 
-/** Returns a 429 Response when the user is over the limit, otherwise null. */
+/** Consumes one event; returns a 429 Response when the user is over the limit, otherwise null. */
 export async function enforceRateLimit(db: Db, userId: string, bucket: Bucket): Promise<Response | null> {
-  const status = await checkRateLimit(db, userId, bucket);
+  const status = await consumeRateLimit(db, userId, bucket);
   return status.allowed ? null : rateLimitResponse(status, bucket);
 }

@@ -4,9 +4,10 @@
 
 -- ======================================================================================
 -- recompute_depth_cell: rebuild the (cell, day) aggregate from non-held uploads.
---   median_ft = n-weighted (lower) median of uploads' median_ft
---   p10_ft    = n-weighted 10th percentile of uploads' p10_ft
---   n         = sum(n)            boats = count(distinct uploader_hash)
+--   median_ft = weighted (lower) median of uploads' median_ft
+--   p10_ft    = weighted 10th percentile of uploads' p10_ft
+--   weight    = least(n, 100) per boat-day-cell, so one boat cannot dominate a cell by claiming a huge n
+--   n         = sum(least(n, 100))   boats = count(distinct uploader_hash)
 -- No qualifying uploads => the aggregate row is deleted.
 -- ======================================================================================
 create or replace function public.recompute_depth_cell(p_cell text, p_day date)
@@ -23,9 +24,9 @@ declare
 begin
   select
     public.weighted_quantile(array_agg(u.median_ft order by u.median_ft, u.id),
-                             array_agg(u.n::double precision order by u.median_ft, u.id), 0.5),
+                             array_agg(least(u.n, 100)::double precision order by u.median_ft, u.id), 0.5),
     count(distinct u.uploader_hash),
-    sum(u.n)
+    sum(least(u.n, 100))
   into v_median, v_boats, v_n
   from public.depth_uploads u
   where u.cell_id = p_cell and u.day = p_day and not u.held;
@@ -36,7 +37,7 @@ begin
   end if;
 
   select public.weighted_quantile(array_agg(u.p10_ft order by u.p10_ft, u.id),
-                                  array_agg(u.n::double precision order by u.p10_ft, u.id), 0.10)
+                                  array_agg(least(u.n, 100)::double precision order by u.p10_ft, u.id), 0.10)
   into v_p10
   from public.depth_uploads u
   where u.cell_id = p_cell and u.day = p_day and not u.held;
@@ -63,11 +64,16 @@ $$;
 --                  "another boat" is exact even though hashes rotate daily.
 --
 -- Hold rule (PRD "Depth log trust" #4, docs/AGENT-PLAN.md):
---   a row is HELD (kept, excluded from depth_cells) when |median_ft - (-baseline_elev_ft)| > 15 AND no
---   other boat has a non-held upload for that cell within 90 days AND no other boat's held row
---   within 30 days agrees with it (|delta| <= 5 ft). If another boat's held row agrees, the new
---   row is accepted and the agreeing held rows are RELEASED. Rows with no baseline are never held.
---   Admin-held rows (held_reason = 'admin') are never auto-released.
+--   a row is HELD (kept, excluded from depth_cells) when |median_ft - (-baseline_elev_ft)| > 15 AND
+--   no other boat corroborates it. Corroboration (a deliberate tightening of the PRD wording, which
+--   only says "no other boat has logged that cell within 90 days"; flagged to the owner because with
+--   the literal wording any unrelated nearby reading would let a poisoned value through):
+--     * a NON-held upload from another boat within 90 days whose median is within 5 ft of this one, or
+--     * a HELD upload from another boat within 30 days within 5 ft of this one (that boat's row is
+--       then RELEASED together with this row).
+--   Rows with no baseline are never held. Admin-held rows (held_reason = 'admin') are never
+--   auto-released. A repeat upload by the same boat for the same (cell, day) REPLACES the earlier one
+--   (unique index), so a boat cannot add weight by re-sending.
 -- ======================================================================================
 create or replace function public.ingest_depth_batch(
   p_batch_id uuid,
@@ -102,6 +108,7 @@ declare
   v_key text;
   v_inserted integer;
   v_owner uuid;
+  v_exists boolean;
   rel record;
 begin
   if p_rows is null or jsonb_typeof(p_rows) <> 'array'
@@ -112,12 +119,17 @@ begin
     raise exception 'account_revoked' using errcode = 'PT403';
   end if;
 
+  -- Unlink uploader ids from batch ledger rows once the 15-minute rate window has passed.
+  update public.depth_batches set user_id = null
+   where user_id is not null and received_at < now() - interval '15 minutes';
+
   insert into public.depth_batches (batch_id, user_id) values (p_batch_id, p_user_id)
   on conflict (batch_id) do nothing;
   get diagnostics v_inserted = row_count;
   if v_inserted = 0 then
     select user_id into v_owner from public.depth_batches where batch_id = p_batch_id;
-    if v_owner is distinct from p_user_id then
+    -- owner is null once the ledger row has been unlinked: any replay is then simply a duplicate
+    if v_owner is not null and v_owner <> p_user_id then
       raise exception 'batch_id_conflict' using errcode = 'PT409';
     end if;
     return jsonb_build_object('duplicate', true);
@@ -152,6 +164,7 @@ begin
          where u.cell_id = v_cell
            and not u.held
            and u.day between v_day - 90 and v_day + 90
+           and abs(u.median_ft - v_med) <= c_agree_ft
            and u.uploader_hash <> v_hash
            and u.uploader_hash <> all (p_self_hashes)
       ) into v_corroborated;
@@ -176,11 +189,19 @@ begin
       end if;
     end if;
 
+    -- Upsert-replace per (boat, cell, day). An admin hold on the existing row survives the replacement.
     insert into public.depth_uploads
       (uploader_hash, cell_id, day, median_ft, p10_ft, n, held, held_reason)
     values
       (v_hash, v_cell, v_day, v_med, v_p10, v_n, v_held,
-       case when v_held then 'baseline_disagreement' end);
+       case when v_held then 'baseline_disagreement' end)
+    on conflict (uploader_hash, cell_id, day) do update
+      set median_ft   = excluded.median_ft,
+          p10_ft      = excluded.p10_ft,
+          n           = excluded.n,
+          held        = coalesce(depth_uploads.held_reason = 'admin', false) or excluded.held,
+          held_reason = case when depth_uploads.held_reason = 'admin' then 'admin'
+                             when excluded.held then 'baseline_disagreement' end;
 
     if v_held then v_held_count := v_held_count + 1; else v_accepted := v_accepted + 1; end if;
     v_keys := v_keys || (v_cell || '|' || v_day::text);
@@ -200,15 +221,18 @@ end
 $$;
 
 -- Replay check used by the depth-upload edge function BEFORE rate limiting, so a retry of an
--- already-accepted batch is answered as a duplicate instead of a 429.
-create or replace function public.depth_batch_owner(p_batch_id uuid)
-returns uuid
+-- already-accepted batch is answered as a duplicate instead of a 429. owner is null once the ledger
+-- row has been unlinked from its user (15 minutes after receipt).
+create or replace function public.depth_batch_lookup(p_batch_id uuid)
+returns jsonb
 language sql
 stable
 security definer
 set search_path = public
 as $$
-  select user_id from public.depth_batches where batch_id = p_batch_id;
+  select coalesce(
+    (select jsonb_build_object('found', true, 'owner', b.user_id) from public.depth_batches b where b.batch_id = p_batch_id),
+    jsonb_build_object('found', false, 'owner', null));
 $$;
 
 -- Audit helper for the admin edge function (denied attempts, invalid requests, ban outcomes).
@@ -220,9 +244,14 @@ language sql
 security definer
 set search_path = public
 as $$
+  -- Flood control: one row per actor per 10 minutes for denial / invalid-request noise.
   insert into public.audit_log (actor, action, target_type, target_id, details)
-  values (p_actor, left(p_action, 100), left(p_target_type, 100), left(p_target_id, 200),
-          coalesce(p_details, '{}'::jsonb));
+  select p_actor, left(p_action, 100), left(p_target_type, 100), left(p_target_id, 200),
+         coalesce(p_details, '{}'::jsonb)
+   where p_action not in ('admin.denied', 'admin.invalid_request')
+      or not exists (select 1 from public.audit_log a
+                      where a.actor is not distinct from p_actor and a.action = p_action
+                        and a.created_at > now() - interval '10 minutes');
 $$;
 
 -- ======================================================================================
@@ -330,7 +359,7 @@ $$;
 -- Groups the user owns pass to the longest-standing other member, or are deleted if empty.
 -- The edge function deletes the auth.users row afterwards.
 -- ======================================================================================
-create or replace function public.delete_account_data(p_user uuid)
+create or replace function public.delete_account_data(p_user uuid, p_self boolean default true)
 returns jsonb
 language plpgsql
 security definer
@@ -343,6 +372,11 @@ declare
   v_msgs integer;
   v_votes integer;
 begin
+  -- A revoked account may not erase its own footprint (pings, votes, messages) to dodge review.
+  -- Operator-initiated deletion calls this with p_self = false.
+  if p_self and exists (select 1 from public.profiles where id = p_user and revoked_at is not null) then
+    raise exception 'account_revoked' using errcode = 'PT403';
+  end if;
   for g in select id from public.groups where owner_id = p_user loop
     select gm.user_id into v_new_owner
       from public.group_members gm
@@ -388,7 +422,7 @@ begin
      where n.nspname = 'public'
        and p.proname in ('recompute_depth_cell','ingest_depth_batch','admin_set_upload_held',
                          'admin_revoke_account','admin_rotate_salt','get_salt_epoch','admin_list_held',
-                         'delete_account_data','depth_batch_owner','admin_audit')
+                         'delete_account_data','depth_batch_lookup','admin_audit')
   loop
     execute format('revoke all on function %s from public, anon, authenticated', f);
     execute format('grant execute on function %s to service_role', f);

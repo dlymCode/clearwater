@@ -22,15 +22,16 @@ Errors: `401` missing/invalid/expired token (with `WWW-Authenticate: Bearer`), `
 `404` archive not in R2 (only when the `TILES` binding is configured), `429` daily quota spent (with
 `Retry-After` = seconds to UTC midnight), `405`, `500` misconfigured (generic body).
 
-**Allowed paths:** `tiles/**/*.pmtiles` and exactly `tiles/index.json`; segments `[A-Za-z0-9_-][A-Za-z0-9._-]*`
-only. No dot segments, `//`, percent escapes, backslashes, query strings or unicode.
+**Allowed paths:** `tiles/**/*.pmtiles`, exactly `tiles/index.json`, and `tides/<station_id>.json` (flat, the
+station id is `[A-Za-z0-9_-]{1,32}`); tile segments are `[A-Za-z0-9_-][A-Za-z0-9._-]*`. No dot segments, `//`,
+percent escapes, backslashes, query strings or unicode. A tide JSON is charged 1 MB.
 
 **Auth:** the token must be a Supabase access token for a signed-in user: signature (HS256 with
 `SUPABASE_JWT_SECRET`, or ES256/RS256 against `<SUPABASE_URL>/auth/v1/.well-known/jwks.json`, cached
 10 min, refetched once on an unknown `kid`), `exp`/`nbf` (5 s skew), `iss = <SUPABASE_URL>/auth/v1`,
 `aud = authenticated`, `role = authenticated` (so the anon and service keys are refused), `sub` a UUID.
 `alg: none` and unconfigured algorithms are refused. HS256 is rejected outright unless a secret is set.
-An account revoked by an admin keeps a valid JWT for at most its remaining lifetime (1 h by
+A token with an undecodable segment is a 401 (never a 5xx). An account revoked by an admin keeps a valid JWT for at most its remaining lifetime (1 h by
 `config.toml`), after which the ban stops refresh.
 
 **Signing:** AWS SigV4 query-string presign (region `auto`, service `s3`, `host` signed header,
@@ -52,7 +53,7 @@ npm test            # node --test with TypeScript type-stripping; no wrangler, n
 npm run typecheck   # tsc --noEmit
 ```
 
-Tests (33) cover the SigV4 reference vector, path validation, quota maths, JWT verification (HS256, ES256
+Tests (36) cover the SigV4 reference vector, path validation, quota maths, JWT verification (HS256, ES256
 via JWKS, rotation, expiry, issuer, audience, anon-key refusal, alg confusion) and the full request flow
 with fake KV/R2. Node >= 22.6 is required (`--experimental-strip-types`; unflagged on 23.6+).
 

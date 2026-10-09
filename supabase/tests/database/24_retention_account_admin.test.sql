@@ -65,7 +65,7 @@ insert into public.groups (id, name, owner_id) values
 insert into public.group_members (group_id, user_id, role) values
   ('00000000-0000-0000-0000-0000000000b1', '00000000-0000-0000-0000-0000000000a2', 'member');
 
-select plan(55);
+select plan(72);
 
 -- =============================== retention ===================================================
 select tests.act_admin();
@@ -79,7 +79,10 @@ insert into public.ping_votes (ping_id, voter_id, vote, voter_dist_m, created_at
   (tests.c(2), tests.u(3),  1, 100, now() - interval '2 days');
 insert into public.messages (id, group_id, author_id, body, created_at) values
   (tests.c(1), tests.g(), tests.u(1), 'old', now() - interval '100 days'),
-  (tests.c(2), tests.g(), tests.u(1), 'recent', now() - interval '30 days');
+  (tests.c(2), tests.g(), tests.u(1), 'recent', now() - interval '30 days'),
+  (tests.c(9), tests.g(), tests.u(1), 'written 100 days ago offline, delivered just now', now() - interval '100 days');
+-- retention keys on the SERVER receipt time (received_at is forced to now() at insert; backdate it here)
+update public.messages set received_at = created_at where id in (tests.c(1), tests.c(2));
 insert into public.last_positions (user_id, geom) values
   (tests.u(1), st_setsrid(st_makepoint(-122.5, 48.3), 4326)),
   (tests.u(2), st_setsrid(st_makepoint(-122.5, 48.3), 4326));
@@ -102,6 +105,9 @@ select is((select b from _b) - date '1970-01-01', ((select b from _b) - date '19
 insert into public.depth_cells (cell_id, day, median_ft, p10_ft, n, boats)
 select '8c2a1072b59ff10', (select b from _b) + d, m, p, n, bo
   from (values (0, -10.0, -12.0, 10, 3), (10, -12.0, -15.0, 30, 4), (20, -14.0, -17.0, 10, 2)) v(d, m, p, n, bo);
+-- a cell only ever seen by 2 boats (never publishable): deleted at 180 days, never rolled up
+insert into public.depth_cells (cell_id, day, median_ft, p10_ft, n, boats)
+values ('8c2a1072b59ff12', (select b from _b) + 5, -9, -10, 20, 2);
 insert into public.depth_cells (cell_id, day, median_ft, p10_ft, n, boats)
 values ('8c2a1072b59ff11', (now() at time zone 'utc')::date - 3, -9, -10, 10, 3);
 
@@ -116,6 +122,7 @@ select is((select count(*) from public.pings where id = tests.c(2)), 1::bigint, 
 select is((select count(*) from public.ping_votes where ping_id = tests.c(2)), 1::bigint, 'votes older than 1 year are deleted, recent kept');
 select is((select count(*) from public.messages where id = tests.c(1)), 0::bigint, 'messages older than 90 days are deleted');
 select is((select count(*) from public.messages where id = tests.c(2)), 1::bigint, 'recent messages are kept');
+select is((select count(*) from public.messages where id = tests.c(9)), 1::bigint, 'S9: retention counts from server receipt, so a message delivered just now is kept despite an old device timestamp');
 select is((select count(*) from public.last_positions where user_id = tests.u(1)), 0::bigint, 'last positions older than 24 h are deleted');
 select is((select count(*) from public.last_positions where user_id = tests.u(2)), 1::bigint, 'fresh last positions are kept');
 select is((select count(*) from public.depth_batches where batch_id = tests.c(1)), 0::bigint, 'idempotency ledger older than 7 days is deleted');
@@ -129,8 +136,10 @@ select is((select count(*) from public.depth_uploads where uploader_hash = repea
 select is((select count(*) from public.depth_cells where cell_id = '8c2a1072b59ff10'), 0::bigint, 'daily cells older than 180 days are deleted');
 select is((select count(*) from public.depth_cells where cell_id = '8c2a1072b59ff11'), 1::bigint, 'recent daily cells are kept');
 select is((select median_ft from public.depth_cell_aggregates where cell_id = '8c2a1072b59ff10'), -12::float8, 'rolled 90-day aggregate: n-weighted median of the daily medians');
-select is((select p10_ft from public.depth_cell_aggregates where cell_id = '8c2a1072b59ff10'), -17::float8, 'rolled 90-day aggregate: n-weighted p10');
-select is((select n from public.depth_cell_aggregates where cell_id = '8c2a1072b59ff10'), 50, 'rolled aggregate sums n');
+select is((select p10_ft from public.depth_cell_aggregates where cell_id = '8c2a1072b59ff10'), -15::float8, 'rolled 90-day aggregate: n-weighted p10 (the 2-boat day is excluded)');
+select is((select n from public.depth_cell_aggregates where cell_id = '8c2a1072b59ff10'), 40, 'rolled aggregate sums n of the >= 3-boat days only');
+select is((select count(*) from public.depth_cell_aggregates where cell_id = '8c2a1072b59ff12'), 0::bigint, 'S10: a cell that never had 3 boats is not rolled into an aggregate');
+select is((select count(*) from public.depth_cells where cell_id = '8c2a1072b59ff12'), 0::bigint, 'S10: ...and its daily row is still deleted after 180 days');
 select is((select boats from public.depth_cell_aggregates where cell_id = '8c2a1072b59ff10'), 4, 'rolled aggregate keeps the max daily boat count');
 select is((select period_start from public.depth_cell_aggregates where cell_id = '8c2a1072b59ff10'), (select b from _b), 'aggregate period starts at the bucket start');
 select is((select period_end - period_start from public.depth_cell_aggregates where cell_id = '8c2a1072b59ff10'), 90, 'aggregate spans 90 days');
@@ -141,8 +150,8 @@ values ('8c2a1072b59ff10', (select b from _b) + 30, -8, -9, 50, 3);
 select tests.act_service();
 select lives_ok($$select public.run_retention(now())$$, 'run_retention is repeatable');
 select tests.act_admin();
-select is((select n from public.depth_cell_aggregates where cell_id = '8c2a1072b59ff10'), 100, 'second roll merges into the existing aggregate (n = 50 + 50)');
-select is((select median_ft from public.depth_cell_aggregates where cell_id = '8c2a1072b59ff10'), -12::float8, 'merged median: (-12, w50) and (-8, w50) -> lower weighted median -12');
+select is((select n from public.depth_cell_aggregates where cell_id = '8c2a1072b59ff10'), 90, 'second roll merges into the existing aggregate (n = 40 + 50)');
+select is((select median_ft from public.depth_cell_aggregates where cell_id = '8c2a1072b59ff10'), -8::float8, 'merged median: (-12, w40) and (-8, w50) -> lower weighted median -8');
 select is((select count(*) from public.depth_cell_aggregates where cell_id = '8c2a1072b59ff10'), 1::bigint, 'still one aggregate row per (cell, bucket)');
 select is((select count(*) from public.audit_log where action = 'retention.run'), 2::bigint, 'each retention run is logged');
 
@@ -212,6 +221,30 @@ select tests.act_as(tests.u(2));
 select is((select count(*) from public.pings where id = tests.c(7)), 0::bigint, 'revoked account''s public pings are hidden from others');
 select tests.act_service();
 select throws_ok($$select public.admin_revoke_account(tests.u(2), gen_random_uuid(), null)$$, 'PT404', null, 'revoking an unknown account is a 404');
+
+-- =============================== S1: a revoked account cannot erase itself ========================
+select tests.act_service();
+select throws_ok($$select public.delete_account_data(tests.u(4))$$, 'PT403', 'account_revoked', 'S1: self-deletion is refused for a revoked profile');
+select is((select count(*) from public.profiles where id = tests.u(4)), 1::bigint, 'S1: the revoked profile and its pings are still there for review');
+select is((select count(*) from public.pings where id = tests.c(7)), 1::bigint, 'S1: its pings are preserved');
+select lives_ok($$select public.delete_account_data(tests.u(4), false)$$, 'S1: an operator-initiated deletion (p_self = false) still works');
+
+-- =============================== S8: audit_log cannot be rewritten ==================================
+select tests.act_service();
+select throws_ok($$truncate public.audit_log$$, '42501', null, 'S8: the service role cannot truncate audit_log');
+select throws_ok($$delete from public.audit_log$$, '42501', null, 'S8: the service role cannot delete audit rows');
+select throws_ok($$update public.audit_log set action = 'x'$$, '42501', null, 'S8: the service role cannot update audit rows');
+select tests.act_admin();
+select throws_ok($$truncate public.audit_log$$, '42501', null, 'S8: even the table owner is stopped by the truncate trigger');
+
+-- admin.denied / admin.invalid_request flood control: one row per actor per 10 minutes
+select tests.act_service();
+select lives_ok($$select public.admin_audit(tests.u(3), 'admin.denied', null, null, '{}') from generate_series(1, 20)$$, '20 denied attempts in a row');
+select is((select count(*) from public.audit_log where action = 'admin.denied' and actor = tests.u(3)), 1::bigint, 'S8: only one admin.denied row is written per actor per 10 minutes');
+select lives_ok($$select public.admin_audit(tests.u(3), 'admin.invalid_request') from generate_series(1, 5)$$, 'invalid requests');
+select is((select count(*) from public.audit_log where action = 'admin.invalid_request' and actor = tests.u(3)), 1::bigint, 'S8: invalid_request noise is throttled too');
+select lives_ok($$select public.admin_audit(tests.u(3), 'admin.revoke_account.ban_failed') from generate_series(1, 3)$$, 'real admin events');
+select is((select count(*) from public.audit_log where action = 'admin.revoke_account.ban_failed'), 3::bigint, 'S8: real admin actions are never deduplicated');
 
 select * from finish();
 rollback;

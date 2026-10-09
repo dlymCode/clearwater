@@ -65,7 +65,7 @@ insert into public.groups (id, name, owner_id) values
 insert into public.group_members (group_id, user_id, role) values
   ('00000000-0000-0000-0000-0000000000b1', '00000000-0000-0000-0000-0000000000a2', 'member');
 
-select plan(41);
+select plan(60);
 
 select tests.act_admin();
 insert into public.messages (id, group_id, author_id, body) values
@@ -131,49 +131,58 @@ select tests.act_as(tests.u(1));
 select is(tests.dml($$delete from public.messages where id = tests.c(4)$$), 1::bigint, 'messages delete: group owner moderates a member''s message');
 
 -- =============================== last_positions =================================================
+-- Writes go through report_position(lat, lon) only; the table has no client insert/update grant.
 select tests.act_as(tests.u(1));
-select lives_ok($$insert into public.last_positions (user_id, geom) values (tests.u(1), st_setsrid(st_makepoint(-122.50123, 48.30456), 4326))$$,
-                'last_positions insert: owner reports a position');
+select throws_ok($$insert into public.last_positions (user_id, geom) values (tests.u(1), st_setsrid(st_makepoint(-122.5, 48.3), 4326))$$,
+                 '42501', null, 'last_positions insert: direct insert denied (use report_position)');
+select throws_ok($$update public.last_positions set geom = st_setsrid(st_makepoint(-122.5, 48.3), 4326)$$,
+                 '42501', null, 'last_positions update: direct update denied');
+select lives_ok($$select public.report_position(48.30456, -122.50123)$$, 'report_position: owner reports a position');
+create temp table _p1 as select st_astext(geom) as g from public.last_positions where user_id = tests.u(1);
+grant select on _p1 to authenticated;
 select ok((select abs(st_x(st_transform(geom, 32610)) - round(st_x(st_transform(geom, 32610)) / 100) * 100) < 0.01
               and abs(st_y(st_transform(geom, 32610)) - round(st_y(st_transform(geom, 32610)) / 100) * 100) < 0.01
              from public.last_positions where user_id = tests.u(1)),
-          'last_positions insert: stored position is snapped to a 100 m grid server-side');
-select throws_ok($$insert into public.last_positions (user_id, geom) values (tests.u(2), st_setsrid(st_makepoint(-122.5, 48.3), 4326))$$,
-                 '42501', null, 'last_positions insert: cannot report for someone else');
+          'report_position: stored position is snapped to a 100 m grid server-side');
+select lives_ok($$select public.report_position(48.4, -122.6)$$, 'report_position: a second report inside 5 minutes is accepted silently (no error)');
+select is((select st_astext(geom) from public.last_positions where user_id = tests.u(1)), (select g from _p1),
+          'report_position: ...but it is a no-op (position unchanged)');
+select throws_ok($$select public.report_position(45.0, -122.5)$$, 'PT400', 'position_out_of_range', 'report_position: outside the Salish Sea box is rejected');
+select throws_ok($$select public.report_position(95, -122.5)$$, 'PT400', 'invalid_position', 'report_position: impossible latitude rejected');
+select throws_ok($$select public.report_position('NaN'::float8, -122.5)$$, 'PT400', 'invalid_position', 'report_position: NaN rejected');
+select throws_ok($$select public.report_position(null, -122.5)$$, 'PT400', 'invalid_position', 'report_position: null rejected');
+select tests.act_admin();
+update public.rate_events set at = now() - interval '6 minutes' where user_id = tests.u(1) and bucket = 'position';
+select tests.act_as(tests.u(1));
+select lives_ok($$select public.report_position(48.4, -122.6)$$, 'report_position: after 5 minutes the update goes through');
+select isnt((select st_astext(geom) from public.last_positions where user_id = tests.u(1)), (select g from _p1), 'report_position: position moved');
+-- delete + re-report cannot dodge the throttle
+select is(tests.dml($$delete from public.last_positions where user_id = tests.u(1)$$), 1::bigint, 'last_positions delete: owner stops sharing');
+select lives_ok($$select public.report_position(48.3, -122.5)$$, 'report_position: re-report right after delete is accepted silently');
+select is((select count(*) from public.last_positions where user_id = tests.u(1)), 0::bigint, 'report_position: ...but delete-and-re-report did not reset the 5-minute throttle');
+
 select tests.act_as(tests.u(2));
-select lives_ok($$insert into public.last_positions (user_id, geom) values (tests.u(2), st_setsrid(st_makepoint(-122.51, 48.31), 4326))$$,
-                'last_positions insert: member reports a position');
+select lives_ok($$select public.report_position(48.31, -122.51)$$, 'report_position: member reports a position');
+select tests.act_admin();
+insert into public.last_positions (user_id, geom) values (tests.u(1), st_setsrid(st_makepoint(-122.5, 48.3), 4326));
+select tests.act_as(tests.u(2));
 select is((select count(*) from public.last_positions), 2::bigint, 'last_positions select: group mates see each other and themself');
 select tests.act_as(tests.u(3));
 select is((select count(*) from public.last_positions), 0::bigint, 'last_positions select: non-member sees none');
 select tests.act_anon();
 select throws_ok($$select * from public.last_positions$$, '42501', null, 'last_positions select: anon denied');
+select throws_ok($$select public.report_position(48.3, -122.5)$$, '42501', null, 'report_position: anon denied');
 select throws_ok($$insert into public.last_positions (user_id, geom) values (tests.u(1), st_setsrid(st_makepoint(-122.5, 48.3), 4326))$$,
                  '42501', null, 'last_positions insert: anon denied');
-
-select tests.act_as(tests.u(1));
-select throws_ok($$update public.last_positions set geom = st_setsrid(st_makepoint(-122.6, 48.4), 4326) where user_id = tests.u(1)$$,
-                 'PT429', null, 'last_positions update: second update inside 5 minutes is throttled (429)');
-select tests.act_admin();
-alter table public.last_positions disable trigger last_positions_before_write;
-update public.last_positions set updated_at = now() - interval '6 minutes' where user_id = tests.u(1);
-alter table public.last_positions enable trigger last_positions_before_write;
-select tests.act_as(tests.u(1));
-select is(tests.dml($$update public.last_positions set geom = st_setsrid(st_makepoint(-122.6, 48.4), 4326) where user_id = tests.u(1)$$),
-          1::bigint, 'last_positions update: owner may update after 5 minutes');
-select is(tests.dml($$update public.last_positions set geom = st_setsrid(st_makepoint(-122.6, 48.4), 4326) where user_id = tests.u(2)$$),
-          0::bigint, 'last_positions update: cannot move a group mate');
-select throws_ok($$update public.last_positions set user_id = tests.u(3) where user_id = tests.u(1)$$, '42501', null,
-                 'last_positions update: user_id is immutable (column privilege)');
-select tests.act_as(tests.u(3));
-select is(tests.dml($$update public.last_positions set geom = st_setsrid(st_makepoint(-122.6, 48.4), 4326)$$), 0::bigint,
-          'last_positions update: non-member updates nothing');
-select tests.act_anon();
 select throws_ok($$update public.last_positions set geom = st_setsrid(st_makepoint(-122.6, 48.4), 4326)$$,
                  '42501', null, 'last_positions update: anon denied');
 
--- stale rows (> 24 h) are invisible even before the purge job runs
+-- table-level Salish Sea CHECK (defence in depth behind the RPC)
 select tests.act_admin();
+select throws_ok($$insert into public.last_positions (user_id, geom) values (tests.u(4), st_setsrid(st_makepoint(-110.0, 40.0), 4326))$$,
+                 '23514', null, 'last_positions: geometry outside the Salish Sea box rejected by CHECK');
+
+-- stale rows (> 24 h) are invisible even before the purge job runs
 alter table public.last_positions disable trigger last_positions_before_write;
 update public.last_positions set updated_at = now() - interval '25 hours' where user_id = tests.u(2);
 alter table public.last_positions enable trigger last_positions_before_write;
@@ -188,6 +197,30 @@ select throws_ok($$delete from public.last_positions$$, '42501', null, 'last_pos
 select tests.act_as(tests.u(1));
 select is(tests.dml($$delete from public.last_positions where user_id = tests.u(2)$$), 0::bigint, 'last_positions delete: cannot delete a group mate''s row');
 select is(tests.dml($$delete from public.last_positions where user_id = tests.u(1)$$), 1::bigint, 'last_positions delete: owner turns sharing off');
+
+-- =============================== removed member loses message history ============================
+select tests.act_as(tests.u(2));
+select cmp_ok((select count(*) from public.messages), '>', 0::bigint, 'member can read the channel');
+select tests.act_as(tests.u(1));
+select is(tests.dml($$delete from public.group_members where user_id = tests.u(2)$$), 1::bigint, 'owner removes the member');
+select tests.act_as(tests.u(2));
+select is((select count(*) from public.messages), 0::bigint, 'removed member can no longer re-read the channel (RLS evaluated per query)');
+select throws_ok($$insert into public.messages (group_id, body) values (tests.g(), 'still here?')$$, '42501', null, 'removed member can no longer post');
+
+-- =============================== revoked accounts cannot write =====================================
+select tests.act_admin();
+update public.profiles set revoked_at = now() where id = tests.u(3);
+select tests.act_as(tests.u(3));
+select throws_ok($$insert into public.groups (name, owner_id) values ('Zombie', tests.u(3))$$, '42501', null, 'revoked: cannot create a group');
+select throws_ok($$select public.report_position(48.3, -122.5)$$, 'PT403', null, 'revoked: report_position refused');
+select throws_ok($$select public.join_group('AAAAAAAA')$$, 'PT403', null, 'revoked: join_group refused');
+select throws_ok($$select public.promote_ping(gen_random_uuid())$$, 'PT403', null, 'revoked: promote_ping refused');
+
+select tests.act_admin();
+update public.profiles set revoked_at = now() where id = tests.u(1);
+select tests.act_as(tests.u(1));
+select throws_ok($$insert into public.messages (group_id, body) values (tests.g(), 'revoked owner')$$, '42501', null, 'revoked: a member cannot post messages');
+select throws_ok($$insert into public.pings (type, geom) values ('log', st_setsrid(st_makepoint(-122.4, 48.2), 4326))$$, '42501', null, 'revoked: cannot post pings');
 
 select * from finish();
 rollback;

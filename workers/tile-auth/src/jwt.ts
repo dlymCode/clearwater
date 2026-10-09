@@ -38,7 +38,13 @@ const CLOCK_SKEW_SECONDS = 5;
 function b64urlToBytes(s: string): Uint8Array<ArrayBuffer> {
   if (!/^[A-Za-z0-9_-]*$/.test(s)) throw new AuthError("malformed token");
   const pad = s.length % 4 === 0 ? "" : "=".repeat(4 - (s.length % 4));
-  const bin = atob(s.replace(/-/g, "+").replace(/_/g, "/") + pad);
+  let bin: string;
+  try {
+    bin = atob(s.replace(/-/g, "+").replace(/_/g, "/") + pad);
+  } catch {
+    // e.g. a length of 4n+1 is not valid base64: a malformed token is a 401, never a 5xx
+    throw new AuthError("malformed token");
+  }
   const out = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
   return out;

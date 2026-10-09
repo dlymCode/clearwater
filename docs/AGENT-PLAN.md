@@ -175,11 +175,31 @@ Last-known position: rounded to 100 m, ≤ every 5 min, foreground only, retaine
    down** (what a sounder reads; `p10_ft` is the shoal-biased 10th percentile). The
    baseline rasters are elevation, positive up — any comparison (the server 15 ft hold
    rule, bias flags) must negate one side: `baseline_depth_ft = -merged_elev_ft`.
-5. **Client-side score parity**: reputations come from `profiles` (readable by all
-   signed-in users per RLS); clients sync profiles for authors/voters they see and use
-   the server's cached `score` as fallback when a reputation is unknown (default 1.0).
+5. **Client reads go through views, not tables** (secrecy): pings via `ping_feed`
+   (exposes `author_reputation`, `received_at`; author identity masked when anonymous;
+   direct `select author_id from pings` is 42501 by design — never `RETURNING *` on
+   insert), votes via `ping_votes_feed` with exactly
+   `(ping_id, vote, created_at, voter_reputation, weight)` — `weight` is the
+   server-precomputed w(d); voter identity and distance are never exposed. Own votes
+   reconcile from `ping_votes` where `voter_id = auth.uid()`. Sync cursor columns:
+   `ping_feed.updated_at`, `ping_votes_feed.created_at`, `messages.received_at`.
 6. **Votes**: clients enqueue optimistically; the server-side `cast_vote` RPC rejects
-   ineligible confirms (>500 m / >24 h); rejection is not an error state in the UI.
+   ineligible confirms (>500 m / >24 h) with PT403 codes the client swallows silently;
+   PT429 means retry later.
+7. **Score decay origin** (both scorers): t0 = `least(created_at, received_at)`;
+   local unsynced pings use `created_at`. Compare implementations with 1e-12 tolerance
+   (Postgres/V8 differ by 1 ulp).
+8. **Positions**: written only via `report_position(p_lat, p_lon)` RPC (validates the
+   Salish Sea bbox, snaps to 100 m, silent no-op inside the 5-min window).
+9. **Groups**: `join_group(p_code)` returns the group id, or NULL for a bad/expired/
+   rotated code (no error raised); invite codes are read via `get_invite_code` (owner
+   only) and rotate automatically when the owner removes a member.
+10. **Tides**: pipeline publishes `tides/<station_id>.json` (flat, unversioned, daily
+    overwrite, includes station lat/lon); the tile-auth worker signs that path shape.
+11. **Depth trust deviations from the PRD** (deliberate, flagged to owner): hold-rule
+    corroboration requires the other boat's median within 5 ft; per-boat aggregate
+    weight capped at `least(n, 100)`; one row per (uploader_hash, cell_id, day) with
+    upsert-replace.
 
 ## Definition of done per part
 

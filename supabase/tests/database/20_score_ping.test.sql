@@ -65,11 +65,12 @@ insert into public.groups (id, name, owner_id) values
 insert into public.group_members (group_id, user_id, role) values
   ('00000000-0000-0000-0000-0000000000b1', '00000000-0000-0000-0000-0000000000a2', 'member');
 
-select plan(22);
+select plan(24);
 
 -- Hand-computed vectors for  S = R_a * (1 + SUM R_i*v_i*w(d_i)) * exp(-ln2/86400 * dt).
 -- T0 is the ping's created_at; lambda gives half-life 24 h, so exp factor = 2^(-hours/24):
 --   12 h -> 0.7071067811865476   24 h -> 0.5   48 h -> 0.25
+-- t0 = least(created_at, received_at) (S6); the fixtures below are created in the past, so t0 = created_at.
 -- Tolerance 1e-12 absolute; the mobile TS implementation must match these to the same tolerance.
 
 select tests.act_admin();
@@ -164,6 +165,15 @@ select tests.act_admin();
 insert into public.pings (id, author_id, type, geom) values
   (tests.c(9), tests.u(4), 'log', st_setsrid(st_makepoint(-122.5, 48.3), 4326));
 select is((select score from public.pings where id = tests.c(9)), 1.5::double precision, 'pings.score starts at the author reputation (1.5)');
+
+-- ---- S6: t0 = least(created_at, received_at): a device clock running ahead cannot make a ping look fresh ----
+select tests.act_admin();
+insert into public.pings (id, author_id, type, geom, created_at)
+  values (tests.c(10), tests.u(1), 'log', st_setsrid(st_makepoint(-122.5, 48.3), 4326), now() + interval '3 days');
+select ok(abs(public.score_ping(tests.c(10), (select received_at + interval '24 hours' from public.pings where id = tests.c(10))) - 0.5) < 1e-9,
+          'S6: a ping stamped 3 days in the future decays from its server receipt time (S = 0.5 at received_at + 24 h)');
+select ok(abs(public.score_ping(tests.c(10), (select received_at from public.pings where id = tests.c(10))) - 1.0) < 1e-9,
+          'S6: ...and is exactly R_a at received_at');
 
 select * from finish();
 rollback;

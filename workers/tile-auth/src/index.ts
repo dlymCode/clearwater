@@ -4,6 +4,7 @@
 //   POST /sign   {"paths": ["tiles/index.json", "tiles/skagit/<version>/base.pmtiles", ...]}   (max 8)
 //   GET  /health
 //
+// Signable paths: tiles/**/*.pmtiles, tiles/index.json, tides/<station_id>.json.
 // Flow: verify the caller's Supabase JWT (401) -> validate each path (400) -> confirm the object
 // exists and learn its size via the optional R2 binding (404) -> charge the per-account daily quota
 // in KV (429) -> return 24-hour SigV4 presigned R2 URLs. The app then range-reads R2 directly with
@@ -119,7 +120,7 @@ export async function handle(req: Request, env: Env, deps: Deps = defaultDeps): 
   const valid: string[] = [];
   for (const raw of requested) {
     const p = validateTilePath(raw);
-    if (!p) return json(400, { error: "invalid_path", message: "Only tiles/**/*.pmtiles and tiles/index.json can be signed." });
+    if (!p) return json(400, { error: "invalid_path", message: "Only tiles/**/*.pmtiles, tiles/index.json and tides/<station>.json can be signed." });
     if (!valid.includes(p)) valid.push(p);
   }
 
@@ -134,7 +135,7 @@ export async function handle(req: Request, env: Env, deps: Deps = defaultDeps): 
       costMb += Math.max(1, Math.ceil(head.size / (1024 * 1024)));
     } else {
       sizes.set(p, undefined);
-      costMb += p === "tiles/index.json" ? 1 : DEFAULT_COST_MB;
+      costMb += p.endsWith(".pmtiles") ? DEFAULT_COST_MB : 1;
     }
   }
 

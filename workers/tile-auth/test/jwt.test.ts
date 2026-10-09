@@ -58,6 +58,14 @@ test("malformed tokens", async () => {
   }
 });
 
+test("S2: base64url segments of an impossible length are an AuthError, not an exception", async () => {
+  // a length of 4n+1 makes atob() throw; each position (header, payload, signature) must be handled
+  await rejects(verifySupabaseJwt("e30x1.e30.e30", hs), /malformed/);
+  await rejects(verifySupabaseJwt("e30.e30x1.e30", hs), /malformed/);
+  await rejects(verifySupabaseJwt("e30.e30.A", hs), /malformed/);
+  await rejects(verifySupabaseJwt("A.A.A", hs), /malformed/);
+});
+
 test("ES256 via JWKS: valid, wrong key, unknown kid, wrong key type", async () => {
   const k = await makeEs256("kid-1");
   const other = await makeEs256("kid-1"); // same kid, different key material

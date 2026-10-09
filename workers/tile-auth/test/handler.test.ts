@@ -24,6 +24,13 @@ test("401 when unauthenticated, with a Bearer challenge", async () => {
   assert.equal((await get(PATH, await signHs256(claims({ role: "anon" })))).status, 401);
 });
 
+test("S2: a token with an undecodable segment is a 401, never a 5xx", async () => {
+  for (const t of ["e30.e30.A", "A.A.A", "e30x1.e30.e30", "a.b.c"]) {
+    const res = await get(PATH, t);
+    assert.equal(res.status, 401, t);
+  }
+});
+
 test("401 happens before any R2 or KV access", async () => {
   const env = makeEnv({ TILES: { head: () => assert.fail("must not reach R2") } });
   assert.equal((await get(PATH, undefined, env)).status, 401);
@@ -114,6 +121,21 @@ test("POST batch signs several paths, all-or-nothing on quota", async () => {
   assert.equal((await post(Array.from({ length: 9 }, () => PATH))).status, 400);
   assert.equal((await post("tiles/index.json")).status, 400);
   assert.equal((await post([PATH, "../x"])).status, 400);
+});
+
+test("X1: tide prediction JSONs are signable and cost almost nothing", async () => {
+  const env = makeEnv({ TILES: fakeR2({ "tides/9447130.json": 400_000 }) });
+  const res = await get("tides/9447130.json", await signHs256(claims()), env);
+  assert.equal(res.status, 200);
+  const body = await res.json();
+  assert.equal(new URL(body.url).pathname, "/clearwater-tiles/tides/9447130.json");
+  assert.equal(body.quota.used_mb, 1);
+  assert.equal((await get("tides/9447130.pmtiles", await signHs256(claims()), env)).status, 400);
+  assert.equal((await get("tides/../tiles/index.json", await signHs256(claims()), env)).status, 400);
+  // without the R2 binding a tide file is still flat-rate cheap, a pmtiles archive is not
+  const flat = makeEnv();
+  await get("tides/9447130.json", await signHs256(claims()), flat);
+  assert.equal(flat.QUOTA.store.get(quotaKey(USER, NOW)), "1");
 });
 
 test("routing: health is open, unknown paths 404, other methods 405", async () => {

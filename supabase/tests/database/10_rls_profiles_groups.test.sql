@@ -65,7 +65,7 @@ insert into public.groups (id, name, owner_id) values
 insert into public.group_members (group_id, user_id, role) values
   ('00000000-0000-0000-0000-0000000000b1', '00000000-0000-0000-0000-0000000000a2', 'member');
 
-select plan(68);
+select plan(81);
 
 -- Roles in this file: u1 = owner, u2 = group member, u3 = signed-in non-member, anon.
 
@@ -184,18 +184,28 @@ select tests.act_anon();
 select throws_ok($$select * from public.rotate_invite_code(tests.g())$$, '42501', null, 'rotate_invite_code: anon denied');
 select tests.act_as(tests.u(1));
 select lives_ok($$select * from public.rotate_invite_code(tests.g())$$, 'rotate_invite_code: owner may rotate');
-select isnt((select invite_code from public.groups where id = tests.g()), (select old_code from _codes),
+select isnt((select invite_code from public.get_invite_code(tests.g())), (select old_code from _codes),
             'rotate_invite_code: code changed');
+select throws_ok($$select invite_code from public.groups where id = tests.g()$$, '42501', null, 'groups: invite_code is not a selectable column even for the owner');
+select throws_ok($$select * from public.groups$$, '42501', null, 'groups: select * is denied (invite_code column)');
+select lives_ok($$select id, name, owner_id, invite_expires_at from public.groups$$, 'groups: the other columns remain readable');
+select tests.act_as(tests.u(2));
+select throws_ok($$select invite_code from public.groups$$, '42501', null, 'groups: a member cannot read the invite code');
+select throws_ok($$select * from public.get_invite_code(tests.g())$$, 'PT403', null, 'get_invite_code: member denied');
+select tests.act_as(tests.u(4));
+select throws_ok($$select * from public.get_invite_code(tests.g())$$, 'PT403', null, 'get_invite_code: non-member denied');
+select tests.act_anon();
+select throws_ok($$select * from public.get_invite_code(tests.g())$$, '42501', null, 'get_invite_code: anon denied');
+select tests.act_as(tests.u(1));
+select is((select count(*) from public.get_invite_code(tests.g())), 1::bigint, 'get_invite_code: owner reads the code');
 select tests.act_as(tests.u(3));
-select throws_ok(format($$select public.join_group(%L)$$, (select old_code from _codes)),
-                 'PT404', null, 'join_group: the rotated-out code no longer works');
+select is((select public.join_group((select old_code from _codes))), null::uuid, 'join_group: the rotated-out code no longer works');
 select tests.act_admin();
 create temp table _newcode as select invite_code as code from public.groups where id = tests.g();
 grant select on _newcode to authenticated;
 update public.groups set invite_expires_at = now() - interval '1 minute' where id = tests.g();
 select tests.act_as(tests.u(3));
-select throws_ok(format($$select public.join_group(%L)$$, (select code from _newcode)),
-                 'PT404', null, 'join_group: expired code is refused');
+select is((select public.join_group((select code from _newcode))), null::uuid, 'join_group: expired code is refused');
 select tests.act_admin();
 update public.groups set invite_expires_at = now() + interval '7 days' where id = tests.g();
 select tests.act_as(tests.u(3));
@@ -250,10 +260,24 @@ select is(tests.dml($$delete from public.group_members where user_id = tests.u(1
 select is(tests.dml($$delete from public.group_members where user_id = tests.u(3)$$), 1::bigint, 'group_members delete: owner removes a member');
 select tests.act_as(tests.u(3));
 select is((select count(*) from public.groups where id = tests.g()), 0::bigint, 'removal revokes group access immediately');
+select is((select public.join_group((select code from _newcode))), null::uuid, 'removed member cannot rejoin with the invite code they knew (code rotated on removal)');
+select tests.act_admin();
+select isnt((select invite_code from public.groups where id = tests.g()), (select code from _newcode), 'owner removal rotated the stored invite code');
+select tests.act_as(tests.u(3));
 select tests.act_as(tests.u(2));
 select is(tests.dml($$delete from public.group_members where user_id = tests.u(2)$$), 1::bigint, 'group_members delete: member leaves');
 select tests.act_anon();
 select throws_ok($$delete from public.group_members$$, '42501', null, 'group_members delete: anon denied');
+
+-- join_group is throttled: 10 attempts per 15 minutes per user
+select tests.act_as(tests.u(4));
+do $$ begin for i in 1..10 loop perform public.join_group('AAAAAAAA'); end loop; end $$;
+select throws_ok($$select public.join_group('AAAAAAAA')$$, 'PT429', null, 'join_group: the 11th attempt in 15 minutes returns 429');
+
+-- profiles.revoked_at is not selectable
+select tests.act_as(tests.u(1));
+select throws_ok($$select revoked_at from public.profiles$$, '42501', null, 'profiles: revoked_at is not a selectable column');
+select throws_ok($$update public.profiles set revoked_at = now()$$, '42501', null, 'profiles: revoked_at is not updatable');
 
 select * from finish();
 rollback;

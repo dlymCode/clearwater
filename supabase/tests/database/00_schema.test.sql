@@ -65,7 +65,7 @@ insert into public.groups (id, name, owner_id) values
 insert into public.group_members (group_id, user_id, role) values
   ('00000000-0000-0000-0000-0000000000b1', '00000000-0000-0000-0000-0000000000a2', 'member');
 
-select plan(55);
+select plan(66);
 
 -- ---- structure --------------------------------------------------------------------------
 select has_table('public', t, 'table exists: ' || t)
@@ -94,6 +94,23 @@ select col_type_is('public', 'pings', 'group_id', 'uuid', 'pings.group_id nullab
 select col_is_null('public', 'pings', 'group_id', 'pings.group_id is nullable (null = public tier)');
 select col_is_null('public', 'messages', 'ping_id', 'messages.ping_id is nullable');
 
+-- Realtime streams whole rows, so only the group channel is published (C1/C2: author_id, voter_id, voter_dist_m)
+select is((select count(*) from pg_publication_tables where pubname = 'supabase_realtime' and schemaname = 'public' and tablename in ('pings', 'ping_votes')),
+          0::bigint, 'C1/C2: pings and ping_votes are NOT in the Realtime publication');
+select is((select count(*) from pg_publication_tables where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = 'messages'),
+          1::bigint, 'messages stay in the Realtime publication');
+
+-- column privileges that carry the secrecy model
+select is(has_column_privilege('authenticated', 'public.pings', 'author_id', 'select'), false, 'authenticated cannot select pings.author_id');
+select is(has_column_privilege('authenticated', 'public.pings', 'rep_processed_at', 'select'), false, 'authenticated cannot select pings.rep_processed_at');
+select is(has_column_privilege('authenticated', 'public.pings', 'geom', 'select'), true, 'authenticated can select pings.geom');
+select is(has_column_privilege('authenticated', 'public.groups', 'invite_code', 'select'), false, 'authenticated cannot select groups.invite_code');
+select is(has_column_privilege('authenticated', 'public.profiles', 'revoked_at', 'select'), false, 'authenticated cannot select profiles.revoked_at');
+select is(has_column_privilege('authenticated', 'public.last_positions', 'geom', 'insert'), false, 'authenticated cannot insert last_positions directly');
+select is(has_column_privilege('authenticated', 'public.last_positions', 'geom', 'update'), false, 'authenticated cannot update last_positions directly');
+select is(has_table_privilege('service_role', 'public.audit_log', 'update'), false, 'service_role cannot update audit_log');
+select is(has_table_privilege('service_role', 'public.audit_log', 'truncate'), false, 'service_role cannot truncate audit_log');
+
 -- anon has no table privileges whatsoever
 select is((select count(*) from information_schema.role_table_grants
             where grantee = 'anon' and table_schema = 'public'),
@@ -101,7 +118,7 @@ select is((select count(*) from information_schema.role_table_grants
 -- clients can never read or write these
 select is((select count(*) from information_schema.role_table_grants
             where grantee in ('anon','authenticated') and table_schema = 'public'
-              and table_name in ('depth_uploads','depth_batches','baseline_cells','audit_log','app_config')),
+              and table_name in ('depth_uploads','depth_batches','baseline_cells','audit_log','app_config','rate_events')),
           0::bigint, 'service-only tables have no client grants');
 
 -- ---- CHECK constraints (run as the superuser session role: constraints, not RLS) -------------

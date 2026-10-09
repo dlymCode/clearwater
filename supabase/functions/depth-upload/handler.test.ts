@@ -1,5 +1,5 @@
 import { assert, assertEquals, assertFalse } from "jsr:@std/assert@1";
-import { handleDepthUpload } from "./handler.ts";
+import { handleDepthUpload, shuffle } from "./handler.ts";
 import { authed, dbError, mockDb, req } from "../_shared/testing.ts";
 
 const SECRET = "unit-test-only-not-a-real-secret-0123456789";
@@ -9,8 +9,8 @@ const BATCH = "11111111-2222-4333-8444-555555555555";
 const ROW = { h3_cell: "8c2a1072b59ffff", day: "2026-10-08", median_ft: -12.5, p10_ft: -14, n: 40 };
 
 const ok = {
-  depth_batch_owner: () => null,
-  rate_limit_status: () => ({ allowed: true, used: 0, max_allowed: 1, retry_after_s: 0 }),
+  depth_batch_lookup: () => ({ found: false, owner: null }),
+  rate_limit_consume: () => ({ allowed: true, used: 0, max_allowed: 1, retry_after_s: 0 }),
   get_salt_epoch: () => 0,
   ingest_depth_batch: () => ({ duplicate: false, accepted: 0, held: 1, released: 0 }),
 };
@@ -75,21 +75,23 @@ Deno.test("400 for invalid JSON, 413 for an oversized body", async () => {
 });
 
 Deno.test("idempotent: a replayed batch UUID answers 200 duplicate without rate limiting or ingesting", async () => {
-  const { db, call } = setup({ depth_batch_owner: () => UID });
+  const { db, call } = setup({ depth_batch_lookup: () => ({ found: true, owner: UID }) });
   const res = await call(authed("POST", "tok", { batch_id: BATCH, rows: [ROW] }));
   assertEquals(res.status, 200);
   assertEquals((await res.json()).duplicate, true);
-  assertEquals(db.calls.map((c) => c.fn), ["depth_batch_owner"]);
+  assertEquals(db.calls.map((c) => c.fn), ["depth_batch_lookup"]);
 });
 
 Deno.test("409 when the batch UUID belongs to someone else", async () => {
-  const { call } = setup({ depth_batch_owner: () => "00000000-0000-0000-0000-0000000000a2" });
+  const { call } = setup({
+    depth_batch_lookup: () => ({ found: true, owner: "00000000-0000-0000-0000-0000000000a2" }),
+  });
   assertEquals((await call(authed("POST", "tok", { batch_id: BATCH, rows: [ROW] }))).status, 409);
 });
 
 Deno.test("429 when a second batch arrives inside 15 minutes", async () => {
   const { db, call } = setup({
-    rate_limit_status: () => ({ allowed: false, used: 1, max_allowed: 1, retry_after_s: 600 }),
+    rate_limit_consume: () => ({ allowed: false, used: 1, max_allowed: 1, retry_after_s: 600 }),
   });
   const res = await call(authed("POST", "tok", { batch_id: BATCH, rows: [ROW] }));
   assertEquals(res.status, 429);
@@ -126,4 +128,44 @@ Deno.test("500 when HMAC_SALT_SECRET is missing or short", async () => {
     now: NOW,
   });
   assertEquals(res.status, 500);
+});
+
+Deno.test("S4: self hashes cover every salt epoch up to the current one", async () => {
+  const a = setup({ get_salt_epoch: () => 0 });
+  await a.call(authed("POST", "tok", { batch_id: BATCH, rows: [ROW] }));
+  const b = setup({ get_salt_epoch: () => 2 });
+  await b.call(authed("POST", "tok", { batch_id: BATCH, rows: [ROW] }));
+  const self = (s: ReturnType<typeof setup>) =>
+    s.db.calls.find((c) => c.fn === "ingest_depth_batch")!.args.p_self_hashes as string[];
+  assertEquals(self(a).length, 181);
+  assertEquals(self(b).length, 181 * 3, "epochs 0, 1 and 2 are all included");
+  const rowHash = (s: ReturnType<typeof setup>) =>
+    (s.db.calls.find((c) => c.fn === "ingest_depth_batch")!.args.p_rows as Array<{ uploader_hash: string }>)[0]
+      .uploader_hash;
+  assert(self(b).includes(rowHash(a)), "epoch-0 hash of the same day is still recognised as this boat");
+  assert(self(b).includes(rowHash(b)));
+});
+
+Deno.test("S5: rows are shuffled before they reach the database", async () => {
+  const rows = Array.from({ length: 200 }, (_, i) => ({
+    ...ROW,
+    h3_cell: "8c2a1072b59" + i.toString(16).padStart(2, "0") + "ff",
+  }));
+  const s = setup();
+  await s.call(authed("POST", "tok", { batch_id: BATCH, rows }));
+  const sent = (s.db.calls.find((c) => c.fn === "ingest_depth_batch")!.args.p_rows as Array<{ h3_cell: string }>).map((
+    r,
+  ) => r.h3_cell);
+  assertEquals([...sent].sort(), rows.map((r) => r.h3_cell).sort(), "same rows");
+  assert(sent.join() !== rows.map((r) => r.h3_cell).join(), "order differs from the client's track order");
+  const sh = shuffle([1, 2, 3, 4, 5, 6, 7, 8]);
+  assertEquals([...sh].sort(), [1, 2, 3, 4, 5, 6, 7, 8]);
+});
+
+Deno.test("S5: a replay after the ledger row was unlinked (owner null) is a duplicate, not a conflict", async () => {
+  const { db, call } = setup({ depth_batch_lookup: () => ({ found: true, owner: null }) });
+  const res = await call(authed("POST", "tok", { batch_id: BATCH, rows: [ROW] }));
+  assertEquals(res.status, 200);
+  assertEquals((await res.json()).duplicate, true);
+  assertEquals(db.calls.length, 1 + 0, "only the lookup ran");
 });
