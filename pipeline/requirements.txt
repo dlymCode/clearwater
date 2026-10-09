@@ -1,0 +1,11 @@
+# Runtime. numpy is the only hard requirement for the core logic; the rest are imported
+# lazily inside the IO steps that need them. GDAL (3.9), PDAL, tippecanoe and the pmtiles
+# CLI are system tools (see README), not pip packages.
+numpy>=1.26,<3
+rasterio>=1.3.10
+pyproj>=3.6
+pystac-client>=0.8
+planetary-computer>=1.0
+boto3>=1.34
+BlueTopo>=0.5
+xarray>=2024.1

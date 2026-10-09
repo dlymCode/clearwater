@@ -1,0 +1,7 @@
+line-length = 130
+target-version = "py312"
+extend-exclude = ["tests/fixtures"]
+
+[lint]
+select = ["E", "F", "W", "I001"]
+ignore = ["E501", "E731", "E741"]
