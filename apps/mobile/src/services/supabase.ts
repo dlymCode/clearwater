@@ -30,11 +30,12 @@ interface PgError {
 /** PostgREST maps SQLSTATE 'PTnnn' to HTTP nnn; supabase-js surfaces it as error.code 'PTnnn' (and status). */
 function statusOf(error: PgError | null, httpStatus?: number): number {
   if (!error) return httpStatus && httpStatus >= 200 ? httpStatus : 200;
+  // Unique-violation on a retry means the row already exists: idempotent success. Must be checked BEFORE the
+  // HTTP status fallback, because PostgREST reports it as HTTP 409.
+  if (error.code === '23505') return 200;
   const m = /^PT(\d{3})$/.exec(error.code ?? '');
   if (m) return Number(m[1]);
   if (httpStatus && httpStatus >= 400) return httpStatus;
-  // Unique-violation on a retry means the row already exists: idempotent success.
-  if (error.code === '23505') return 200;
   return 500;
 }
 
@@ -54,6 +55,8 @@ export const sendOutboxBatch: OutboxSender = async (batch: OutboxBatch): Promise
         const p = i.payload as { id: string; group_id: string | null; type: string; lat: number; lon: number; note: string | null; created_at: string; tide_ft: number | null; anonymous: boolean };
         return { id: p.id, group_id: p.group_id, type: p.type, geom: ewkt(p.lat, p.lon), note: p.note, created_at: p.created_at, tide_ft: p.tide_ft, anonymous: p.anonymous };
       });
+      // Minimal response on purpose: NEVER chain .select() / RETURNING * here. pings.author_id is column-revoked for
+      // clients, so a RETURNING * would fail with 42501. supabase-js sends `Prefer: return=minimal` when no select().
       const { error, status } = await sb.from('pings').upsert(rows, { onConflict: 'id', ignoreDuplicates: true });
       return { status: statusOf(error, status) };
     }
@@ -68,7 +71,8 @@ export const sendOutboxBatch: OutboxSender = async (batch: OutboxBatch): Promise
         const v = i.payload as { ping_id: string; vote: 1 | -1 };
         const { error, status } = await sb.rpc('cast_vote', { p_ping_id: v.ping_id, p_vote: v.vote });
         const s = statusOf(error, status);
-        if (s >= 300) return { status: s };
+        // error.message carries the SQL identifier ('confirm_ineligible', 'cannot_vote_own_ping', ...)
+        if (s >= 300) return { status: s, ...(error?.message ? { code: error.message } : {}) };
       }
       return { status: 200 };
     }

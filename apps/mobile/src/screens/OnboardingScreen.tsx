@@ -4,9 +4,10 @@ import { Button } from '../components/Button';
 import { s, useColors } from '../components/theme';
 
 /** First-launch gate: the "not for navigation" disclaimer MUST be accepted before the app is usable. */
-export function OnboardingScreen({ onAccept }: { onAccept: (isoTime: string) => void }) {
+export function OnboardingScreen({ onAccept }: { onAccept: (isoTime: string, sharePosition: boolean) => void }) {
   const c = useColors();
   const [checked, setChecked] = useState(false);
+  const [share, setShare] = useState(false); // opt-in: default OFF
   return (
     <ScrollView style={{ backgroundColor: c.bg }} contentContainerStyle={[s.pad, s.gap]}>
       <Text style={[s.h1, { color: c.text }]}>Sound Maps</Text>
@@ -24,7 +25,13 @@ export function OnboardingScreen({ onAccept }: { onAccept: (isoTime: string) => 
         <Text style={[s.body, { color: c.text, flex: 1 }]}>I understand this app is not for navigation.</Text>
         <Switch value={checked} onValueChange={setChecked} accessibilityLabel="Accept not for navigation" />
       </View>
-      <Button label="Continue" disabled={!checked} onPress={() => onAccept(new Date().toISOString())} />
+      <View style={[s.row, { justifyContent: 'space-between', minHeight: 56 }]}>
+        <Text style={[s.body, { color: c.text, flex: 1 }]}>
+          Share my last position, rounded to 100 m, every 5 minutes while the app is open. Needed to confirm other boats' pings. You can change this in Settings.
+        </Text>
+        <Switch value={share} onValueChange={setShare} accessibilityLabel="Share last known position" />
+      </View>
+      <Button label="Continue" disabled={!checked} onPress={() => onAccept(new Date().toISOString(), share)} />
     </ScrollView>
   );
 }

@@ -9,9 +9,17 @@
  *    rows are coalesced into a single request per flush, because the server allows 1 depth batch / 15 min.
  *  - 50 MB cap: when exceeded, the OLDEST pending depth batches are merged further (same cell+day rows
  *    collapse). Depth data is never dropped, and pings/votes/messages are never dropped.
+ *  - Rows that were ever attempted (attempts > 0 or lastError) are NEVER merged or re-id'd: the server may already
+ *    hold them under their id, and a fresh id would double count. Only never-sent rows are merged.
+ *  - 401 pauses sending (authRequired) instead of failing rows; other permanent 4xx rows become `failed`, stay
+ *    visible (unsyncedIds / failed()) and can be retried with retryFailed(). Vote 403s that mean "you cannot vote
+ *    on this" (confirm_ineligible, cannot_vote_own_ping, ...) are swallowed silently.
+ *  - Depth rows over 5000 are split into stably-id'd chunks at send time (server rejects > 5000 per batch).
+ *  - TODO(multi-batch drain): flush sends one batch per kind per call; a long offline backlog drains one
+ *    batch per sync pass. Loop until empty (respecting the 15 min depth limit) when this matters.
  *  - Storage is behind OutboxStore: SQLite in the app (services/outboxSqlite.ts), in-memory in tests.
  */
-import { OUTBOX_CAP_BYTES, OUTBOX_KINDS, type DepthUploadRow, type OutboxKind } from '@clearwater/shared';
+import { DEPTH_BATCH_MAX_ROWS, OUTBOX_CAP_BYTES, OUTBOX_KINDS, type DepthUploadRow, type OutboxKind } from '@clearwater/shared';
 import { assertAnonymousUploadPayload, mergeUploadRows, sanitizeUploadRows } from './aggregate';
 import { uuidv4, type IdGenerator } from './uuid';
 
@@ -36,6 +44,7 @@ export interface OutboxStore {
   /** Next sequence number; persisted so it survives restarts and deletes. */
   nextSeq(): Promise<number>;
   insert(row: OutboxRow): Promise<void>;
+  get(id: string): Promise<OutboxRow | null>;
   /** Rows ordered by seq ascending. */
   list(filter?: { status?: OutboxStatus; kind?: OutboxKind }): Promise<OutboxRow[]>;
   update(
@@ -63,7 +72,12 @@ export interface OutboxBatch {
 /** HTTP-like status; the app's sender maps Supabase responses to this. Throw for network errors. */
 export interface SendResult {
   status: number;
+  /** Server error identifier when known (e.g. PostgREST message 'confirm_ineligible'). */
+  code?: string;
 }
+
+/** 403s on votes that are expected user situations, not failures: dropped silently. */
+export const SILENT_VOTE_CODES: readonly string[] = ['confirm_ineligible', 'cannot_vote_own_ping', 'ping_not_found'];
 export type OutboxSender = (batch: OutboxBatch) => Promise<SendResult>;
 
 export interface OutboxOptions {
@@ -79,6 +93,10 @@ export interface OutboxOptions {
 export interface FlushResult {
   sent: number;
   failed: number;
+  /** Votes the server refused for expected reasons (marked done, nothing shown). */
+  swallowed: number;
+  /** A 401 paused sending; refresh the session / sign in, then flush again. Rows stay pending. */
+  authRequired: boolean;
   /** A retryable error stopped some or all sending; rows remain pending. */
   stopped: boolean;
   perKind: Record<OutboxKind, { sent: number; failed: number }>;
@@ -115,6 +133,35 @@ export function estimateBytes(payload: unknown): number {
   return utf8Length(JSON.stringify(payload) ?? 'null') + ROW_OVERHEAD_BYTES;
 }
 
+/** Only never-sent rows may be merged or re-id'd. */
+export function isMergeable(r: OutboxRow): boolean {
+  return r.status === 'pending' && r.attempts === 0 && r.lastError === null;
+}
+
+/** Stable id for chunk `index` of a split depth batch (index 0 keeps the row id). */
+export function chunkId(id: string, index: number): string {
+  if (index === 0) return id;
+  return `${id.slice(0, id.length - 4)}${index.toString(16).padStart(4, '0').slice(-4)}`;
+}
+
+export function chunkRows<T>(rows: readonly T[], size: number = DEPTH_BATCH_MAX_ROWS): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < rows.length; i += size) out.push(rows.slice(i, i + size));
+  return out.length ? out : [[]];
+}
+
+/**
+ * Deterministic batch id for "aggregate soundings id range [first,last]" so a retry after a crash produces the same
+ * id (idempotent) instead of a new batch. `installId` is a random per-install UUID, so ids never collide across boats.
+ */
+export function soundingBatchId(installId: string, firstId: number, lastId: number): string {
+  const hex = installId.replace(/-/g, '').toLowerCase().padEnd(32, '0');
+  const f = (firstId >>> 0).toString(16).padStart(6, '0').slice(-6);
+  const l = (lastId >>> 0).toString(16).padStart(6, '0').slice(-6);
+  const body = `${hex.slice(0, 20)}${f}${l}`;
+  return `${body.slice(0, 8)}-${body.slice(8, 12)}-4${body.slice(13, 16)}-8${body.slice(17, 20)}-${body.slice(20, 32)}`;
+}
+
 export interface DepthBatchPayload {
   rows: DepthUploadRow[];
 }
@@ -148,6 +195,10 @@ export class Outbox {
   async enqueue(kind: OutboxKind, payload: unknown, opts: { id?: string } = {}): Promise<OutboxRow> {
     if (!(OUTBOX_KINDS as readonly string[]).includes(kind)) throw new Error(`unknown outbox kind: ${kind}`);
     if (kind === 'depth_batch') assertAnonymousUploadPayload(payload);
+    if (opts.id) {
+      const existing = await this.store.get(opts.id);
+      if (existing) return existing; // idempotent: a retry after a crash does not duplicate
+    }
     const row: OutboxRow = {
       id: opts.id ?? this.idGen(),
       seq: await this.store.nextSeq(),
@@ -176,6 +227,19 @@ export class Outbox {
     return new Set((await this.pending(kind)).map((r) => r.id));
   }
 
+  /** Pending PLUS rejected-and-not-retried rows: both are "not on the server yet", so both keep the pending mark. */
+  async unsyncedIds(kind: OutboxKind): Promise<Set<string>> {
+    const [p, f] = await Promise.all([this.pending(kind), this.failed()]);
+    return new Set([...p, ...f.filter((r) => r.kind === kind)].map((r) => r.id));
+  }
+
+  /** User-initiated retry of rows the server rejected. They stay unmergeable (attempts > 0). */
+  async retryFailed(): Promise<number> {
+    const failed = await this.failed();
+    for (const r of failed) await this.store.update(r.id, { status: 'pending', lastError: null });
+    return failed.length;
+  }
+
   /** Free space held by already-sent rows older than `olderThanMs`. */
   async pruneSent(olderThanMs: number): Promise<number> {
     const cutoff = this.now() - olderThanMs;
@@ -194,7 +258,7 @@ export class Outbox {
     for (;;) {
       const total = await this.pendingBytes();
       if (total <= this.cap) return { totalBytes: total, merges, overCap: false };
-      const depth = await this.pending('depth_batch');
+      const depth = (await this.pending('depth_batch')).filter(isMergeable);
       if (depth.length < 2) return { totalBytes: total, merges, overCap: true };
       // Merge the two oldest pending depth rows into the older one.
       const [a, b] = depth as [OutboxRow, OutboxRow];
@@ -216,7 +280,7 @@ export class Outbox {
 
   /** Coalesce pending depth rows (up to maxDepthRows output rows) into one outbox row before sending. */
   private async coalesceDepth(): Promise<void> {
-    const depth = await this.pending('depth_batch');
+    const depth = (await this.pending('depth_batch')).filter(isMergeable);
     if (depth.length < 2) return;
     const take: OutboxRow[] = [];
     let rows: DepthUploadRow[] = [];
@@ -245,6 +309,8 @@ export class Outbox {
     const result: FlushResult = {
       sent: 0,
       failed: 0,
+      swallowed: 0,
+      authRequired: false,
       stopped: false,
       perKind: {
         ping: { sent: 0, failed: 0 },
@@ -261,9 +327,10 @@ export class Outbox {
       const rows = (await this.pending(kind)).slice(0, this.batchSize[kind]);
       if (rows.length === 0) continue;
       const outcome = await this.sendRows(kind, rows, send, result);
-      if (outcome === 'network') {
+      if (outcome === 'network' || outcome === 'auth') {
         result.stopped = true;
-        break; // offline: nothing else will succeed either
+        if (outcome === 'auth') result.authRequired = true;
+        break; // offline / signed out: nothing else will succeed either
       }
       if (outcome === 'retry') {
         result.stopped = true;
@@ -278,25 +345,47 @@ export class Outbox {
     rows: OutboxRow[],
     send: OutboxSender,
     result: FlushResult,
-  ): Promise<'ok' | 'retry' | 'network'> {
+  ): Promise<'ok' | 'retry' | 'network' | 'auth'> {
+    if (kind === 'depth_batch') return this.sendDepth(rows, send, result);
     const batch: OutboxBatch = {
       kind,
       items: rows.map((r) => ({ id: r.id, seq: r.seq, payload: r.payload, createdAt: r.createdAt })),
     };
-    if (kind === 'depth_batch') {
-      for (const it of batch.items) assertAnonymousUploadPayload(it.payload);
-    }
-    let status: number;
-    try {
-      status = (await send(batch)).status;
-    } catch (e) {
-      await this.noteAttempt(rows, e instanceof Error ? e.message : 'network error');
+    const out = await this.dispatch(batch, send);
+    if (out.type === 'network') {
+      await this.noteAttempt(rows, out.message);
       return 'network';
     }
+    return this.settle(kind, rows, out.result, send, result);
+  }
+
+  /** Send one batch; a thrown error means offline. */
+  private async dispatch(
+    batch: OutboxBatch,
+    send: OutboxSender,
+  ): Promise<{ type: 'network'; message: string } | { type: 'http'; result: SendResult }> {
+    try {
+      return { type: 'http', result: await send(batch) };
+    } catch (e) {
+      return { type: 'network', message: e instanceof Error ? e.message : 'network error' };
+    }
+  }
+
+  /** Interpret an HTTP-like result for `rows` (already sent as one batch). */
+  private async settle(
+    kind: OutboxKind,
+    rows: OutboxRow[],
+    res: SendResult,
+    send: OutboxSender,
+    result: FlushResult,
+  ): Promise<'ok' | 'retry' | 'network' | 'auth'> {
+    const status = res.status;
     if (status >= 200 && status < 300) {
       await this.markSent(rows, kind, result);
       return 'ok';
     }
+    // 401: the session expired. Not the row's fault: leave everything pending (no attempt counted) and pause.
+    if (status === 401) return 'auth';
     const retryable = status === 408 || status === 429 || status >= 500;
     if (retryable) {
       await this.noteAttempt(rows, `HTTP ${status}`);
@@ -305,15 +394,72 @@ export class Outbox {
     if (rows.length > 1) {
       // Isolate the poison row(s): resend one by one, stop at the first retryable problem.
       for (const r of rows) {
-        const o = await this.sendRows(kind, [r], send, result);
+        const one: OutboxBatch = { kind, items: [{ id: r.id, seq: r.seq, payload: r.payload, createdAt: r.createdAt }] };
+        const out = await this.dispatch(one, send);
+        if (out.type === 'network') {
+          await this.noteAttempt([r], out.message);
+          return 'network';
+        }
+        const o = await this.settle(kind, [r], out.result, send, result);
         if (o !== 'ok') return o;
       }
       return 'ok';
     }
     const only = rows[0] as OutboxRow;
-    await this.store.update(only.id, { status: 'failed', attempts: only.attempts + 1, lastError: `HTTP ${status}` });
+    if (kind === 'vote' && status === 403 && res.code && SILENT_VOTE_CODES.includes(res.code)) {
+      // Expected: not near the ping, own ping, ping gone. Nothing to show or retry.
+      await this.store.update(only.id, { status: 'sent', payload: null, bytes: 0, lastError: null });
+      result.swallowed++;
+      return 'ok';
+    }
+    await this.store.update(only.id, {
+      status: 'failed',
+      attempts: only.attempts + 1,
+      lastError: `HTTP ${status}${res.code ? ` ${res.code}` : ''}`,
+    });
     result.failed++;
     result.perKind[kind].failed++;
+    return 'ok';
+  }
+
+  /**
+   * Depth: one outbox row per request, but a row with more than 5000 rows is split into chunks, each with a
+   * stable id (chunkId), sent in order. The row is marked sent only after every chunk is accepted; a retry
+   * resends the same chunk ids, which the server dedupes.
+   */
+  private async sendDepth(rows: OutboxRow[], send: OutboxSender, result: FlushResult): Promise<'ok' | 'retry' | 'network' | 'auth'> {
+    for (const r of rows) {
+      assertAnonymousUploadPayload(r.payload);
+      const chunks = chunkRows((r.payload as DepthBatchPayload).rows);
+      for (let i = 0; i < chunks.length; i++) {
+        const batch: OutboxBatch = {
+          kind: 'depth_batch',
+          items: [{ id: chunkId(r.id, i), seq: r.seq, payload: { rows: chunks[i] }, createdAt: r.createdAt }],
+        };
+        const out = await this.dispatch(batch, send);
+        if (out.type === 'network') {
+          await this.noteAttempt([r], out.message);
+          return 'network';
+        }
+        const status = out.result.status;
+        if (status >= 200 && status < 300) continue;
+        if (i > 0 || chunks.length > 1) {
+          // Partial progress: never mark failed mid-way; chunk ids are stable so a retry is safe.
+          if (status === 401) return 'auth';
+          const retryable = status === 408 || status === 429 || status >= 500;
+          if (retryable) {
+            await this.noteAttempt([r], `HTTP ${status} (chunk ${i + 1}/${chunks.length})`);
+            return 'retry';
+          }
+          await this.store.update(r.id, { status: 'failed', attempts: r.attempts + 1, lastError: `HTTP ${status} (chunk ${i + 1}/${chunks.length})` });
+          result.failed++;
+          result.perKind.depth_batch.failed++;
+          return 'ok';
+        }
+        return this.settle('depth_batch', [r], out.result, send, result);
+      }
+      await this.markSent([r], 'depth_batch', result);
+    }
     return 'ok';
   }
 

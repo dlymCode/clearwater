@@ -4,19 +4,24 @@ import { TIDE_CURVE_WINDOW_HOURS } from '@clearwater/shared';
 import { Banner } from '../components/Banner';
 import { s, useColors } from '../components/theme';
 import { REFERENCE_TIDE_STATIONS } from '../lib/stations';
+import type { TideStation } from '@clearwater/shared';
 import { isTideStale } from '../lib/syncCursor';
 import { daysCachedAhead, interpolateTide, nearestStation, tideCurve, type TideSeries } from '../lib/tide';
-import { loadSeries, tideFetchedAt } from '../services/tideService';
+import { loadSeries, stationRegistry, tideFetchedAt } from '../services/tideService';
 import { useAppStore } from '../state/store';
 
 /** MAP-8: 48 h curve (24 h back, 24 h ahead) for the nearest station, current height marked. Reads the local cache only (works offline). */
 export function TideScreen() {
   const c = useColors();
   const gps = useAppStore((st) => st.gps);
+  // Registry = bundled stations overlaid with the lat/lon found in cached tide JSONs.
+  const [registry, setRegistry] = useState<readonly TideStation[]>(REFERENCE_TIDE_STATIONS);
+  useEffect(() => void stationRegistry().then(setRegistry), []);
   const near = useMemo(
-    () => nearestStation(REFERENCE_TIDE_STATIONS, gps ? { lat: gps.lat, lon: gps.lon } : { lat: 48.3, lon: -122.5 }),
-    [gps],
+    () => nearestStation(registry, gps ? { lat: gps.lat, lon: gps.lon } : { lat: 48.3, lon: -122.5 }),
+    [registry, gps],
   );
+  const stationId = near?.station.station_id ?? null;
   const [series, setSeries] = useState<TideSeries | null>(null);
   const [fetchedAt, setFetchedAt] = useState<string | null>(null);
   const [now, setNow] = useState(Date.now());
@@ -25,11 +30,12 @@ export function TideScreen() {
     const t = setInterval(() => setNow(Date.now()), 30_000);
     return () => clearInterval(t);
   }, []);
+  // Depends on the station ID, not the `near` object: GPS fixes create a new object every second.
   useEffect(() => {
-    if (!near) return;
-    void loadSeries(near.station.station_id).then(setSeries);
-    void tideFetchedAt(near.station.station_id).then(setFetchedAt);
-  }, [near]);
+    if (!stationId) return;
+    void loadSeries(stationId).then(setSeries);
+    void tideFetchedAt(stationId).then(setFetchedAt);
+  }, [stationId]);
 
   const half = (TIDE_CURVE_WINDOW_HOURS / 2) * 3_600_000;
   const curve = useMemo(() => (series ? tideCurve(series, now - half, now + half, 30) : []), [series, now, half]);

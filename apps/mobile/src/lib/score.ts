@@ -3,17 +3,21 @@
  *
  *   S = R_a * (1 + SUM_i R_i * v_i * w(d_i)) * exp(-lambda * (t_now - t_last))
  *
- *   lambda = ln(2) / 24 h, t measured in hours
- *   w(d)   = 1.0 if d <= 200 m, 0.5 if d <= 500 m, else 0   (d = voter's distance to the ping)
- *   t_last = max(created_at, latest confirm)   (confirm = vote of +1)
+ *   lambda = ln(2) / 24 h
+ *   w      = the SERVER-PRECOMPUTED weight in {1.0, 0.5, 0} exposed by ping_votes_feed (1.0 within 200 m, 0.5 within
+ *            500 m, else 0). The feed does not expose voter ids or distances (trilateration risk), so the client
+ *            never recomputes w from a distance. distanceWeight() below exists only for the vote-button hint.
+ *   t0     = least(created_at, coalesce(received_at, created_at))   (anti-gaming: a future-dated ping cannot stay solid)
+ *   t_last = max(t0, latest confirm)   (confirm = vote of +1)
  *
  * Render: S < 0.25 hidden, S < 0.5 faded, S <= 1.5 normal, S > 1.5 solid (+ confirm count).
  *
  * Parity with supabase public.score_ping (migration 4), operation for operation:
  *  - lambda = ln(2) / 86400 per SECOND; dt = max(0, seconds between now and t_last) as a double;
- *  - votes are summed in (created_at, voter_id) ascending order, each term (rep * vote) * w(d);
+ *  - votes are summed in created_at ascending order (voter_id is not available client-side; ties differ from SQL at
+ *    most by floating-point associativity, well inside the 1e-12 tolerance), each term (rep * vote) * w;
  *  - votes created after `now` are ignored;
- *  - a missing distance (null) has weight 0; no clamp on S itself (net-disputed can go <= 0 => hidden).
+ *  - no clamp on S itself (net-disputed can go <= 0 => hidden).
  */
 import {
   SCORE_FADED_BELOW,
@@ -35,16 +39,16 @@ export interface ScoreVote {
   /** +1 confirm, -1 dispute. */
   vote: 1 | -1;
   voterReputation: number;
-  /** Tie-break for the summation order (matches SQL ORDER BY created_at, voter_id). */
-  voterId?: string;
-  /** Distance of the voter's last-known position to the ping, metres; null = unknown. */
-  voterDistM: number | null;
+  /** Server-precomputed w(d) from ping_votes_feed. */
+  weight: number;
   createdAt: Instant;
 }
 
 export interface ScoreInput {
   authorReputation: number;
   createdAt: Instant;
+  /** Server receipt time (ping_feed.received_at). Omit for locally created, unsynced pings (t0 = created_at). */
+  receivedAt?: Instant | null;
   votes: readonly ScoreVote[];
   now: Instant;
 }
@@ -69,9 +73,17 @@ export function isVoteEligible(distM: number | null): boolean {
   return distM !== null && Number.isFinite(distM) && distM >= 0 && distM <= CONFIRM_ELIGIBILITY_M;
 }
 
-/** t_last = max(created_at, latest confirm). Returns epoch ms. */
-export function lastActivityMs(createdAt: Instant, votes: readonly ScoreVote[]): number {
-  let t = toMs(createdAt);
+/** t0 = least(created_at, coalesce(received_at, created_at)), epoch ms. */
+export function decayOriginMs(createdAt: Instant, receivedAt?: Instant | null): number {
+  const c = toMs(createdAt);
+  if (receivedAt === null || receivedAt === undefined) return c;
+  const r = toMs(receivedAt);
+  return Number.isFinite(r) ? Math.min(c, r) : c;
+}
+
+/** t_last = max(t0, latest confirm). Returns epoch ms. */
+export function lastActivityMs(t0: Instant, votes: readonly ScoreVote[]): number {
+  let t = toMs(t0);
   for (const v of votes) {
     if (v.vote === 1) {
       const vt = toMs(v.createdAt);
@@ -91,11 +103,11 @@ export function pingScore(input: ScoreInput): number {
   const votes = input.votes
     .filter((v) => toMs(v.createdAt) <= nowMs)
     .slice()
-    .sort((a, b) => toMs(a.createdAt) - toMs(b.createdAt) || (a.voterId ?? '').localeCompare(b.voterId ?? ''));
-  const tLast = lastActivityMs(input.createdAt, votes);
+    .sort((a, b) => toMs(a.createdAt) - toMs(b.createdAt)); // stable: ties keep feed order
+  const tLast = lastActivityMs(decayOriginMs(input.createdAt, input.receivedAt), votes);
   const dtSeconds = Math.max(0, (nowMs - tLast) / 1000);
   let sum = 0;
-  for (const v of votes) sum += v.voterReputation * v.vote * distanceWeight(v.voterDistM);
+  for (const v of votes) sum += v.voterReputation * v.vote * v.weight;
   return input.authorReputation * (1 + sum) * Math.exp(-SCORE_LAMBDA_PER_SECOND * dtSeconds);
 }
 
@@ -122,4 +134,19 @@ export function summarizePing(input: ScoreInput): PingSummary {
     else disputes++;
   }
   return { score, state: renderState(score), confirms, disputes };
+}
+
+/**
+ * When reputations are unavailable (feed row without author_reputation / voter_reputation), NEVER assume 1.0.
+ * Use the server's cached score (refreshed on every vote, `updated_at`) decayed to `now`:
+ *   S ~= cached * exp(-lambda * (now - updated_at))
+ * This is exact for an unvoted ping and a close lower bound otherwise (decay since the last server refresh).
+ */
+export function fallbackScore(cachedScore: number | null | undefined, updatedAt: Instant | null | undefined, now: Instant): number | null {
+  if (cachedScore === null || cachedScore === undefined || !Number.isFinite(cachedScore)) return null;
+  if (updatedAt === null || updatedAt === undefined) return null;
+  const t = toMs(updatedAt);
+  if (!Number.isFinite(t)) return null;
+  const dtSeconds = Math.max(0, (toMs(now) - t) / 1000);
+  return cachedScore * Math.exp(-SCORE_LAMBDA_PER_SECOND * dtSeconds);
 }

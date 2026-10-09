@@ -2,15 +2,17 @@ import { Modal, Text, View } from 'react-native';
 import { PING_TYPE_LABELS } from '@clearwater/shared';
 import { Button } from './Button';
 import { s, useColors } from './theme';
-import type { ScoredPing } from '../lib/pingModel';
+import type { ScoredPing, VoteAvailability } from '../lib/pingModel';
 
 /** FLT-2: confirm or dispute in one tap. Eligibility (within 500 m in the last 24 h) is enforced server-side by cast_vote. */
 export function PingDetail({
   scored,
+  availability,
   onVote,
   onClose,
 }: {
   scored: ScoredPing | null;
+  availability: VoteAvailability;
   onVote: (pingId: string, vote: 1 | -1) => void;
   onClose: () => void;
 }) {
@@ -24,13 +26,12 @@ export function PingDetail({
           <Text style={[s.h2, { color: c.text }]}>{PING_TYPE_LABELS[ping.type]}</Text>
           <Text style={[s.body, { color: c.sub }]}>{`${new Date(ping.created_at).toLocaleString()}${pendingSync ? ' · pending sync' : ''}`}</Text>
           {ping.note ? <Text style={[s.body, { color: c.text }]}>{ping.note}</Text> : null}
-          <Text style={[s.body, { color: c.text }]}>{`${summary.confirms} confirmed, ${summary.disputes} disputed · ${summary.state}`}</Text>
-          {!pendingSync ? (
-            <View style={s.row}>
-              <View style={{ flex: 1, marginRight: 8 }}><Button label="Confirm" onPress={() => onVote(ping.id, 1)} /></View>
-              <View style={{ flex: 1 }}><Button label="Dispute" kind="danger" onPress={() => onVote(ping.id, -1)} /></View>
-            </View>
-          ) : null}
+          <Text style={[s.body, { color: c.text }]}>{`${summary.confirms} confirmed, ${summary.disputes} disputed · ${summary.state}${scored.scoreIsFallback ? ' (server score)' : ''}`}</Text>
+          <View style={s.row}>
+            <View style={{ flex: 1, marginRight: 8 }}><Button label="Confirm" disabled={!availability.confirm} onPress={() => onVote(ping.id, 1)} /></View>
+            <View style={{ flex: 1 }}><Button label="Dispute" kind="danger" disabled={!availability.dispute} onPress={() => onVote(ping.id, -1)} /></View>
+          </View>
+          {availability.reason ? <Text style={[s.small, { color: c.sub }]}>{availability.reason}</Text> : null}
           <Button label="Close" kind="secondary" onPress={onClose} />
         </View>
       </View>

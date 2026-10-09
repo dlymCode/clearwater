@@ -1,16 +1,29 @@
-/** Last-known position reporter: rounded to 100 m, <= every 5 min, foreground only (lib/positionReport.ts). */
+/**
+ * Last-known position reporter: rounded to 100 m client-side (defense in depth), at most every 5 min, foreground only
+ * (lib/positionReport.ts). Sent through the `report_position(p_lat, p_lon)` RPC: the server snaps to 100 m again and
+ * enforces the 5-minute window SILENTLY (no 429 storm). Uses getSession() (local, no network round trip).
+ */
 import { AppState } from 'react-native';
 import { decidePositionReport } from '../lib/positionReport';
 import { useAppStore } from '../state/store';
+import { kvGet, kvSet } from './db';
 import { getSupabase } from './supabase';
 
+const LAST_REPORT_KEY = 'position.lastReportMs';
 let lastReportMs: number | null = null;
+let lastAttemptMs: number | null = null;
+let inFlight = false;
+let loaded = false;
 
 /** Call on every GPS fix (cheap: the policy short-circuits). */
 export async function maybeReportPosition(): Promise<void> {
+  if (!loaded) {
+    loaded = true;
+    lastReportMs = await kvGet<number>(LAST_REPORT_KEY); // survives relaunch: no report burst on every app start
+  }
   const { settings, gps } = useAppStore.getState();
   const decision = decidePositionReport(
-    { lastReportMs },
+    { lastReportMs, lastAttemptMs, inFlight },
     {
       nowMs: Date.now(),
       sharingEnabled: settings.sharePosition,
@@ -19,13 +32,18 @@ export async function maybeReportPosition(): Promise<void> {
     },
   );
   if (!decision.report) return;
-  const sb = getSupabase();
-  const { data } = await sb.auth.getUser();
-  if (!data.user) return;
-  const { position } = decision;
-  // The server snaps to the 100 m grid again and throttles (tg_last_positions_before_write); we send already-rounded values.
-  const { error } = await sb
-    .from('last_positions')
-    .upsert({ user_id: data.user.id, geom: `SRID=4326;POINT(${position.lon} ${position.lat})` }, { onConflict: 'user_id' });
-  if (!error) lastReportMs = Date.now();
+  inFlight = true;
+  lastAttemptMs = Date.now();
+  try {
+    const sb = getSupabase();
+    const { data } = await sb.auth.getSession();
+    if (!data.session) return;
+    const { error } = await sb.rpc('report_position', { p_lat: decision.position.lat, p_lon: decision.position.lon });
+    if (!error) {
+      lastReportMs = Date.now();
+      await kvSet(LAST_REPORT_KEY, lastReportMs);
+    }
+  } finally {
+    inFlight = false;
+  }
 }

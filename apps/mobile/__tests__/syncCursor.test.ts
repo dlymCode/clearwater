@@ -19,17 +19,23 @@ describe('cursors', () => {
     expect(advanceCursor('2026-10-10T00:00:00Z', rows)).toBe('2026-10-10T00:00:00Z');
     expect(advanceCursor('2026-10-09T10:30:00Z', rows)).toBe('2026-10-09T11:00:00Z');
   });
+  it('advances by the per-table cursor column, not always updated_at', () => {
+    const votes = [{ created_at: '2026-10-09T10:00:00Z' }, { created_at: '2026-10-09T12:00:00Z' }];
+    expect(advanceCursor(undefined, votes, 'created_at')).toBe('2026-10-09T12:00:00Z');
+    expect(advanceCursor(undefined, votes)).toBeUndefined(); // rows have no updated_at
+    expect(advanceCursor(undefined, [{ received_at: '2026-10-09T09:00:00Z' }], 'received_at')).toBe('2026-10-09T09:00:00Z');
+  });
   it('ignores rows with missing or garbage stamps; empty keeps previous', () => {
     expect(advanceCursor('2026-10-09T10:00:00Z', [{ updated_at: null }, { updated_at: 'nope' }, {}])).toBe('2026-10-09T10:00:00Z');
     expect(advanceCursor(undefined, [])).toBeUndefined();
   });
   it('builds one inclusive pull per table (first sync has null bounds)', () => {
     expect(pullSpecs({})).toEqual([
-      { table: 'pings', updatedAtGte: null },
-      { table: 'ping_votes', updatedAtGte: null },
-      { table: 'messages', updatedAtGte: null },
+      { table: 'pings', relation: 'ping_feed', cursorColumn: 'updated_at', gte: null },
+      { table: 'ping_votes', relation: 'ping_votes_feed', cursorColumn: 'created_at', gte: null },
+      { table: 'messages', relation: 'messages', cursorColumn: 'received_at', gte: null },
     ]);
-    expect(pullSpecs({ pings: '2026-10-09T10:00:00Z' })[0]).toEqual({ table: 'pings', updatedAtGte: '2026-10-09T10:00:00Z' });
+    expect(pullSpecs({ pings: '2026-10-09T10:00:00Z' })[0]).toMatchObject({ table: 'pings', gte: '2026-10-09T10:00:00Z' });
   });
   it('dedupeById keeps the newest version of overlapping rows', () => {
     const out = dedupeById([

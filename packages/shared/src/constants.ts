@@ -171,3 +171,18 @@ export type OutboxKind = (typeof OUTBOX_KINDS)[number];
 /** Server tables pulled by the inbound cursor sync. */
 export const SYNC_TABLES = ['pings', 'ping_votes', 'messages'] as const;
 export type SyncTable = (typeof SYNC_TABLES)[number];
+
+/**
+ * Where each inbound table is read from and which column is its sync cursor. Not every table has
+ * `updated_at`: votes are immutable (server created_at), messages use the server clock (received_at).
+ * Pings and votes are read through the feed views, which expose reputations for client-side scoring and
+ * hide the author of anonymous pings.
+ */
+export const SYNC_SOURCES = {
+  pings: { relation: 'ping_feed', cursorColumn: 'updated_at' },
+  ping_votes: { relation: 'ping_votes_feed', cursorColumn: 'created_at' },
+  messages: { relation: 'messages', cursorColumn: 'received_at' },
+} as const satisfies Record<SyncTable, { relation: string; cursorColumn: string }>;
+
+/** Server accepts at most this many rows per depth upload batch. */
+export const DEPTH_BATCH_MAX_ROWS = 5000;

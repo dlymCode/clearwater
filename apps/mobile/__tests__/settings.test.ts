@@ -27,5 +27,8 @@ describe('settings', () => {
     expect(m.toggles.fleet).toBe(true);
     expect(m.toggles.depth).toBe(true);
     expect(m.sharePosition).toBe(false);
+    expect(DEFAULT_SETTINGS.sharePosition).toBe(false);
+    expect(mergeSettings({}).sharePosition).toBe(false);
+    expect(mergeSettings({ sharePosition: true }).sharePosition).toBe(true);
   });
 });

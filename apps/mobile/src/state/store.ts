@@ -24,12 +24,18 @@ interface AppState {
   nmeaStats: NmeaStats | null;
   /** Bumped whenever local ping/vote/message tables change, to refresh lists. */
   dataRev: number;
+  /** Signed-in user id (null when offline-only / signed out). */
+  userId: string | null;
+  /** A 401 paused syncing: show sign-in again. */
+  authRequired: boolean;
   setSettings: (patch: Partial<AppSettings>) => void;
   hydrateSettings: (stored: unknown) => void;
   setGps: (fix: GpsFix) => void;
   setDepth: (d: DepthReading | null) => void;
   setNmea: (status: NmeaStatus, stats?: NmeaStats | null) => void;
   bumpData: () => void;
+  setUserId: (id: string | null) => void;
+  setAuthRequired: (v: boolean) => void;
 }
 
 export const useAppStore = create<AppState>((set) => ({
@@ -40,10 +46,14 @@ export const useAppStore = create<AppState>((set) => ({
   nmeaStatus: 'idle',
   nmeaStats: null,
   dataRev: 0,
+  userId: null,
+  authRequired: false,
   setSettings: (patch) => set((s) => ({ settings: { ...s.settings, ...patch } })),
   hydrateSettings: (stored) => set({ settings: mergeSettings(stored), settingsLoaded: true }),
   setGps: (gps) => set({ gps }),
   setDepth: (depth) => set({ depth }),
   setNmea: (nmeaStatus, stats) => set((s) => ({ nmeaStatus, nmeaStats: stats === undefined ? s.nmeaStats : stats })),
   bumpData: () => set((s) => ({ dataRev: s.dataRev + 1 })),
+  setUserId: (userId) => set({ userId }),
+  setAuthRequired: (authRequired) => set({ authRequired }),
 }));

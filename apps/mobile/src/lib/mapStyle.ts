@@ -116,18 +116,56 @@ export function depthLegend(): LegendStop[] {
   return stops;
 }
 
+/** Ramp bands as [deepest..shallowest] depth-ft lower bounds: band d covers depth [d, next deeper-bound). */
+const BAND_EPS = 0.001;
+
 /**
  * color-relief expression over the decoded raster value. The depth tiles carry FEET MLLW (positive up) and
- * MapLibre treats the value as "metres", so stops are given as raw feet numbers. Depth d ft => value -d.
- * Stops are ascending: 40 ft deep ... 0 ft (datum) ... +3 ft (dries).
+ * MapLibre treats the value as "metres", so stops are raw feet. The legend shows HARD BANDS (0-3, 3-6, ... 40+),
+ * so the expression emits hard bands too (paired stops BAND_EPS apart) instead of a smooth gradient: what the
+ * legend says is what the map draws.
+ *   depth >= 40 ft          -> RAMP[40]        value <= -40
+ *   20 <= depth < 40        -> RAMP[20]        -40 < value <= -20
+ *   ... 0 <= depth < 3      -> RAMP[0]         -3 < value <= 0
+ *   dries (value > 0)       -> DRYING_COLOR
  */
+export function colorReliefStops(): Array<[number, string]> {
+  const ramp = [...DEPTH_COLOR_RAMP_FT].sort((a, b) => b - a); // 40,20,10,6,3,0
+  const stops: Array<[number, string]> = [[-ramp[0]! - 10, RAMP_COLORS[ramp[0] as number] as string]];
+  ramp.forEach((d, i) => {
+    const color = RAMP_COLORS[d] as string;
+    if (i === 0) stops.push([-d, color]); // everything at or below -40 stays deepest
+    else {
+      const upper = ramp[i - 1]!; // the deeper breakpoint closing this band from below
+      stops.push([-upper + BAND_EPS, color]);
+      stops.push([-d, color]);
+    }
+  });
+  stops.push([BAND_EPS, DRYING_COLOR]);
+  stops.push([3, DRYING_COLOR]);
+  return stops;
+}
+
 export function colorReliefExpression(): unknown[] {
   const expr: unknown[] = ['interpolate', ['linear'], ['elevation']];
-  const ramp = [...DEPTH_COLOR_RAMP_FT].sort((a, b) => b - a); // deepest first => lowest elevation first
-  expr.push(-ramp[0]! - 10, RAMP_COLORS[ramp[0] as number]); // deeper than 40 ft keeps the deepest color
-  for (const d of ramp) expr.push(-d, RAMP_COLORS[d]);
-  expr.push(3, DRYING_COLOR); // anything that dries by 3 ft or more
+  for (const [v, c] of colorReliefStops()) expr.push(v, c);
   return expr;
+}
+
+/** Evaluate the ramp the way MapLibre's linear interpolate does, for a depth in ft (positive down). Used by tests. */
+export function rampColorAtDepth(depthFt: number): string {
+  const v = -depthFt;
+  const stops = colorReliefStops();
+  if (v <= stops[0]![0]) return stops[0]![1];
+  for (let i = 1; i < stops.length; i++) {
+    const [v1, c1] = stops[i]!;
+    const [v0, c0] = stops[i - 1]!;
+    if (v <= v1) {
+      // Hard bands only interpolate between equal colors (or across a BAND_EPS-wide step); pick the nearer stop.
+      return v - v0 < v1 - v ? c0 : c1;
+    }
+  }
+  return stops[stops.length - 1]![1];
 }
 
 // --- Style --------------------------------------------------------------------------------------

@@ -1,6 +1,6 @@
 import { haversineM, roundPosition } from '../src/lib/geo';
 import { inviteStatusText, isInviteExpired, isValidInviteCode, normalizeInviteCode, inviteExpiryFrom } from '../src/lib/groups';
-import { buildMapStyle, colorReliefExpression, depthLegend, DEFAULT_TOGGLES, layersForToggle } from '../src/lib/mapStyle';
+import { buildMapStyle, colorReliefExpression, depthLegend, DEFAULT_TOGGLES, layersForToggle, rampColorAtDepth } from '../src/lib/mapStyle';
 import {
   buildMessagePayload,
   buildPingPayload,
@@ -117,7 +117,7 @@ describe('ping model', () => {
     author_reputation: rep,
   });
   it('visiblePings: fades at 24 h, hides at 48 h+, reconfirmation revives, pending always shown', () => {
-    const vote: PingVote = { ping_id: 'old', voter_id: 'v', vote: 1, voter_dist_m: 100, created_at: new Date(NOW - 2 * 3_600_000).toISOString(), voter_reputation: 1 };
+    const vote: PingVote = { ping_id: 'old', vote: 1, created_at: new Date(NOW - 2 * 3_600_000).toISOString(), voter_reputation: 1, weight: 1 };
     const out = visiblePings(
       [ping('fresh', 1), ping('day', 30), ping('gone', 60), ping('old', 60), ping('mine', 60)],
       new Map([['old', [vote]]]),
@@ -162,6 +162,20 @@ describe('mapStyle', () => {
     const minimal = buildMapStyle({ base: 'pmtiles://b', depth: 'pmtiles://d' });
     expect(Object.keys(minimal.sources)).toEqual(['base', 'depth']);
     expect(minimal.layers.some((l) => l.id.startsWith('fleet'))).toBe(false);
+  });
+  it('the map draws what the legend says: every legend band mid-point renders in the legend colour', () => {
+    const legend = depthLegend();
+    const mid = (depthFt: number, i: number) => {
+      const next = legend[i + 1]?.depthFt;
+      return next === undefined ? depthFt + 10 : (depthFt + next) / 2;
+    };
+    legend.forEach((stop, i) => {
+      if (stop.label === 'Dries') expect(rampColorAtDepth(-1.5)).toBe(stop.color);
+      else expect(rampColorAtDepth(mid(stop.depthFt, i))).toBe(stop.color);
+    });
+    // breakpoints are hard: just either side of 10 ft changes colour, not a gradient
+    expect(rampColorAtDepth(9.9)).not.toBe(rampColorAtDepth(10.1));
+    expect(rampColorAtDepth(200)).toBe(legend[legend.length - 1]!.color);
   });
   it('hillshade exaggeration is scaled by 0.3048 because the tiles are feet', () => {
     const s = buildMapStyle(urls);

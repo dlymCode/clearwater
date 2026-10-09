@@ -7,6 +7,8 @@ import { inviteStatusText, isValidInviteCode } from '../lib/groups';
 import { createGroup, joinGroup, leaveGroup, listMyGroups, rotateInviteCode } from '../services/groups';
 import { getSupabase } from '../services/supabase';
 
+// TODO(item 19, not implemented): remove-member UI for owners (services/groups.removeMember exists) and group-tier ping
+// creation from the map.
 /** FLT-7: create, invite by code (8 chars, 7 days), join, leave. Online-only operations; owner can rotate the code. */
 export function GroupsScreen({ onOpen }: { onOpen: (g: Group) => void }) {
   const c = useColors();

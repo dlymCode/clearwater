@@ -11,29 +11,38 @@
 import {
   AOI_STALE_RED_DAYS,
   AOI_STALE_YELLOW_DAYS,
+  SYNC_SOURCES,
   SYNC_TABLES,
   TIDE_STALE_HOURS,
   type SyncTable,
 } from '@clearwater/shared';
 
-export type SyncCursors = Partial<Record<SyncTable, string>>;
+/** Cursor keys: the three feed tables plus the user's own votes (ping_votes where voter_id = me). */
+export type CursorKey = SyncTable | 'my_votes';
+export type SyncCursors = Partial<Record<CursorKey, string>>;
 
 const DAY_MS = 86_400_000;
 const HOUR_MS = 3_600_000;
 
 const ms = (iso: string | undefined | null): number => (iso ? Date.parse(iso) : Number.NaN);
 
-/** New cursor = max(previous, newest updated_at in `rows`). Never moves backwards; ignores bad stamps. */
+/**
+ * New cursor = max(previous, newest `column` value in `rows`). Never moves backwards; ignores bad stamps.
+ * `column` is the table's cursor column (SYNC_SOURCES): updated_at for pings, created_at for votes,
+ * received_at for messages.
+ */
 export function advanceCursor(
   previous: string | undefined,
-  rows: ReadonlyArray<{ updated_at?: string | null }>,
+  rows: ReadonlyArray<Record<string, unknown>>,
+  column = 'updated_at',
 ): string | undefined {
   let best = previous;
   let bestMs = ms(previous);
   for (const r of rows) {
-    const t = ms(r.updated_at);
+    const v = r[column];
+    const t = typeof v === 'string' ? Date.parse(v) : Number.NaN;
     if (Number.isFinite(t) && (!Number.isFinite(bestMs) || t > bestMs)) {
-      best = r.updated_at as string;
+      best = v as string;
       bestMs = t;
     }
   }
@@ -41,13 +50,24 @@ export function advanceCursor(
 }
 
 export interface PullSpec {
-  table: SyncTable;
-  /** Inclusive lower bound on updated_at; null = first sync (pull the last-48 h window instead). */
-  updatedAtGte: string | null;
+  table: CursorKey;
+  /** Extra equality filter (own votes: voter_id = auth.uid()). */
+  eq?: { column: string; value: string };
+  /** Relation to read (a feed view for pings/votes). */
+  relation: string;
+  /** Column used as this table's cursor and ordering. */
+  cursorColumn: string;
+  /** Inclusive lower bound; null = first sync (the caller applies its window). */
+  gte: string | null;
 }
 
 export function pullSpecs(cursors: SyncCursors): PullSpec[] {
-  return SYNC_TABLES.map((table) => ({ table, updatedAtGte: cursors[table] ?? null }));
+  return SYNC_TABLES.map((table) => ({
+    table,
+    relation: SYNC_SOURCES[table].relation,
+    cursorColumn: SYNC_SOURCES[table].cursorColumn,
+    gte: cursors[table] ?? null,
+  }));
 }
 
 /** Keep the latest version of each id (rows from an inclusive pull overlap by design). */

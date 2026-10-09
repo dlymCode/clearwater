@@ -2,23 +2,23 @@ import { Camera, Images, Map, Marker, type MapRef, type StyleSpecification } fro
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { NativeSyntheticEvent } from 'react-native';
 import { Pressable, Text, View } from 'react-native';
-import type { PingVote, TileLayer } from '@clearwater/shared';
+import type { TileLayer } from '@clearwater/shared';
 import { Banner, NotForNavigationLine } from '../components/Banner';
 import { Button } from '../components/Button';
 import { DepthLegend } from '../components/DepthLegend';
 import { DepthNumeral } from '../components/DepthNumeral';
 import { PingDetail } from '../components/PingDetail';
 import { s, useColors } from '../components/theme';
-import { isGpsStale, shouldRender } from '../lib/geo';
+import { haversineM, isGpsStale, shouldRender } from '../lib/geo';
 import { readoutFromPixels, type InspectReadout } from '../lib/inspect';
 import { buildMapStyle, type LayerToggles } from '../lib/mapStyle';
-import { normalizePingRow, visiblePings, buildVotePayload, type ScoredPing } from '../lib/pingModel';
+import { normalizePingRow, normalizeVoteRow, optimisticVote, visiblePings, buildVotePayload, voteAvailability, type ScoredPing } from '../lib/pingModel';
 import { regionReadout, type BoundaryCollection } from '../lib/region';
 import { offsetsNeeded } from '../lib/settings';
 import { aoiBanner } from '../lib/syncCursor';
 import { type InstalledAoi } from '../lib/tilesIndex';
 import { getInstalled, localFileUri } from '../services/downloads';
-import { loadLocalPings, loadLocalVotes } from '../services/localWrites';
+import { loadLocalPings, loadLocalVotes, loadMyVotedPingIds, saveLocalVote } from '../services/localWrites';
 import { loadRegions } from '../services/regions';
 import { saveSettings } from '../services/settingsRepo';
 import { outbox } from '../services/syncService';
@@ -27,6 +27,8 @@ import { useAppStore } from '../state/store';
 import { InspectPopup } from './InspectPopup';
 import { PingSheet } from './PingSheet';
 
+// TODO(item 19, not implemented): group ping creation (PingSheet takes a groupId; the map always posts public), a
+// remove-member UI, an "Inspect unavailable" message while tileSampler is a stub, and MAP-4 scene-count display.
 const AOI = 'skagit'; // TODO: persist the user's selected AOI; Skagit is the beta area
 const PMTILES = 'pmtiles://';
 
@@ -46,6 +48,8 @@ export function MapScreen() {
   const depth = useAppStore((st) => st.depth);
   const rev = useAppStore((st) => st.dataRev);
   const bump = useAppStore((st) => st.bumpData);
+  const userId = useAppStore((st) => st.userId);
+  const [myVotes, setMyVotes] = useState<Set<string>>(new Set());
   const mapRef = useRef<MapRef>(null);
 
   const [installed, setInstalled] = useState<InstalledAoi | undefined>();
@@ -83,14 +87,16 @@ export function MapScreen() {
   useEffect(() => {
     void (async () => {
       const pings = (await loadLocalPings()).map(normalizePingRow).flatMap((p) => (p ? [p] : []));
-      const votes = new globalThis.Map<string, PingVote[]>();
-      for (const v of await loadLocalVotes()) {
-        const pv = v as unknown as PingVote;
-        votes.set(pv.ping_id, [...(votes.get(pv.ping_id) ?? []), pv]);
+      const votes = new globalThis.Map<string, NonNullable<ReturnType<typeof normalizeVoteRow>>[]>();
+      for (const raw of await loadLocalVotes()) {
+        const pv = normalizeVoteRow(raw);
+        if (pv) votes.set(pv.ping_id, [...(votes.get(pv.ping_id) ?? []), pv]);
       }
-      setScored(visiblePings(pings, votes, Date.now(), await outbox.pendingIds('ping')));
+      setMyVotes(await loadMyVotedPingIds());
+      // Unsynced = queued OR rejected-and-not-retried: both keep the "pending sync" mark.
+      setScored(visiblePings(pings, votes, Date.now(), await outbox.unsyncedIds('ping')));
     })();
-  }, [rev, minute]); // refresh on data change and once a minute (decay)
+  }, [rev, minute, userId]); // refresh on data change and once a minute (decay)
 
   const style = useMemo(() => {
     if (!installed) return null;
@@ -124,7 +130,9 @@ export function MapScreen() {
   );
 
   async function vote(pingId: string, v: 1 | -1) {
-    await outbox.enqueue('vote', buildVotePayload(pingId, v, Date.now()));
+    const now = Date.now();
+    await outbox.enqueue('vote', buildVotePayload(pingId, v, now));
+    await saveLocalVote(optimisticVote(pingId, v, now)); // greys the buttons at once; the server row reconciles it
     setDetail(null);
     bump();
   }
@@ -195,7 +203,15 @@ export function MapScreen() {
         groupId={null}
         onClose={() => { setPingSheet(false); setPlaced(null); }}
       />
-      <PingDetail scored={detail} onVote={(id, v) => void vote(id, v)} onClose={() => setDetail(null)} />
+      <PingDetail
+        scored={detail}
+        availability={detail ? voteAvailability({
+          isOwn: !!userId && detail.ping.author_id === userId,
+          pendingSync: detail.pendingSync,
+          alreadyVoted: myVotes.has(detail.ping.id),
+          distanceToPingM: here ? haversineM(here, { lat: detail.ping.lat, lon: detail.ping.lon }) : null,
+        }) : { confirm: false, dispute: false, reason: null }}
+        onVote={(id, v) => void vote(id, v)} onClose={() => setDetail(null)} />
     </View>
   );
 }

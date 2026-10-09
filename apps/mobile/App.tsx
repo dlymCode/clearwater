@@ -28,6 +28,7 @@ const TABS: Array<[Tab, string]> = [['map', 'Map'], ['tides', 'Tides'], ['areas'
 export default function App() {
   const c = useColors();
   const loaded = useAppStore((st) => st.settingsLoaded);
+  const authRequired = useAppStore((st) => st.authRequired);
   const settings = useAppStore((st) => st.settings);
   const [tab, setTab] = useState<Tab>('map');
   const [channel, setChannel] = useState<Group | null>(null);
@@ -42,6 +43,7 @@ export default function App() {
       await loadSettings();
       if (isBackendConfigured()) {
         const { data } = await getSupabase().auth.getSession();
+        useAppStore.getState().setUserId(data.session?.user.id ?? null);
         setSignedIn(!!data.session);
       } else {
         setSignedIn(true); // offline-only mode: map, tides, boundaries work without a backend
@@ -93,8 +95,8 @@ export default function App() {
   }, [accepted, settings.nmeaEnabled, settings.nmeaHost, settings.nmeaPort, settings.nmeaProtocol]);
 
   if (!loaded || signedIn === null) return <View style={{ flex: 1, backgroundColor: c.bg }} />;
-  if (!accepted) return <SafeAreaView style={{ flex: 1, backgroundColor: c.bg }}><OnboardingScreen onAccept={(t) => void saveSettings({ acceptedDisclaimerAt: t })} /></SafeAreaView>;
-  if (!signedIn) return <SafeAreaView style={{ flex: 1, backgroundColor: c.bg }}><AuthScreen onSignedIn={() => setSignedIn(true)} /></SafeAreaView>;
+  if (!accepted) return <SafeAreaView style={{ flex: 1, backgroundColor: c.bg }}><OnboardingScreen onAccept={(t, share) => void saveSettings({ acceptedDisclaimerAt: t, sharePosition: share })} /></SafeAreaView>;
+  if (!signedIn || authRequired) return <SafeAreaView style={{ flex: 1, backgroundColor: c.bg }}><AuthScreen onSignedIn={() => { setSignedIn(true); useAppStore.getState().setAuthRequired(false); void getSupabase().auth.getSession().then(({ data }) => useAppStore.getState().setUserId(data.session?.user.id ?? null)); }} /></SafeAreaView>;
 
   return (
     <SafeAreaView style={{ flex: 1, backgroundColor: c.bg }}>

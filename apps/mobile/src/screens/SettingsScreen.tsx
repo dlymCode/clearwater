@@ -1,10 +1,41 @@
-import { useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { ScrollView, Switch, Text, TextInput, View } from 'react-native';
 import { Button } from '../components/Button';
 import { s, useColors } from '../components/theme';
 import { offsetsNeeded, parseOffsetFt, validateNmea, type NmeaProtocol } from '../lib/settings';
 import { saveSettings } from '../services/settingsRepo';
+import { getLastSyncReport, outbox, syncNow } from '../services/syncService';
+import type { OutboxRow } from '../lib/outbox';
 import { useAppStore } from '../state/store';
+
+/** Sync health: unsent counts, rows the server rejected (with a retry button), last pull errors. Never silent. */
+function SyncStatus() {
+  const c = useColors();
+  const rev = useAppStore((st) => st.dataRev);
+  const [pending, setPending] = useState(0);
+  const [failed, setFailed] = useState<OutboxRow[]>([]);
+  const [errors, setErrors] = useState<string[]>([]);
+  const refresh = useCallback(async () => {
+    setPending((await outbox.pending()).length);
+    setFailed(await outbox.failed());
+    setErrors(getLastSyncReport()?.errors ?? []);
+  }, []);
+  useEffect(() => void refresh(), [refresh, rev]);
+  return (
+    <View style={s.gap}>
+      <Text style={[s.h2, { color: c.text }]}>Sync</Text>
+      <Text style={[s.body, { color: c.text }]}>{`${pending} waiting to send, ${failed.length} rejected by the server`}</Text>
+      {failed.map((r) => (
+        <Text key={r.id} style={[s.small, { color: c.danger }]}>{`${r.kind}: ${r.lastError ?? 'rejected'}`}</Text>
+      ))}
+      {errors.map((e) => (
+        <Text key={e} style={[s.small, { color: c.warn }]}>{e}</Text>
+      ))}
+      <Button label="Sync now" kind="secondary" onPress={() => void syncNow().then(refresh)} />
+      {failed.length > 0 ? <Button label="Retry rejected" onPress={() => void outbox.retryFailed().then(() => syncNow()).then(refresh)} /> : null}
+    </View>
+  );
+}
 
 export function SettingsScreen() {
   const c = useColors();
@@ -65,6 +96,8 @@ export function SettingsScreen() {
       <Text style={[s.small, { color: c.sub }]}>
         {`Status: ${nmeaStatus}${stats ? `. ${stats.parsed} sentences parsed, ${stats.badChecksum} bad checksums dropped.` : ''}`}
       </Text>
+
+      <SyncStatus />
 
       <Text style={[s.h2, { color: c.text }]}>Privacy</Text>
       <View style={[s.row, { justifyContent: 'space-between', minHeight: 56 }]}>

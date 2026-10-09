@@ -237,3 +237,163 @@ describe('50 MB cap policy (scaled down)', () => {
     expect(m!.id).not.toBe(a.id);
   });
 });
+
+import { chunkId, chunkRows, isMergeable, soundingBatchId } from '../src/lib/outbox';
+import { Mutex } from '../src/lib/mutex';
+import { DEPTH_BATCH_MAX_ROWS } from '@clearwater/shared';
+
+describe('rows that were ever attempted are never merged or re-id\'d (no double counting)', () => {
+  it('coalesce at flush leaves an attempted depth row alone, with its id', async () => {
+    const { outbox, store } = mk();
+    const a = await outbox.enqueue('depth_batch', { rows: [depthRow(0)] });
+    await outbox.flush(recorder(503).send); // a is attempted (maybe the server got it)
+    const b = await outbox.enqueue('depth_batch', { rows: [depthRow(0)] });
+    const c = await outbox.enqueue('depth_batch', { rows: [depthRow(1)] });
+    const { calls, send } = recorder();
+    await outbox.flush(send);
+    const ids = calls.filter((x) => x.kind === 'depth_batch').map((x) => x.items[0]!.id);
+    expect(ids[0]).toBe(a.id); // retried under the ORIGINAL id => server dedupes
+    expect(ids).not.toContain(b.id); // b+c were merged together (never sent) under a fresh id, not into a
+    expect(ids).not.toContain(c.id);
+    const aRows = (calls.find((x) => x.items[0]!.id === a.id)!.items[0]!.payload as { rows: DepthUploadRow[] }).rows;
+    expect(aRows).toHaveLength(1);
+    expect(aRows[0]!.n).toBe(5);
+    expect(await store.get(a.id)).not.toBeNull();
+  });
+
+  it('enforceCap never touches attempted rows', async () => {
+    const { outbox } = mk({ capBytes: 1 });
+    const a = await outbox.enqueue('depth_batch', { rows: [depthRow(0)] });
+    await outbox.flush(recorder(500).send);
+    const b = await outbox.enqueue('depth_batch', { rows: [depthRow(0)] });
+    const cap = await outbox.enforceCap();
+    expect(cap.merges).toBe(0); // only b is mergeable: nothing to merge it with
+    expect(cap.overCap).toBe(true);
+    expect((await outbox.pending('depth_batch')).map((r) => r.id)).toEqual([a.id, b.id]);
+    expect(isMergeable((await outbox.pending('depth_batch'))[0]!)).toBe(false);
+  });
+
+  it('enqueue with an explicit id is idempotent', async () => {
+    const { outbox } = mk();
+    const a = await outbox.enqueue('depth_batch', { rows: [depthRow(0)] }, { id: 'fixed' });
+    const again = await outbox.enqueue('depth_batch', { rows: [depthRow(9)] }, { id: 'fixed' });
+    expect(again.seq).toBe(a.seq);
+    expect(await outbox.pending('depth_batch')).toHaveLength(1);
+  });
+});
+
+describe('auth, silent votes, visible failures', () => {
+  it('401 pauses flush (authRequired), leaves rows pending with NO attempt counted, nothing marked failed', async () => {
+    const { outbox } = mk();
+    await outbox.enqueue('ping', {});
+    await outbox.enqueue('depth_batch', { rows: [depthRow(0)] });
+    const { calls, send } = recorder(401);
+    const r = await outbox.flush(send);
+    expect(r.authRequired).toBe(true);
+    expect(r.stopped).toBe(true);
+    expect(calls).toHaveLength(1); // stopped at the first 401
+    const pending = await outbox.pending();
+    expect(pending).toHaveLength(2);
+    expect(pending.every((p) => p.attempts === 0 && p.status === 'pending')).toBe(true);
+    expect(await outbox.failed()).toHaveLength(0);
+    // after sign-in the same rows go through
+    const ok = await outbox.flush(recorder(200).send);
+    expect(ok.authRequired).toBe(false);
+    expect(ok.sent).toBe(2);
+  });
+
+  it.each(['confirm_ineligible', 'cannot_vote_own_ping', 'ping_not_found'])('403 %s on a vote is swallowed silently', async (code) => {
+    const { outbox } = mk();
+    await outbox.enqueue('vote', { v: 1 });
+    const r = await outbox.flush(async () => ({ status: 403, code }));
+    expect(r.swallowed).toBe(1);
+    expect(r.failed).toBe(0);
+    expect(await outbox.pending()).toHaveLength(0);
+    expect(await outbox.failed()).toHaveLength(0);
+  });
+
+  it('other 4xx become visible failures that keep the pending mark and can be retried', async () => {
+    const { outbox } = mk();
+    const p = await outbox.enqueue('ping', {}, { id: 'ping-x' });
+    const v = await outbox.enqueue('vote', {});
+    await outbox.flush(async (b) => (b.kind === 'ping' ? { status: 422 } : { status: 403, code: 'something_else' }));
+    expect((await outbox.failed()).map((r) => r.id).sort()).toEqual([p.id, v.id].sort());
+    expect((await outbox.pendingIds('ping')).has(p.id)).toBe(false);
+    expect((await outbox.unsyncedIds('ping')).has(p.id)).toBe(true); // still shows "pending sync"
+    expect(await outbox.retryFailed()).toBe(2);
+    expect(await outbox.failed()).toHaveLength(0);
+    const r = await outbox.flush(recorder(200).send);
+    expect(r.sent).toBe(2);
+  });
+});
+
+describe('depth batches over 5000 rows are chunked at send time with stable ids', () => {
+  const bigRows = (n: number): DepthUploadRow[] =>
+    Array.from({ length: n }, (_, i) => ({ h3_cell: latLngToCell(48 + Math.floor(i / 1000) * 0.05, -122 + (i % 1000) * 0.0005, 12), day: '2026-10-09', median_ft: 5, p10_ft: 4, n: 2 }));
+
+  it('splits 12 000 rows into 5000/5000/2000 sequential requests; row marked sent only after all', async () => {
+    const { outbox } = mk({ maxDepthRowsPerBatch: 20000 });
+    const rows = bigRows(12_000);
+    const unique = new Set(rows.map((r) => r.h3_cell)).size;
+    const row = await outbox.enqueue('depth_batch', { rows });
+    const { calls, send } = recorder();
+    await outbox.flush(send);
+    const depth = calls.filter((c) => c.kind === 'depth_batch');
+    expect(depth.map((c) => (c.items[0]!.payload as { rows: unknown[] }).rows.length)).toEqual([5000, 5000, unique - 10_000]);
+    expect(depth.every((c) => (c.items[0]!.payload as { rows: unknown[] }).rows.length <= DEPTH_BATCH_MAX_ROWS)).toBe(true);
+    expect(depth[0]!.items[0]!.id).toBe(row.id);
+    expect(new Set(depth.map((c) => c.items[0]!.id)).size).toBe(3);
+    expect(await outbox.pending()).toHaveLength(0);
+  });
+
+  it('a mid-way failure leaves the row pending; the retry resends the SAME chunk ids', async () => {
+    const { outbox } = mk({ maxDepthRowsPerBatch: 20000 });
+    await outbox.enqueue('depth_batch', { rows: bigRows(6000) });
+    let n = 0;
+    const first: string[] = [];
+    await outbox.flush(async (b) => {
+      first.push(b.items[0]!.id);
+      return { status: ++n === 2 ? 503 : 200 };
+    });
+    expect(await outbox.pending('depth_batch')).toHaveLength(1);
+    const second: string[] = [];
+    await outbox.flush(async (b) => {
+      second.push(b.items[0]!.id);
+      return { status: 200 };
+    });
+    expect(second).toEqual(first);
+    expect(await outbox.pending()).toHaveLength(0);
+  });
+
+  it('chunk helpers', () => {
+    expect(chunkRows([1, 2, 3], 2)).toEqual([[1, 2], [3]]);
+    expect(chunkRows([], 2)).toEqual([[]]);
+    expect(chunkId('abc-0000', 0)).toBe('abc-0000');
+    expect(chunkId('11111111-1111-4111-8111-111111111111', 2)).toBe('11111111-1111-4111-8111-111111110002');
+  });
+});
+
+describe('deterministic sounding batch ids + mutex', () => {
+  const install = '0f8fad5b-d9cb-469f-a165-70867728950e';
+  it('same range => same id; different range or install => different; valid UUID shape', () => {
+    const a = soundingBatchId(install, 10, 500);
+    expect(a).toBe(soundingBatchId(install, 10, 500));
+    expect(a).not.toBe(soundingBatchId(install, 10, 501));
+    expect(a).not.toBe(soundingBatchId('1f8fad5b-d9cb-469f-a165-70867728950e', 10, 500));
+    expect(a).toMatch(UUID_RE);
+  });
+  it('Mutex serializes overlapping critical sections (no interleaving, even when one throws)', async () => {
+    const m = new Mutex();
+    const log: string[] = [];
+    const task = (name: string, fail = false) =>
+      m.runExclusive(async () => {
+        log.push(`${name}:start`);
+        await new Promise((r) => setTimeout(r, 5));
+        log.push(`${name}:end`);
+        if (fail) throw new Error('boom');
+      });
+    const results = await Promise.allSettled([task('a'), task('b', true), task('c')]);
+    expect(log).toEqual(['a:start', 'a:end', 'b:start', 'b:end', 'c:start', 'c:end']);
+    expect(results.map((r) => r.status)).toEqual(['fulfilled', 'rejected', 'fulfilled']);
+  });
+});

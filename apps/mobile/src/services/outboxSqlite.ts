@@ -1,6 +1,6 @@
 import type { OutboxKind } from '@clearwater/shared';
 import type { OutboxRow, OutboxStatus, OutboxStore } from '../lib/outbox';
-import { getDb } from './db';
+import { getDb, runTx } from './db';
 
 interface Raw {
   id: string;
@@ -30,16 +30,23 @@ const SEQ_KEY = 'outbox.seq';
 
 /** SQLite OutboxStore. The sequence counter is persisted in `kv` so it never repeats after deletes. */
 export class SqliteOutboxStore implements OutboxStore {
+  /** One atomic statement (no transaction): safe to call inside or outside runTx. */
   async nextSeq(): Promise<number> {
     const db = await getDb();
-    let next = 0;
-    await db.withTransactionAsync(async () => {
-      const cur = await db.getFirstAsync<{ v: string }>('SELECT v FROM kv WHERE k = ?', SEQ_KEY);
-      const maxRow = await db.getFirstAsync<{ m: number | null }>('SELECT MAX(seq) AS m FROM outbox');
-      next = Math.max(cur ? Number(cur.v) : 0, maxRow?.m ?? 0) + 1;
-      await db.runAsync('INSERT INTO kv (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v', SEQ_KEY, String(next));
-    });
-    return next;
+    const row = await db.getFirstAsync<{ v: string }>(
+      `INSERT INTO kv (k, v) VALUES (?, '1')
+       ON CONFLICT(k) DO UPDATE SET v = CAST(CAST(v AS INTEGER) + 1 AS TEXT)
+       RETURNING v`,
+      SEQ_KEY,
+    );
+    if (!row) throw new Error('outbox seq counter failed');
+    return Number(row.v);
+  }
+
+  async get(id: string): Promise<OutboxRow | null> {
+    const db = await getDb();
+    const r = await db.getFirstAsync<Raw>('SELECT * FROM outbox WHERE id = ?', id);
+    return r ? toRow(r) : null;
   }
 
   async insert(row: OutboxRow): Promise<void> {
@@ -79,12 +86,8 @@ export class SqliteOutboxStore implements OutboxStore {
     await db.runAsync(`DELETE FROM outbox WHERE id IN (${ids.map(() => '?').join(',')})`, [...ids]);
   }
 
+  /** Serialized transaction. Do not nest runTx / atomic inside each other. */
   async atomic<T>(fn: () => Promise<T>): Promise<T> {
-    const db = await getDb();
-    let out: T | undefined;
-    await db.withTransactionAsync(async () => {
-      out = await fn();
-    });
-    return out as T;
+    return runTx(() => fn());
   }
 }

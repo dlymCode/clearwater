@@ -10,6 +10,7 @@ import {
   canResume, createJob, isComplete, markDone, markFailed, markProgress, nextFile, totals,
   type DownloadJob,
 } from '../lib/downloadState';
+import { staleVersionDirs, verifyDownload, versionDirName } from '../lib/downloadVerify';
 import type { InstalledAoi } from '../lib/tilesIndex';
 import { kvGet, kvSet } from './db';
 import { signTileUrl } from './supabase';
@@ -17,8 +18,8 @@ import { signTileUrl } from './supabase';
 const jobKey = (aoi: string): string => `download.job.${aoi}`;
 const installedKey = (aoi: string): string => `download.installed.${aoi}`;
 
-export const tilesDir = (aoi: string, version: string): string =>
-  `${FileSystem.documentDirectory ?? ''}tiles/${aoi}/${version.replace(/[^0-9A-Za-z_-]/g, '_')}/`;
+const aoiDir = (aoi: string): string => `${FileSystem.documentDirectory ?? ''}tiles/${aoi}/`;
+export const tilesDir = (aoi: string, version: string): string => `${aoiDir(aoi)}${versionDirName(version)}/`;
 
 export const localFileUri = (aoi: string, version: string, fileName: string): string => `${tilesDir(aoi, version)}${fileName}`;
 
@@ -57,6 +58,20 @@ export async function runDownload(
       }, f.resumeData);
       const res = await dl.downloadAsync();
       if (!res) return 'cancelled';
+      // expo-file-system writes ANY response body to disk: check the status and (when the index knows it) the size
+      // before trusting the file. A bad file is deleted and the layer marked failed so the next run restarts it.
+      const info = await FileSystem.getInfoAsync(dest);
+      const verdict = verifyDownload({
+        status: res.status,
+        expectedBytes: f.bytes,
+        actualBytes: info.exists && 'size' in info ? info.size : null,
+      });
+      if (!verdict.ok) {
+        await FileSystem.deleteAsync(dest, { idempotent: true }).catch(() => undefined);
+        job = markFailed({ ...job, files: job.files.map((x) => (x.layer === f.layer ? { ...x, resumeData: undefined, bytesDone: 0 } : x)) }, f.layer);
+        await kvSet(jobKey(entry.aoi), job);
+        return 'failed';
+      }
       job = markDone(job, f.layer);
     } catch {
       // Persist resume data so the next launch continues this file.
@@ -75,6 +90,15 @@ export async function runDownload(
       downloadedAt: new Date().toISOString(),
     } satisfies InstalledAoi);
     await kvSet(jobKey(entry.aoi), null);
+    await deleteOldVersions(entry.aoi, entry.version);
   }
   return 'done';
+}
+
+/** After a complete install, drop every other version directory of this AOI (hundreds of MB each). */
+async function deleteOldVersions(aoi: string, keepVersion: string): Promise<void> {
+  const entries = await FileSystem.readDirectoryAsync(aoiDir(aoi)).catch(() => [] as string[]);
+  for (const stale of staleVersionDirs(entries, versionDirName(keepVersion))) {
+    await FileSystem.deleteAsync(`${aoiDir(aoi)}${stale}`, { idempotent: true }).catch(() => undefined);
+  }
 }

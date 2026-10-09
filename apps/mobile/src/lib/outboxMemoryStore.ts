@@ -16,6 +16,11 @@ export class InMemoryOutboxStore implements OutboxStore {
     this.rows.set(row.id, { ...row });
   }
 
+  async get(id: string): Promise<OutboxRow | null> {
+    const r = this.rows.get(id);
+    return r ? { ...r } : null;
+  }
+
   async list(filter: { status?: OutboxStatus; kind?: OutboxKind } = {}): Promise<OutboxRow[]> {
     return [...this.rows.values()]
       .filter((r) => (!filter.status || r.status === filter.status) && (!filter.kind || r.kind === filter.kind))

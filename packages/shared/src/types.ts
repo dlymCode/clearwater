@@ -31,7 +31,8 @@ export interface GroupMember {
 
 export interface Ping {
   id: string;
-  author_id: string;
+  /** null for anonymous public pings (ping_feed hides it). */
+  author_id: string | null;
   /** null = public tier. */
   group_id: string | null;
   type: PingType;
@@ -40,6 +41,8 @@ export interface Ping {
   lon: number;
   note: string | null;
   created_at: string;
+  /** Server clock (ping_feed). Decay starts at least(created_at, received_at) so a future-dated ping cannot stay solid. */
+  received_at?: string;
   expires_at: string | null;
   score: number | null;
   /** Tide height (ft MLLW) at post time, when known. */
@@ -53,16 +56,24 @@ export interface Ping {
 
 export type VoteValue = 1 | -1;
 
+/**
+ * Row of the `ping_votes_feed` view: (ping_id, vote, created_at, voter_reputation, weight). voter_id and the voter's
+ * distance are deliberately NOT exposed (trilateration risk); `weight` is the server-precomputed w(d) in {1.0, 0.5, 0}.
+ */
 export interface PingVote {
   ping_id: string;
-  voter_id: string;
   vote: VoteValue;
-  /** Distance of the voter's last-known position to the ping, metres. null if unknown. */
-  voter_dist_m: number | null;
   created_at: string;
-  /** Voter reputation (R_i). Server includes it on pull. */
   voter_reputation?: number;
-  updated_at?: string;
+  /** Server-precomputed distance weight w(d); the client never recomputes it from a distance. */
+  weight?: number;
+}
+
+/** The signed-in user's own vote (read from ping_votes where voter_id = auth.uid(), or queued locally). */
+export interface MyVote {
+  ping_id: string;
+  vote: VoteValue;
+  created_at: string;
 }
 
 export interface Message {
@@ -72,6 +83,8 @@ export interface Message {
   body: string;
   ping_id: string | null;
   created_at: string;
+  /** Server clock; the inbound sync cursor for messages. */
+  received_at?: string;
   author_handle?: string | null;
   updated_at?: string;
 }
@@ -121,6 +134,9 @@ export interface TidePredictions {
   name: string;
   datum: 'MLLW';
   units: 'ft';
+  /** Station coordinates (pipeline adds them from the CO-OPS metadata API); nearest-station picking uses them. */
+  lat?: number;
+  lon?: number;
   predictions: TidePrediction[];
 }
 

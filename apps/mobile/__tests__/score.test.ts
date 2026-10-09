@@ -15,7 +15,7 @@ const H = 3_600_000;
 const vote = (v: 1 | -1, dist: number | null, rep = 1, hoursAfter = 1): ScoreVote => ({
   vote: v,
   voterReputation: rep,
-  voterDistM: dist,
+  weight: distanceWeight(dist), // the app receives this precomputed from ping_votes_feed
   createdAt: T0 + hoursAfter * H,
 });
 
@@ -90,6 +90,43 @@ describe('golden vectors (the SQL function must produce these)', () => {
   it.each(cases)('%s', (_name, rep, votes, hours, expected) => {
     const s = pingScore({ authorReputation: rep, createdAt: T0, votes, now: T0 + hours * H });
     expect(s).toBeCloseTo(expected, 12);
+  });
+});
+
+describe('t0 = least(created_at, received_at): a future-dated ping cannot stay solid', () => {
+  it('decay starts at the earlier of device and server time', () => {
+    const created = T0 + 10 * H; // device clock claims 10 h in the future
+    const received = T0; // server saw it at T0
+    const now = T0 + 24 * H;
+    const gamed = pingScore({ authorReputation: 1, createdAt: created, votes: [], now });
+    const honest = pingScore({ authorReputation: 1, createdAt: created, receivedAt: received, votes: [], now });
+    expect(honest).toBeCloseTo(0.5, 12); // 24 h since the server received it
+    expect(gamed).toBeGreaterThan(honest); // without received_at the future-dated ping looks 14 h old
+  });
+  it('received_at later than created_at (offline ping synced later) does not shorten decay', () => {
+    const s = pingScore({ authorReputation: 1, createdAt: T0, receivedAt: T0 + 20 * H, votes: [], now: T0 + 24 * H });
+    expect(s).toBeCloseTo(0.5, 12);
+  });
+  it('locally created unsynced pings (no received_at) use created_at; null is the same as absent', () => {
+    const a = pingScore({ authorReputation: 1, createdAt: T0, votes: [], now: T0 + 12 * H });
+    expect(pingScore({ authorReputation: 1, createdAt: T0, receivedAt: null, votes: [], now: T0 + 12 * H })).toBe(a);
+  });
+  it('a confirm after t0 still resets t_last', () => {
+    const s = pingScore({ authorReputation: 1, createdAt: T0 + 5 * H, receivedAt: T0, votes: [vote(1, 100, 1, 20)], now: T0 + 24 * H });
+    expect(s).toBeCloseTo(2 * Math.pow(0.5, 4 / 24), 12);
+  });
+});
+
+describe('uses the server-precomputed weight, in created_at order', () => {
+  it('weight 0.5 from the feed scales the vote regardless of any distance', () => {
+    const v: ScoreVote = { vote: 1, voterReputation: 2, weight: 0.5, createdAt: T0 };
+    expect(pingScore({ authorReputation: 1, createdAt: T0, votes: [v], now: T0 })).toBe(2);
+  });
+  it('input order does not matter (sorted by created_at)', () => {
+    const a = vote(1, 100, 1.3, 1), b = vote(1, 300, 0.7, 2), c = vote(-1, 100, 0.9, 3);
+    const x = pingScore({ authorReputation: 1.1, createdAt: T0, votes: [a, b, c], now: T0 + 6 * H });
+    const y = pingScore({ authorReputation: 1.1, createdAt: T0, votes: [c, a, b], now: T0 + 6 * H });
+    expect(Math.abs(x - y)).toBeLessThan(1e-12);
   });
 });
 

@@ -19,7 +19,8 @@ const config: ExpoConfig = {
         'Sound Maps shows your boat on the map and rounds your last position to 100 m so other boats can confirm hazards near you.',
       NSLocalNetworkUsageDescription:
         'Sound Maps connects to your boat\'s WiFi NMEA gateway to read the depth sounder.',
-      UIBackgroundModes: ['location', 'fetch'],
+      // No 'location' background mode: location is foreground-only for now (App Store review + privacy). Add it with S7-1.
+      UIBackgroundModes: ['fetch'],
     },
   },
   plugins: [

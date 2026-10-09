@@ -26,7 +26,8 @@ export const DEFAULT_SETTINGS: AppSettings = {
   nmeaHost: '192.168.4.1', // Yacht Devices YDWG-02 default AP address; confirm per gateway
   nmeaPort: 1456, // YDWG-02 default NMEA 0183 TCP port; UDP gateways commonly use 10110
   nmeaProtocol: 'tcp',
-  sharePosition: true,
+  /** Default OFF (privacy): the user opts in explicitly during onboarding. */
+  sharePosition: false,
   acceptedDisclaimerAt: null,
   toggles: DEFAULT_TOGGLES,
 };
@@ -66,7 +67,7 @@ export function mergeSettings(stored: unknown): AppSettings {
     nmeaHost: typeof o.nmeaHost === 'string' && o.nmeaHost ? o.nmeaHost : DEFAULT_SETTINGS.nmeaHost,
     nmeaPort: Number.isInteger(o.nmeaPort) ? (o.nmeaPort as number) : DEFAULT_SETTINGS.nmeaPort,
     nmeaProtocol: o.nmeaProtocol === 'udp' ? 'udp' : 'tcp',
-    sharePosition: o.sharePosition !== false,
+    sharePosition: o.sharePosition === true,
     acceptedDisclaimerAt: typeof o.acceptedDisclaimerAt === 'string' ? o.acceptedDisclaimerAt : null,
     toggles: { ...DEFAULT_TOGGLES, ...(typeof o.toggles === 'object' && o.toggles ? o.toggles : {}) },
   };
