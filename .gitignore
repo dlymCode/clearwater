@@ -1,0 +1,29 @@
+# Dependencies
+node_modules/
+
+# Expo / React Native
+.expo/
+dist/
+build/
+
+# Python
+__pycache__/
+.pytest_cache/
+*.pyc
+
+# Secrets and environment
+.env
+.env.*
+!.env.example
+
+# Pipeline data (downloads, intermediate rasters, tiles)
+data/
+*.tif
+*.laz
+*.pmtiles
+
+# OS and tooling
+.DS_Store
+coverage/
+.wrangler/
+supabase/.temp

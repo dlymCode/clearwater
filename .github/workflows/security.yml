@@ -1,0 +1,87 @@
+name: security
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gitleaks:
+    name: Secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  npm-audit:
+    name: npm audit (non-blocking)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Advisory only: report, do not fail the build.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Audit apps/mobile
+        if: always()
+        working-directory: apps/mobile
+        run: |
+          if [ -f package-lock.json ]; then
+            npm audit --audit-level=high || echo "::warning::npm audit reported issues in apps/mobile"
+          else
+            echo "::notice::No package-lock.json in apps/mobile; skipping audit"
+          fi
+
+      - name: Audit workers/tile-auth
+        if: always()
+        working-directory: workers/tile-auth
+        run: |
+          if [ -f package-lock.json ]; then
+            npm audit --audit-level=high || echo "::warning::npm audit reported issues in workers/tile-auth"
+          else
+            echo "::notice::No package-lock.json in workers/tile-auth; skipping audit"
+          fi
+
+  pip-audit:
+    name: pip-audit (non-blocking)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Advisory only: report, do not fail the build.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install pip-audit
+        run: pip install pip-audit
+
+      - name: Audit pipeline requirements
+        run: |
+          if [ -f pipeline/requirements.txt ]; then
+            pip-audit -r pipeline/requirements.txt || echo "::warning::pip-audit reported issues in pipeline"
+          else
+            echo "::notice::pipeline/requirements.txt not found; skipping audit"
+          fi

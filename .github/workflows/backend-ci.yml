@@ -1,0 +1,65 @@
+name: backend-ci
+
+on:
+  push:
+    paths:
+      - "supabase/**"
+      - "workers/**"
+      - ".github/workflows/backend-ci.yml"
+  pull_request:
+    paths:
+      - "supabase/**"
+      - "workers/**"
+      - ".github/workflows/backend-ci.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: backend-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pgtap:
+    name: pgTAP (supabase db)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Local Supabase needs Docker and a project that is fully provisioned.
+    # Keep this non-blocking until the migrations and tests are verified in CI;
+    # remove this line once the job is reliably green.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Supabase CLI
+        uses: supabase/setup-cli@v1
+        with:
+          version: latest
+
+      - name: Start local Supabase stack
+        run: supabase db start
+
+      - name: Run pgTAP tests
+        run: supabase test db
+
+  workers-tile-auth:
+    name: Node tests (workers/tile-auth)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: workers/tile-auth
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Run tests
+        run: npm test
