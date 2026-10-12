@@ -17,13 +17,14 @@ GTX     ?=
 # ENC COALNE GeoJSON for the MANDATORY shoreline datum check (produced by the tiles vector stage)
 COALNE  ?= $(wildcard $(DATA)/$(AOI)/tiles/enc_geojson/*_COALNE.geojson)
 PUBLISH_FLAGS ?=
+FLEET_FLAGS ?=
 # Dev-only overrides for validate: --skip-waterline-gate --skip-shoreline-check (never for a real publish)
 VALIDATE_FLAGS ?=
 
 PYRUN = cd $(ROOT) && $(PY) -m
 
 .PHONY: all test lint tides schema-check $(AOIS) run-aoi need-aoi \
-        step-fetch step-laz step-mllw step-align step-meta step-waterline step-merge step-validate step-tiles step-tides step-publish
+        step-fetch step-laz step-mllw step-align step-meta step-waterline step-merge step-validate step-tiles step-tides step-publish step-load-baseline step-fleet fleet-all
 .NOTPARALLEL:
 
 # `make all`: fetch tides ONCE, then run each AOI (SKIP_TIDES stops step-publish re-fetching them 5 times).
@@ -75,6 +76,20 @@ step-tides:
 
 step-publish: need-aoi $(if $(SKIP_TIDES),,step-tides)
 	$(PYRUN) pipeline.publish --aoi $(AOI) --data-dir $(DATA) $(PUBLISH_FLAGS)
+
+# NOT part of run-aoi. Run explicitly AFTER publish: loads the merged baseline into Postgres
+# (public.baseline_cells, elevation ft MLLW positive up) so the server's 15 ft hold rule can fire.
+# Needs SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY and the `h3` package.
+step-load-baseline: need-aoi
+	$(PYRUN) pipeline.load_baseline --aoi $(AOI) --data-dir $(DATA)
+
+# Nightly fleet layer (FLT-6): published depth_cells -> fleet.pmtiles + fleet_meta.pmtiles, uploaded under the
+# AOI's current version. Needs SUPABASE_* and R2_* env vars. NOT part of run-aoi.
+step-fleet: need-aoi
+	$(PYRUN) pipeline.fleet_tiles --aoi $(AOI) --data-dir $(DATA) $(FLEET_FLAGS)
+
+fleet-all:
+	@set -e; for a in $(AOIS); do $(MAKE) AOI=$$a step-fleet; done
 
 # Daily: 30 days of tide predictions, one JSON per station
 tides: step-tides

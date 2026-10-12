@@ -34,7 +34,7 @@ Steps are modules: `python -m pipeline.<module> --aoi <slug> [--data-dir data]`.
 | 6 merge | `merge` | `merge/merged_{elev,src,date,unc}.tif` |
 | 7 validate | `validate` | `validate/report.{html,json}`; **exit 1 unless every gate below passes**. In the Makefile it runs *after* `tiles` (it needs `tiles/depth_rgb.tif` and the COALNE GeoJSON) and before `publish` |
 | 8 tiles | `tiles` | `tiles/{depth,depth_meta,waterline,base}.pmtiles`, optional `land.pmtiles` (see below) |
-| 9 publish | `publish` | R2 `tiles/<aoi>/<version>/...` + `tiles/index.json` (schema: `schemas/tiles_index.schema.json`), plus flat `tides/<station_id>.json` |
+| 9 publish | `publish` (+ `load_baseline`, `fleet_tiles` run separately, see below) | R2 `tiles/<aoi>/<version>/...` + `tiles/index.json` (schema: `schemas/tiles_index.schema.json`), plus flat `tides/<station_id>.json` |
 
 `merged_src` codes (uint8, `common.SOURCES`): 1 bluetopo, 2 ehydro, 3 lidar_ncmp, 4 lidar_2014,
 5 wa_lidar, 6 cudem, 7 coned, 8 waterline (only joins the merge with `--include-waterline`); 0 = hole.
@@ -52,6 +52,46 @@ abort the publish. In CI/cron the daily job is just `make tides` + `python -m pi
 `fetch_tides` isolates stations: one failing station is reported on stderr (`FAILED <id>: ...`), the others are still
 written, and the exit code is non-zero. Uploaded files must also have finite in-range `lat`/`lon` and strictly time-ordered,
 well-formed `predictions`. Hi/lo interpolation refuses unsorted/duplicate-conflicting/non-finite events and gaps over 10 h.
+
+## Server feeds: baseline loader and nightly fleet layer
+
+Both talk to Supabase through plain REST (`supabase_rest.py`, stdlib only) with the **service role** key
+(`SUPABASE_URL` https + `SUPABASE_SERVICE_ROLE_KEY`, environment only, never logged). Both need the `h3` package
+(imported lazily; `pip install h3`). Neither is part of `make <aoi>`.
+
+### `load_baseline` - makes the server's 15 ft hold rule fire (`make AOI=skagit step-load-baseline`)
+
+Run explicitly **after `publish`**. Reads `merge/merged_elev.tif` + `merged_date.tif`, enumerates every H3 res-12
+cell whose **centre** lies on valid data (sparse 8 m lattice + margin, then centre sampling; no-data and out-of-range
+(|z| > 2000 ft) centres are skipped) and upserts `(cell_id, baseline_elev_ft, source_date)` into `public.baseline_cells`
+(`on_conflict=cell_id`, 1000 rows per request). **`baseline_elev_ft` is ELEVATION ft MLLW, positive up, exactly the
+`merged_elev` value** (12 ft of water = -12); uploads are depth positive down, so the *server* negates the baseline when
+comparing - the loader never does. `source_date` is null where the merged date is no-data. It refuses to run unless the
+AOI's validation report passes the same checks `publish` requires and is newer than the merged rasters. `--dry-run` counts
+rows without credentials. Skagit-sized AOIs are ~1M cells: expect a few minutes and ~1 GB of RAM (both rasters are read whole).
+
+### `fleet_tiles` - nightly FLT-6 rebuild (`make AOI=skagit step-fleet`, or `make fleet-all`)
+
+1. `GET depth_cells?boats=gte.3&day=gte.<today-90>` (paged), then the rule is **re-applied client-side** because the service role
+   bypasses RLS: only well-formed daily rows with `boats >= 3`, `today-90 <= day <= today`. A cell seen by two boats on each of
+   several days is still unpublished (distinct boats across days cannot be known by design, so `boats` is the per-day max, not a sum).
+2. Per cell: median = n-weighted median of the daily medians, boats = max daily boats, newest day.
+3. Each H3 res-12 cell paints a disc of radius 8.14 m (the hexagon inradius) on the 2 m AOI grid.
+4. **Depth is NEGATED to elevation before Terrain-RGB encoding** (`depth_cells.median_ft` is positive down), so the app decodes
+   `fleet.pmtiles` with the same decoder and sign as `depth.pmtiles` (12 ft of water decodes as -12).
+5. `fleet_meta.pmtiles` (RGBA): R = boats (clamped 255), G/B = newest contributing day (uint16 days since 1880, same epoch as
+   `depth_meta`), A = validity flag. Like `depth_meta` it is not in `tiles/index.json`; the app derives the path from `fleet.pmtiles`.
+6. Both are built with the existing raster helpers (z10-z16, nearest resampling) and uploaded to the AOI's **current** version
+   directory `tiles/<aoi>/<version>/{fleet,fleet_meta}.pmtiles`; only that AOI's `fleet` entry (`path`, `bytes`) in the live
+   `tiles/index.json` changes. No published cells on the grid => `bytes: 0`, nothing uploaded, last night's files deleted locally.
+   The AOI must already be in the live index (publish the baseline first). Needs `SUPABASE_*` and `R2_*`. The index update is a
+   read-modify-write: do not schedule it at the same moment as a baseline publish of the same AOI.
+
+Nightly cron (after the 00:00 UTC depth roll-up; one AOI at a time so a failure stays contained):
+
+```cron
+15 3 * * *  cd /srv/clearwater && set -a && . ./.env.pipeline && set +a && make -C pipeline fleet-all >> /var/log/clearwater-fleet.log 2>&1
+```
 
 ## Gates (all fail closed)
 

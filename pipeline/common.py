@@ -24,6 +24,8 @@ OUT_CRS = "EPSG:3857"  # tiles only, at the very end
 CELL_M = 2.0  # working-grid cell size, metres
 SNAP_M = 1000.0  # grid origin snapped to a multiple of this, metres
 
+H3_RESOLUTION = 12  # fleet/baseline cells (~9.4 m edge, ~307 m2); the database domain h3_res12 is the same
+
 FT_PER_M = 3.280839895013123  # international foot
 TARGET_DATUM = "MLLW"
 TARGET_UNITS = "ft"

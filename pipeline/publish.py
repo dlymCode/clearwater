@@ -26,6 +26,7 @@ Safety gates (always on, also for a direct ``python -m pipeline.publish``; the C
 from __future__ import annotations
 
 import argparse
+import copy
 import datetime as dt
 import json
 import os
@@ -139,8 +140,9 @@ class PublishRefused(RuntimeError):
 MERGED_RASTERS = ("merged_elev.tif", "merged_src.tif", "merged_date.tif", "merged_unc.tif")
 
 
-def check_publish_gates(aoi: str, data_dir: Path, tile_files: Sequence[Path]) -> None:
-    """Raise :class:`PublishRefused` unless validation passed on exactly these (fresh) tiles."""
+def check_validation_report(aoi: str, data_dir: Path) -> Path:
+    """Raise :class:`PublishRefused` unless ``validate/report.json`` is a complete, passing, override-free
+    report for exactly this AOI. Returns the report path."""
     report_path = step_dir(data_dir, aoi, "validate") / "report.json"
     if not report_path.exists():
         raise PublishRefused(f"{report_path} missing: run `validate` before publishing")
@@ -176,15 +178,26 @@ def check_publish_gates(aoi: str, data_dir: Path, tile_files: Sequence[Path]) ->
     problems += [f"{n}: did not pass" for n in failing if n not in REQUIRED_CHECKS]
     if problems:
         raise PublishRefused("validation report incomplete: " + "; ".join(problems))
-    report_mtime = report_path.stat().st_mtime
-    stale_report = [p.name for p in tile_files if p.stat().st_mtime >= report_mtime]
-    if stale_report:
-        raise PublishRefused(f"tiles changed after validation ({', '.join(stale_report)}); rerun validate")
+    return report_path
+
+
+def merge_outputs_mtime(aoi: str, data_dir: Path) -> float:
+    """Newest mtime among the four merged rasters; raises :class:`PublishRefused` if any is missing."""
     merge_dir = step_dir(data_dir, aoi, "merge")
     missing = [n for n in MERGED_RASTERS if not (merge_dir / n).exists()]
     if missing:
         raise PublishRefused(f"missing merge output(s): {', '.join(missing)}")
-    newest_merge = max((merge_dir / n).stat().st_mtime for n in MERGED_RASTERS)
+    return max((merge_dir / n).stat().st_mtime for n in MERGED_RASTERS)
+
+
+def check_publish_gates(aoi: str, data_dir: Path, tile_files: Sequence[Path]) -> None:
+    """Raise :class:`PublishRefused` unless validation passed on exactly these (fresh) tiles."""
+    report_path = check_validation_report(aoi, data_dir)
+    report_mtime = report_path.stat().st_mtime
+    stale_report = [p.name for p in tile_files if p.stat().st_mtime >= report_mtime]
+    if stale_report:
+        raise PublishRefused(f"tiles changed after validation ({', '.join(stale_report)}); rerun validate")
+    newest_merge = merge_outputs_mtime(aoi, data_dir)
     stale_tiles = [p.name for p in tile_files if p.stat().st_mtime < newest_merge]
     if stale_tiles:
         raise PublishRefused(f"tiles older than the merged rasters ({', '.join(stale_tiles)}); rerun tiles")
@@ -317,6 +330,53 @@ def publish_aoi(aoi: str, data_dir: Path, store: ObjectStore, *, version: str | 
     local_index.write_text(json.dumps(index, indent=2) + "\n")
     if not dry_run:
         for local, key in uploads:  # data first, index last: the app never sees a dangling version
+            store.upload_file(local, key)
+        store.put_json(INDEX_KEY, index)
+    return index
+
+
+FLEET_FILES = ("fleet.pmtiles", "fleet_meta.pmtiles")
+
+
+def publish_fleet(aoi: str, tiles_dir: Path, store: ObjectStore, *, now: dt.datetime | None = None,
+                  dry_run: bool = False) -> dict:
+    """Publish the nightly fleet layer under the AOI's CURRENT version directory and update only that AOI's
+    ``fleet`` entry in the live ``tiles/index.json`` (other AOIs and the baseline files are untouched).
+
+    No ``fleet.pmtiles`` in ``tiles_dir`` (no published cells tonight) sets ``bytes: 0`` in the index - the app
+    treats that as "not available" - and uploads nothing. The index is read-modify-written, so avoid running it
+    at the same instant as a baseline publish of the same AOI.
+    """
+    now = now or dt.datetime.now(dt.timezone.utc)
+    live = store.get_json(INDEX_KEY)
+    if live is None:
+        raise PublishRefused("no live tiles/index.json: publish the baseline before the fleet layer")
+    index = copy.deepcopy(check_existing_index(live))
+    entry = next((a for a in index["aois"] if a.get("aoi") == aoi), None)
+    if entry is None:
+        raise PublishRefused(f"AOI {aoi!r} is not in the live index: publish its baseline first")
+    version = entry.get("version")
+    parse_version(version if isinstance(version, str) else "")  # the CURRENT version directory, strictly validated
+    fleet, meta = Path(tiles_dir) / FLEET_FILES[0], Path(tiles_dir) / FLEET_FILES[1]
+    uploads: list[tuple[Path, str]] = []
+    size = 0
+    if fleet.exists():
+        if not meta.exists():
+            raise PublishRefused("fleet.pmtiles without fleet_meta.pmtiles: refusing a half-built fleet layer")
+        size = fleet.stat().st_size
+        if size == 0 or meta.stat().st_size == 0:
+            raise PublishRefused("zero-byte fleet tile file")
+        uploads = [(fleet, f"tiles/{aoi}/{version}/{FLEET_FILES[0]}"), (meta, f"tiles/{aoi}/{version}/{FLEET_FILES[1]}")]
+    files = entry.get("files")
+    if not isinstance(files, dict):
+        raise PublishRefused(f"live index entry for {aoi} has no files object")
+    files["fleet"] = {"path": f"tiles/{aoi}/{version}/{FLEET_FILES[0]}", "bytes": int(size)}
+    index["updated_at"] = iso_z(now)
+    errors = validate_index(index)
+    if errors:
+        raise ValueError("tiles index failed schema validation: " + "; ".join(errors))
+    if not dry_run:
+        for local, key in uploads:  # data first, index last
             store.upload_file(local, key)
         store.put_json(INDEX_KEY, index)
     return index

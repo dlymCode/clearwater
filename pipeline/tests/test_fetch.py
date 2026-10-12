@@ -95,7 +95,7 @@ def test_all_modules_import_without_geo_stack():
         "    sys.modules[n] = None\n"
         "import importlib\n"
         "for m in ('common','geo','coops','jsonschema_lite','fetch_baseline','fetch_tides','to_mllw','align','source_meta',"
-        "'waterline_dem','merge','validate','tiles','publish'):\n"
+        "'waterline_dem','merge','validate','tiles','publish','supabase_rest','load_baseline','fleet_tiles'):\n"
         "    importlib.import_module('pipeline.' + m)\n"
         "print('ok')\n"
     )

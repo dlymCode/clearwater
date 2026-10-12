@@ -116,6 +116,39 @@ def unpack_source_date(rgba: np.ndarray) -> dict[str, np.ndarray]:
     }
 
 
+# ------------------------------------------------------------------ fleet meta (boats / newest day)
+MAX_BOATS_PACKED = 255
+
+
+def pack_fleet_meta(boats: np.ndarray, day: np.ndarray) -> np.ndarray:
+    """(H, W) boats (0 = hole) and newest contributing day (int32 days since 1970) -> (H, W, 4) uint8 RGBA.
+
+    R = distinct-boat count (clamped to 255), G,B = big-endian uint16 days since 1880-01-01 (same epoch as
+    ``depth_meta``), A = 255 valid / 0 hole (alpha is only a validity flag; RGB zeroed in holes).
+    Published cells always have boats >= 3; the app may still hatch ``boats < 3`` as defense in depth.
+    """
+    boats = np.asarray(boats)
+    day = np.asarray(day).astype(np.int64)
+    hole = (boats <= 0) | (day == DATE_NODATA)
+    shifted = day + _DATE_EPOCH_SHIFT
+    clamped = int((~hole & ((shifted < 0) | (shifted > 65535))).sum())
+    if clamped:
+        log.warning("%d fleet cell date(s) outside the packable 1880-01-01..2059-06 range were clamped", clamped)
+    d16 = np.clip(shifted, 0, 65535).astype(np.uint16)
+    r = np.clip(boats, 0, MAX_BOATS_PACKED).astype(np.uint8)
+    out = np.stack([r, (d16 >> 8).astype(np.uint8), (d16 & 0xFF).astype(np.uint8), np.where(hole, 0, 255).astype(np.uint8)], axis=-1)
+    out[hole] = 0
+    return out
+
+
+def unpack_fleet_meta(rgba: np.ndarray) -> dict[str, np.ndarray]:
+    a = np.asarray(rgba)
+    valid = a[..., 3] == 255
+    d16 = (a[..., 1].astype(np.int64) << 8) | a[..., 2].astype(np.int64)
+    return {"valid": valid, "boats": np.where(valid, a[..., 0], 0).astype(np.uint8),
+            "day": np.where(valid, d16 - _DATE_EPOCH_SHIFT, DATE_NODATA).astype(np.int32)}
+
+
 # ------------------------------------------------------------------ subprocess wrappers
 def require_tool(name: str) -> str:
     path = shutil.which(name)
@@ -152,7 +185,7 @@ def raster_pmtiles_cmds(rgb_tif: str | Path, workdir: str | Path, out_pmtiles: s
     ``meta`` (source/date/unc RGBA) ships as ``depth_meta.pmtiles`` next to ``depth.pmtiles``; it is
     not listed in ``tiles/index.json`` (contract has no slot for it) - the app derives its path by convention.
     """
-    zmin, zmax = ZOOMS["depth" if kind == "meta" else kind]
+    zmin, zmax = ZOOMS[{"meta": "depth", "fleet_meta": "fleet"}.get(kind, kind)]
     wd = Path(workdir)
     merc, mb = wd / f"{kind}_3857.tif", wd / f"{kind}.mbtiles"
     return [gdalwarp_3857_cmd(rgb_tif, merc), mbtiles_cmd(merc, mb, zmin, zmax), pmtiles_convert_cmd(mb, out_pmtiles)]
@@ -188,7 +221,7 @@ def tippecanoe_cmd(layers: Mapping[str, str | Path | Sequence[str | Path]], out_
 
 
 # ------------------------------------------------------------------ IO + CLI (rasterio, lazy)
-def _write_rgb_tif(path: Path, arr: np.ndarray, grid_ref: Path) -> None:
+def write_rgb_geotiff(path: Path, arr: np.ndarray, grid_ref: Path) -> None:
     import rasterio  # lazy
 
     with rasterio.open(grid_ref) as ref:
@@ -226,7 +259,7 @@ def stage_raster(aoi: str, data_dir: Path) -> list[Path]:
     made: list[Path] = []
     for kind, arr in products:
         tif = out / f"{kind}_rgb.tif"
-        _write_rgb_tif(tif, arr, ref)
+        write_rgb_geotiff(tif, arr, ref)
         pm = out / ("depth_meta.pmtiles" if kind == "meta" else f"{kind}.pmtiles")
         for cmd in raster_pmtiles_cmds(tif, out, pm, kind):
             run(cmd)

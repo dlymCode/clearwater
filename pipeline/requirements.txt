@@ -8,3 +8,4 @@ pystac-client>=0.8
 planetary-computer>=1.0
 boto3>=1.34
 BlueTopo>=0.5
+h3>=4.0  # load_baseline / fleet_tiles (imported lazily)
