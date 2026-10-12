@@ -155,7 +155,8 @@ class CudemFetcher:
         paths: list[Path] = []
         for t in self.plan(aoi):
             dest = out_dir / "cudem" / t.name
-            if not dest.exists():  # reruns are safe
+            if not manifest.is_intact(dest):  # skip only a file whose checksum matches what we recorded
+                dest.unlink(missing_ok=True)  # a 0-byte / truncated / altered leftover is never trusted
                 self._download(t.url, dest)
             vy = parse_version_year(t.name)
             manifest.add_file(dest, source_url=t.url, source="cudem", kind="dem",
@@ -167,11 +168,14 @@ class CudemFetcher:
 
 # ------------------------------------------------------------------ BlueTopo
 class BlueTopoFetcher:
-    """Wrapper around the NOAA ``BlueTopo`` package (``pip install BlueTopo``, import ``nbs.bluetopo``).
+    """Wrapper around the NOAA ``BlueTopo`` package (``pip install BlueTopo``).
 
-    The package import is lazy and the callable is injectable so this is mockable. The
-    exact ``fetch_tiles`` signature should be confirmed against the pinned BlueTopo
-    version in S0-3 (TODO: not verifiable offline).
+    Verified against the BlueTopo 0.5.0 wheel: the entry point is
+    ``nbs.bluetopo.fetch_tiles.main(project_dir, desired_area_filename=None, untrack_missing=False,
+    data_source=None)`` (``nbs.bluetopo`` is a namespace package, so ``from nbs.bluetopo import fetch_tiles``
+    would give the *module*, not a function). ``project_dir`` must be absolute; it returns
+    ``(successful_downloads, failed_downloads)`` and verifies the published checksums itself. The package
+    needs GDAL's ``osgeo`` bindings, so the import stays lazy and the callable injectable.
     """
 
     def __init__(self, fetch_fn: Callable[..., Any] | None = None) -> None:
@@ -179,9 +183,9 @@ class BlueTopoFetcher:
 
     def _fn(self) -> Callable[..., Any]:
         if self._fetch_fn is None:
-            from nbs.bluetopo import fetch_tiles  # lazy: heavy GDAL-dependent package
+            from nbs.bluetopo.fetch_tiles import main as fetch_tiles_main  # lazy: GDAL-dependent package
 
-            self._fetch_fn = fetch_tiles
+            self._fetch_fn = fetch_tiles_main
         return self._fetch_fn
 
     @staticmethod
@@ -193,12 +197,17 @@ class BlueTopoFetcher:
                               "geometry": {"type": "Polygon", "coordinates": [ring]}}]}
 
     def fetch(self, aoi: AOI, out_dir: Path, manifest: Manifest) -> list[Path]:
-        root = out_dir / "bluetopo"
+        root = (out_dir / "bluetopo").resolve()
         root.mkdir(parents=True, exist_ok=True)
         area = root / "aoi.geojson"
         area.write_text(json.dumps(self.aoi_geojson(aoi)))
-        self._fn()(str(root), desired_area_filename=str(area))
+        result = self._fn()(str(root), desired_area_filename=str(area))
+        if isinstance(result, (list, tuple)) and len(result) == 2 and result[1]:
+            raise RuntimeError(f"BlueTopo failed to download/verify tile(s): {result[1]}")
         found = sorted(root.rglob("*.tiff")) + sorted(root.rglob("*.tif"))
+        empty = [p.name for p in found if p.stat().st_size == 0]
+        if empty:
+            raise RuntimeError(f"BlueTopo produced zero-byte file(s): {', '.join(empty)}; delete them and rerun")
         for p in found:
             # BlueTopo tiles are MLLW metres; the fetcher verifies published checksums itself.
             manifest.add_file(p, source_url="s3://noaa-ocs-nationalbathymetry-pds/BlueTopo/",
@@ -235,8 +244,8 @@ class TideTagger:
         assert station.id
         if station.id not in self._events:
             pad = dt.timedelta(days=2)
-            self._events[station.id] = self.client.hilo(station.id, window[0] - pad, window[1] + pad)
-        return coops.cosine_interpolate(self._events[station.id], when)
+            self._events[station.id] = coops.normalize_events(self.client.hilo(station.id, window[0] - pad, window[1] + pad))
+        return coops.cosine_interpolate(self._events[station.id], when, validated=True)
 
 
 # ------------------------------------------------------------------ Sentinel-2
@@ -307,7 +316,8 @@ class Sentinel2Searcher:
 
         for band, href in scene.assets.items():
             dest = out_dir / "s2" / scene.id / f"{band}.tif"
-            if not dest.exists():
+            if not manifest.is_intact(dest):
+                dest.unlink(missing_ok=True)
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 with rasterio.open(href) as src:
                     b = transform_bounds("EPSG:4326", src.crs, *aoi.bbox)

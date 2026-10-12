@@ -91,7 +91,7 @@ def test_command_builders_do_not_execute_and_use_nearest():
     zmin, zmax = ZOOMS["waterline"]
     assert f"MINZOOM={zmin}" in cmds[1] and f"MAXZOOM={zmax}" in cmds[1] and "RESAMPLING=NEAREST" in cmds[1]
     assert cmds[2] == ["pmtiles", "convert", "work/waterline.mbtiles", "out.pmtiles"]
-    assert tiles.gdal2tiles_cmd("a.tif", "o", 8, 16)[:3] == ["gdal2tiles.py", "--xyz", "-r"]
+    assert not hasattr(tiles, "gdal2tiles_cmd")  # dead code removed; the MBTILES route is the only one
 
 
 def test_enc_layers_and_tippecanoe():
@@ -103,7 +103,7 @@ def test_enc_layers_and_tippecanoe():
 
 
 def test_tippecanoe_tiles_every_enc_cell_per_layer(tmp_path):
-    t = tiles.tippecanoe_cmd({"WRECKS": ["a_WRECKS.geojson", "b_WRECKS.geojson"], "DEPARE": "a_DEPARE.geojson"}, "o.pmtiles")
+    t = tiles.tippecanoe_cmd({"WRECKS": ["a_WRECKS.geojson", "b_WRECKS.geojson"], "DEPARE": "a_DEPARE.geojson"}, "o.pmtiles", 8, 16)
     assert t.count("-L") == 3 and "WRECKS:a_WRECKS.geojson" in t and "WRECKS:b_WRECKS.geojson" in t
     for cell in ("US5WA10M", "US5WA11M", "US5WA12M"):
         for layer in ("DEPARE", "COALNE"):

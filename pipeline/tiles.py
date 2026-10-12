@@ -71,19 +71,21 @@ _DATE_EPOCH_SHIFT = (dt.date(1970, 1, 1) - dt.date(1880, 1, 1)).days  # 32872
 
 
 def encode_unc_index(unc_ft: np.ndarray) -> np.ndarray:
-    """Bucket index 0..14 (round up, clamp >= 45 ft to 14); NaN -> 15 (unknown, used for nothing else)."""
+    """Bucket index 0..14 (round up, clamp >= 45 ft to 14); NaN/inf/negative -> 15 (unknown, used for nothing else)."""
     u = np.asarray(unc_ft, dtype=np.float64)
+    known = np.isfinite(u) & (u >= 0)  # negative uncertainty is bad data, never "0 ft": treat as unknown
     levels = np.asarray(UNC_LEVELS_FT)
-    idx = np.searchsorted(levels, np.where(np.isfinite(u), u, 0.0), side="left")  # smallest level >= u
+    idx = np.searchsorted(levels, np.where(known, u, 0.0), side="left")  # smallest level >= u
     idx = np.minimum(idx, len(levels) - 1)
-    return np.where(np.isfinite(u), idx, UNC_UNKNOWN_INDEX).astype(np.uint8)
+    return np.where(known, idx, UNC_UNKNOWN_INDEX).astype(np.uint8)
 
 
 def pack_source_date(src: np.ndarray, date: np.ndarray, unc_ft: np.ndarray) -> np.ndarray:
     """(H, W) src uint8, date int32 days-since-1970, unc float ft -> (H, W, 4) uint8 RGBA."""
-    src = np.asarray(src).astype(np.uint8)
-    if src.size and src.max() > 15:
-        raise ValueError("source codes above 15 do not fit in 4 bits")
+    src_in = np.asarray(src)
+    if src_in.size and (src_in.max() > 15 or src_in.min() < 0):  # check BEFORE the uint8 cast (256 would wrap to 0)
+        raise ValueError("source codes must be 0..15 to fit in 4 bits")
+    src = src_in.astype(np.uint8)
     date = np.asarray(date).astype(np.int64)
     hole = (src == 0) | (date == DATE_NODATA)
     shifted = date + _DATE_EPOCH_SHIFT
@@ -140,10 +142,6 @@ def mbtiles_cmd(src_3857: str | Path, dst_mbtiles: str | Path, zmin: int, zmax: 
             "-co", "RESAMPLING=NEAREST", str(src_3857), str(dst_mbtiles)]
 
 
-def gdal2tiles_cmd(src_3857: str | Path, out_dir: str | Path, zmin: int, zmax: int) -> list[str]:
-    return ["gdal2tiles.py", "--xyz", "-r", "near", "-z", f"{zmin}-{zmax}", "--processes=4", str(src_3857), str(out_dir)]
-
-
 def pmtiles_convert_cmd(src: str | Path, dst: str | Path) -> list[str]:
     return ["pmtiles", "convert", str(src), str(dst)]
 
@@ -178,7 +176,7 @@ def enc_to_geojson_cmds(enc_cells: Sequence[str | Path], out_dir: str | Path) ->
 
 
 def tippecanoe_cmd(layers: Mapping[str, str | Path | Sequence[str | Path]], out_pmtiles: str | Path,
-                   zmin: int = 8, zmax: int = 16) -> list[str]:
+                   zmin: int, zmax: int) -> list[str]:
     """``layers`` maps vector layer name -> one GeoJSON path or a list of them (one per ENC cell;
     repeated ``-L name:file`` entries with the same name are combined into a single layer)."""
     cmd = ["tippecanoe", "-o", str(out_pmtiles), "--force", f"-Z{zmin}", f"-z{zmax}", "--drop-densest-as-needed",
@@ -249,6 +247,49 @@ def collect_layer_files(geojson_dir: Path) -> dict[str, list[Path]]:
     return {k: v for k, v in out.items() if v}
 
 
+# ---- optional vector inputs (path conventions; both are manual/other-step products)
+BOUNDARIES_LAYER = "boundaries"
+LAND_LAYER = "land"
+
+
+def boundaries_input(aoi: str, data_dir: Path) -> Path:
+    """WDFW crab-region / catch-area boundaries (EPSG:4326 GeoJSON FeatureCollection), optional."""
+    return step_dir(data_dir, aoi, "fetch") / "boundaries.geojson"
+
+
+def land_input(aoi: str, data_dir: Path) -> Path:
+    """OSM land polygons clipped to the AOI (EPSG:4326 GeoJSON), optional."""
+    return step_dir(data_dir, aoi, "fetch") / "osm_land.geojson"
+
+
+def check_geojson(path: Path) -> int:
+    """Number of features in a GeoJSON FeatureCollection; raises ValueError if unreadable or empty."""
+    import json
+
+    try:
+        gj = json.loads(Path(path).read_text())
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{path}: not valid JSON ({exc})") from exc
+    feats = gj.get("features") if isinstance(gj, dict) else None
+    if not isinstance(gj, dict) or gj.get("type") != "FeatureCollection" or not isinstance(feats, list) or not feats:
+        raise ValueError(f"{path}: expected a non-empty GeoJSON FeatureCollection")
+    return len(feats)
+
+
+def base_layers(enc_layers: Mapping[str, Sequence[Path]], boundaries: Path | None) -> dict[str, list[Path] | Path]:
+    """Layers of base.pmtiles: all ENC cells per layer, plus ``boundaries`` when that input exists.
+    OSM land is deliberately NOT here (ODbL share-alike must not touch ENC/boundary tiles)."""
+    layers: dict[str, list[Path] | Path] = dict(enc_layers)
+    if boundaries is not None and Path(boundaries).exists():
+        check_geojson(boundaries)
+        layers[BOUNDARIES_LAYER] = Path(boundaries)
+    return layers
+
+
+def land_tippecanoe_cmd(land_geojson: Path, out_pmtiles: Path) -> list[str]:
+    return tippecanoe_cmd({LAND_LAYER: land_geojson}, out_pmtiles, *ZOOMS["base"])
+
+
 def stage_vector(aoi: str, data_dir: Path) -> Path:
     enc_dir = step_dir(data_dir, aoi, "fetch") / "enc"
     cells = sorted(enc_dir.glob("*.000"))
@@ -265,10 +306,15 @@ def stage_vector(aoi: str, data_dir: Path) -> Path:
             # *absence across all cells* of DEPARE/COALNE is fatal (checked below).
             print(f"note: {cmd[-1]} not extracted from {cmd[-2]}", file=sys.stderr)
             Path(cmd[-3]).unlink(missing_ok=True)
-    layers = collect_layer_files(gj)
-    # TODO: add WDFW boundary GeoJSON as extra -L layers. OSM stays in its own file (ODbL).
+    layers = base_layers(collect_layer_files(gj), boundaries_input(aoi, data_dir))
+    if BOUNDARIES_LAYER not in layers:
+        print(f"note: no {boundaries_input(aoi, data_dir)}; base.pmtiles will have no boundaries layer", file=sys.stderr)
     base = out / "base.pmtiles"
     run(tippecanoe_cmd(layers, base, *ZOOMS["base"]))
+    land = land_input(aoi, data_dir)
+    if land.exists():  # OSM (ODbL) lives in its own file, published by convention as land.pmtiles
+        check_geojson(land)
+        run(land_tippecanoe_cmd(land, out / "land.pmtiles"))
     return base
 
 

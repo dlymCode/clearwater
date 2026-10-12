@@ -30,9 +30,30 @@ import numpy as np
 from .common import (DATE_NODATA, FT_PER_M, SOURCES, Manifest, MixedMetaError, clean_profile, days_since_epoch,
                      step_dir)
 
-LIDAR_UNC_FT = 0.5
-EHYDRO_UNC_FT = 0.5
-CUDEM_UNC_FT = 1.0
+#: Dates recorded in the fetch manifest (flight/survey/version) must be believable for these sources.
+META_MIN_DATE = dt.date(1990, 1, 1)
+#: Per-cell tables (BlueTopo RAT, CoNED source surveys) legitimately reach back to the 1800s bathymetry
+#: but cannot be packed into the tiles before 1880.
+TABLE_MIN_DATE = dt.date(1880, 1, 1)
+
+
+def parse_meta_date(value: Any, name: str, min_date: dt.date = META_MIN_DATE) -> int:
+    """Days since 1970 for an ISO date string / date, rejecting bool/int/float confusion and implausible dates."""
+    if isinstance(value, bool) or isinstance(value, (int, float)):
+        raise ValueError(f"{name}: expected an ISO date string like '2014-09-15', got {type(value).__name__} {value!r}")
+    if isinstance(value, dt.datetime):
+        value = value.date()
+    if isinstance(value, str):
+        try:
+            value = dt.date.fromisoformat(value[:10]) if len(value) >= 10 else dt.date.fromisoformat(value)
+        except ValueError as exc:
+            raise ValueError(f"{name}: {value!r} is not an ISO date (YYYY-MM-DD)") from exc
+    if not isinstance(value, dt.date):
+        raise ValueError(f"{name}: unsupported date value {value!r}")
+    latest = dt.date.today() + dt.timedelta(days=1)
+    if not (min_date <= value <= latest):
+        raise ValueError(f"{name}: {value.isoformat()} outside {min_date.isoformat()}..{latest.isoformat()}")
+    return days_since_epoch(value)
 
 
 def covered(elev: np.ndarray) -> np.ndarray:
@@ -46,28 +67,36 @@ def constant_meta(elev: np.ndarray, day: int, unc_ft: float) -> tuple[np.ndarray
     return date, unc
 
 
-def lidar_meta(elev: np.ndarray, flight_date: str | dt.date) -> tuple[np.ndarray, np.ndarray]:
-    return constant_meta(elev, days_since_epoch(flight_date), LIDAR_UNC_FT)
+def lidar_meta(elev: np.ndarray, flight_date: str | dt.date, source: str = "lidar_2014") -> tuple[np.ndarray, np.ndarray]:
+    return constant_meta(elev, parse_meta_date(flight_date, "flight_date"), SOURCES[source].unc_ft)
 
 
 def ehydro_meta(elev: np.ndarray, survey_date: str | dt.date) -> tuple[np.ndarray, np.ndarray]:
-    return constant_meta(elev, days_since_epoch(survey_date), EHYDRO_UNC_FT)
+    return constant_meta(elev, parse_meta_date(survey_date, "survey_date"), SOURCES["ehydro"].unc_ft)
 
 
 def cudem_meta(elev: np.ndarray, version_year: int) -> tuple[np.ndarray, np.ndarray]:
-    """Tile version year -> Jan 1 of that year (month unknown; conservative), 1 ft."""
-    return constant_meta(elev, days_since_epoch(dt.date(int(version_year), 1, 1)), CUDEM_UNC_FT)
+    """Tile version year -> Jan 1 of that year (month unknown; conservative), uncertainty from SOURCES."""
+    if isinstance(version_year, bool) or not isinstance(version_year, int):
+        raise ValueError(f"version_year: expected an int year like 2023, got {type(version_year).__name__} {version_year!r}")
+    day = parse_meta_date(dt.date(version_year, 1, 1) if 1 <= version_year <= 9999 else version_year, "version_year")
+    return constant_meta(elev, day, SOURCES["cudem"].unc_ft)
 
 
 def _date_lookup(table: Mapping[Any, Any]) -> dict[int, int]:
-    """id -> days since epoch from values that are ISO dates or bare years."""
+    """id -> days since epoch from values that are ISO dates or bare 4-digit years (int or str)."""
     out: dict[int, int] = {}
     for k, v in table.items():
+        name = f"table[{k}]"
+        if isinstance(v, bool):
+            raise ValueError(f"{name}: bool is not a date")
         if isinstance(v, int) or (isinstance(v, str) and v.isdigit() and len(v) == 4):
-            d = dt.date(int(v), 1, 1)
+            year = int(v)
+            if not (1 <= year <= 9999):
+                raise ValueError(f"{name}: {v!r} is not a year (an int must be a 4-digit year, not e.g. 20140915)")
+            out[int(k)] = parse_meta_date(dt.date(year, 1, 1), name, TABLE_MIN_DATE)
         else:
-            d = dt.date.fromisoformat(str(v)[:10])
-        out[int(k)] = days_since_epoch(d)
+            out[int(k)] = parse_meta_date(v, name, TABLE_MIN_DATE)
     return out
 
 
@@ -90,7 +119,7 @@ def bluetopo_meta(elev: np.ndarray, contributor: np.ndarray, rat: Mapping[Any, A
         unc = np.full(elev.shape, np.nan, dtype=np.float32)
     else:
         unc = (np.asarray(uncertainty_m, dtype=np.float64) * FT_PER_M).astype(np.float32)
-        unc = np.where(m & np.isfinite(unc), unc, np.float32(np.nan)).astype(np.float32)
+        unc = np.where(m & np.isfinite(unc) & (unc >= 0), unc, np.float32(np.nan)).astype(np.float32)  # negative = bad data
     return dates, unc
 
 
@@ -131,7 +160,7 @@ def build_arrays(source: str, elev: np.ndarray, meta: Mapping[str, Any],
     if source not in SOURCES:
         raise ValueError(f"unknown source {source!r}")
     if source in ("lidar_2014", "lidar_ncmp", "wa_lidar"):
-        return lidar_meta(elev, _need(meta, "flight_date", source))
+        return lidar_meta(elev, _need(meta, "flight_date", source), source)
     if source == "ehydro":
         return ehydro_meta(elev, _need(meta, "survey_date", source))
     if source == "cudem":
@@ -185,6 +214,7 @@ def run(aoi: str, data_dir: Path) -> None:
 
     align_dir = step_dir(data_dir, aoi, "align")
     manifest = Manifest.load(align_dir, aoi, "align")
+    manifest.verify(kinds=["dem"])
     for source in manifest.sources("dem"):
         sdir = align_dir / source
         meta = manifest.select(source=source)[0].meta

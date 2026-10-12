@@ -77,7 +77,7 @@ def test_warp_command_flags():
     assert c[-3:] == ["a.tif", "b.tif", "out.tif"]
     lidar = align.warp_command(["l.tif"], "o.tif", g, align.RESAMPLING[align.kind_of("lidar_2014")])
     assert lidar[lidar.index("-r") + 1] == "min"
-    assert align.RESAMPLING == {"dem": "bilinear", "lidar": "min", "categorical": "near"}
+    assert align.RESAMPLING == {"dem": "bilinear", "lidar": "min"}
     with pytest.raises(ValueError):
         align.warp_command(["a"], "b", g, "lanczos-of-doom")
 
@@ -95,10 +95,13 @@ def test_laz_requires_explicit_vertical_crs(tmp_path):
 
     from pipeline.common import MissingVerticalCRS
 
+    import hashlib
+
     fetch = tmp_path / "skagit" / "fetch"
-    fetch.mkdir(parents=True)
-    entry = dict(path="lidar_2014/a.laz", source_url="u", download_date="d", sha256="s", crs=None, bytes=1,
-                 source="lidar_2014", kind="laz", vertical_crs=None, vertical_units="m", meta={})
+    (fetch / "lidar_2014").mkdir(parents=True)
+    (fetch / "lidar_2014" / "a.laz").write_bytes(b"laz")
+    entry = dict(path="lidar_2014/a.laz", source_url="u", download_date="d", sha256=hashlib.sha256(b"laz").hexdigest(), crs=None,
+                 bytes=3, source="lidar_2014", kind="laz", vertical_crs=None, vertical_units="m", meta={})
     (fetch / "manifest.json").write_text(json.dumps({"aoi": "skagit", "step": "fetch", "files": [entry]}))
     with pytest.raises(MissingVerticalCRS, match="vertical_crs"):
         align.stage_laz("skagit", tmp_path)

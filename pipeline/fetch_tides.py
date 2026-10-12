@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Sequence
 
 from . import coops
+from .common import ISO_UTC_FORMAT
 
 STEP_MIN = 30
 
@@ -41,28 +42,38 @@ def build_payload(station: coops.Station, events: Sequence[coops.Event], start: 
         "units": "ft",
         "lat": round(station.lat, 5),
         "lon": round(station.lon, 5),
-        "predictions": [{"t": t.strftime("%Y-%m-%dT%H:%M:%SZ"), "v": round(v, 3)} for t, v in pts],
+        "predictions": [{"t": t.strftime(ISO_UTC_FORMAT), "v": round(v, 3)} for t, v in pts],
     }
 
 
 def fetch_all(out_dir: Path, *, now: dt.datetime | None = None, days: int = 30,
               stations: Sequence[coops.Station] = coops.ALL_STATIONS,
-              http_get: coops.HttpGet = coops.default_http_get) -> list[Path]:
+              http_get: coops.HttpGet = coops.default_http_get,
+              failures: list[tuple[str, str]] | None = None) -> list[Path]:
+    """Write one JSON per station. A failing station is recorded in ``failures`` (id/name, error) and
+    skipped - it never aborts the others or leaves a partial file; the caller decides the exit code."""
+    failures = failures if failures is not None else []
     now = (now or dt.datetime.now(dt.timezone.utc)).astimezone(dt.timezone.utc).replace(minute=0, second=0, microsecond=0)
     start = now
     end = now + dt.timedelta(days=days)
     client = coops.CoopsClient(http_get)
     resolved, unresolved = coops.resolve_stations(stations, http_get)
     for s in unresolved:
-        print(f"warning: no CO-OPS id found for {s.name!r}; skipped", file=sys.stderr)
+        failures.append((s.name, "no CO-OPS station id found"))
     out_dir.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
     for s in resolved:
-        # pad so the grid edges fall inside the hi/lo event range
-        events = client.hilo(s.id, start - dt.timedelta(days=1), end + dt.timedelta(days=1))
-        payload = build_payload(s, events, start, end)
+        try:
+            # pad so the grid edges fall inside the hi/lo event range
+            events = client.hilo(s.id, start - dt.timedelta(days=1), end + dt.timedelta(days=1))
+            payload = build_payload(s, events, start, end)
+        except Exception as exc:  # noqa: BLE001 - per-station isolation is the point
+            failures.append((s.id or s.name, f"{type(exc).__name__}: {exc}"))
+            continue
         path = out_dir / f"{s.id}.json"
-        path.write_text(json.dumps(payload, separators=(",", ":")) + "\n")
+        tmp = path.with_name(path.name + ".part")
+        tmp.write_text(json.dumps(payload, separators=(",", ":")) + "\n")
+        tmp.replace(path)
         written.append(path)
     return written
 
@@ -72,9 +83,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--out", type=Path, default=Path("data/tides"))
     p.add_argument("--days", type=int, default=30)
     a = p.parse_args(argv)
-    paths = fetch_all(a.out, days=a.days)
+    failures: list[tuple[str, str]] = []
+    paths = fetch_all(a.out, days=a.days, failures=failures)
     print(f"wrote {len(paths)} station files to {a.out}")
-    return 0 if paths else 1
+    for who, why in failures:
+        print(f"FAILED {who}: {why}", file=sys.stderr)
+    return 1 if failures or not paths else 0
 
 
 if __name__ == "__main__":

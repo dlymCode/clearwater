@@ -26,12 +26,14 @@ PYRUN = cd $(ROOT) && $(PY) -m
         step-fetch step-laz step-mllw step-align step-meta step-waterline step-merge step-validate step-tiles step-tides step-publish
 .NOTPARALLEL:
 
-all: $(AOIS)
+# `make all`: fetch tides ONCE, then run each AOI (SKIP_TIDES stops step-publish re-fetching them 5 times).
+all: step-tides
+	@set -e; for a in $(AOIS); do $(MAKE) AOI=$$a SKIP_TIDES=1 run-aoi; done
 
 $(AOIS):
 	$(MAKE) AOI=$@ run-aoi
 
-run-aoi: step-fetch step-laz step-mllw step-align step-meta step-waterline step-merge step-tiles step-validate step-tides step-publish
+run-aoi: step-fetch step-laz step-mllw step-align step-meta step-waterline step-merge step-tiles step-validate step-publish
 
 need-aoi:
 	@test -n "$(AOI)" || (echo "set AOI=<one of: $(AOIS)>" && exit 2)
@@ -71,7 +73,7 @@ step-tiles: need-aoi
 step-tides:
 	$(PYRUN) pipeline.fetch_tides --out $(DATA)/tides
 
-step-publish: need-aoi step-tides
+step-publish: need-aoi $(if $(SKIP_TIDES),,step-tides)
 	$(PYRUN) pipeline.publish --aoi $(AOI) --data-dir $(DATA) $(PUBLISH_FLAGS)
 
 # Daily: 30 days of tide predictions, one JSON per station

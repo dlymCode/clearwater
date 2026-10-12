@@ -16,7 +16,8 @@ python3 -m pytest pipeline/tests -q               # from the repo root (or `pyte
 
 cd pipeline
 make test                                         # same suite
-make skagit                                       # fetch -> laz -> mllw -> align -> meta -> waterline -> merge -> tiles -> validate -> publish
+make skagit                                       # fetch -> laz -> mllw -> align -> meta -> waterline -> merge -> tiles -> validate -> (tides) -> publish
+make all                                          # tides once, then the five AOIs in turn
 make AOI=skagit step-merge                        # any single step
 make tides                                        # daily: 30-day tide predictions, one JSON per station (data/tides/)
 ```
@@ -31,8 +32,8 @@ Steps are modules: `python -m pipeline.<module> --aoi <slug> [--data-dir data]`.
 | 4 meta | `source_meta` | `align/<source>/date.tif` (int32 days since 1970), `unc.tif` (float32 ft) |
 | 5 waterline | `waterline_dem` | `waterline/{elev,bracket,date,n}.tif` |
 | 6 merge | `merge` | `merge/merged_{elev,src,date,unc}.tif` |
-| 7 validate | `validate` | `validate/report.{html,json}`; **exit 1 unless every gate below passes** |
-| 8 tiles | `tiles` | `tiles/{depth,depth_meta,waterline,base}.pmtiles` |
+| 7 validate | `validate` | `validate/report.{html,json}`; **exit 1 unless every gate below passes**. In the Makefile it runs *after* `tiles` (it needs `tiles/depth_rgb.tif` and the COALNE GeoJSON) and before `publish` |
+| 8 tiles | `tiles` | `tiles/{depth,depth_meta,waterline,base}.pmtiles`, optional `land.pmtiles` (see below) |
 | 9 publish | `publish` | R2 `tiles/<aoi>/<version>/...` + `tiles/index.json` (schema: `schemas/tiles_index.schema.json`), plus flat `tides/<station_id>.json` |
 
 `merged_src` codes (uint8, `common.SOURCES`): 1 bluetopo, 2 ehydro, 3 lidar_ncmp, 4 lidar_2014,
@@ -47,27 +48,45 @@ signed-URL worker). They are not listed in `tiles/index.json`. All stations are 
 the app picks the nearest station by distance from the lat/lon in each file and the whole set is ~0.5 MB. Each file is checked
 before upload (station_id matches the file name, MLLW/ft, predictions reach at least 7 days ahead); stale or malformed files
 abort the publish. In CI/cron the daily job is just `make tides` + `python -m pipeline.publish --aoi <x>`; for tides only, run
-`fetch_tides` and call `publish.publish_tides(...)`.
+`fetch_tides` and call `publish.publish_tides(...)`. `make all` fetches tides once (`SKIP_TIDES=1` for the per-AOI sub-makes).
+`fetch_tides` isolates stations: one failing station is reported on stderr (`FAILED <id>: ...`), the others are still
+written, and the exit code is non-zero. Uploaded files must also have finite in-range `lat`/`lon` and strictly time-ordered,
+well-formed `predictions`. Hi/lo interpolation refuses unsorted/duplicate-conflicting/non-finite events and gaps over 10 h.
 
 ## Gates (all fail closed)
 
 `validate` writes `validate/report.json`; `gate.passed` is true only if all of these pass:
 
-* **Waterline gate** - p90 absolute error <= 1.5 ft from >= 30 waterline samples in total, >= 1 sample from
-  *every* ground-truth run, and >= 3 runs (`make` also insists on >= 3 CSVs). A gate that can pass on one
-  lucky point is worthless, so fewer samples = failure. Per-source `coverage` (fraction of truth points
-  with a prediction) is in the report.
-* **Shoreline datum check (mandatory)** - median merged elevation at ENC COALNE cells must be within
-  +/- 1.5 ft of the AOI's expected MHHW (`common.AOI_MHHW_FT`). No COALNE file or < 50 shoreline cells = failure.
-  **The MHHW table values are estimates marked TODO-verify against the NOAA benchmark sheets (S0-4).**
-  Dev-only overrides: `--skip-waterline-gate`, `--skip-shoreline-check` (via `make VALIDATE_FLAGS=...`).
-* **Bias gate** - any NAVD88-derived source (cudem, coned, lidar_*) with |mean bias| > 1.5 ft vs. the runs (>= 30 samples).
-* **Encode consistency** - if `tiles/depth_rgb.tif` exists, the decoded Terrain-RGB at the truth points must match
-  `merged_elev` within 0.06 ft (warning only when the file is absent).
+* **Waterline gate** - p90 absolute error <= 1.5 ft from >= 30 **unique grid cells** with a waterline prediction (30
+  duplicate CSV rows in one cell count once; exact duplicate rows are also dropped on load), >= 1 unique cell from
+  *every* ground-truth run, and >= 3 runs (`make` also insists on >= 3 CSVs). A NaN p90 fails. Per-source `coverage`
+  (fraction of truth points with a prediction) is in the report.
+* **Shoreline datum check (mandatory)** - median of the per-cell 3x3-neighbourhood medians at ENC COALNE cells (unique
+  cells) must be within +/- 1.5 ft of the AOI's expected MHHW (`common.AOI_MHHW_FT`). No COALNE file or < 50 shoreline
+  cells = failure. **The MHHW table values are estimates marked TODO-verify against the NOAA benchmark sheets (S0-4).**
+* **Plausibility** - the merge masks elevations outside -1500..+500 ft MLLW (`common.ELEV_MIN_FT/MAX_FT`: 1e30, inf, an
+  unlabeled -9999 m sentinel...) to holes instead of letting them win by date, and writes per-source counts to
+  `merge/merge_stats.json`; validate fails when more than 0.1 % of a source's covered cells had to be masked.
+* **Bias gate** - any NAVD88-derived source (cudem, coned, lidar_*) with |mean bias| > 1.5 ft vs. the runs (>= 30 unique cells).
+* **Encode consistency** - the decoded Terrain-RGB (`tiles/depth_rgb.tif`) at the truth points must match `merged_elev`
+  within 0.06 ft; the CLI fails if the file is absent.
 
-`publish` re-checks independently (also for a direct `python -m pipeline.publish`, no bypass flag): the report must
-exist, name the AOI, say `gate.passed: true`, be **newer than every tile file**, and no tile may be **older than
-`merge/merged_elev.tif`**.
+**Dev overrides** (`--skip-waterline-gate`, `--skip-shoreline-check`, via `make VALIDATE_FLAGS=...`) keep the exit code at 0
+for local work but are recorded as `dev_overrides` in `report.json` (and the check as `skipped`).
+
+`publish` re-checks independently (also for a direct `python -m pipeline.publish`; the CLI has no skip flag). It refuses
+unless `report.json` is a JSON object whose `aoi` equals the AOI **exactly** (missing/null/other = refuse), `gate.passed`
+is literally `true`, **every check in `common.REQUIRED_CHECKS` is present, passed and not skipped**
+(waterline, bias, plausibility, shoreline_datum, encode_consistency), there are **no `dev_overrides`**, the report is
+**newer than every gated tile**, and no gated tile is **older than any `merge/merged_*.tif`**. `base`, `depth` and
+`depth_meta` must exist (`waterline`/`fleet` optional). The live `tiles/index.json` is only treated as "absent" on a
+genuine `NoSuchKey`/`404` error code; any other R2 error, or a malformed index, aborts instead of rebuilding the index
+from scratch (which would wipe the other AOIs), and existing entries with unknown slugs are kept (the schema check then
+fails loudly).
+
+Checksums are enforced too: `Manifest.verify()` re-hashes recorded files at the start of `to_mllw`, `align`,
+`source_meta`, `merge` and `waterline_dem`, and fetchers skip an existing file only when its hash matches the manifest
+(a 0-byte or truncated leftover is re-downloaded; its hash is never recorded as truth).
 
 ## Contracts worth knowing
 
@@ -77,14 +96,16 @@ exist, name the AOI, say `gate.passed: true`, be **newer than every tile file**,
   `tiles/index.json` (the agreed schema has no slot). Encoding (4-bit source | 4-bit uncertainty bucket in R,
   uint16 days-since-1880 in G/B, alpha = validity flag) is documented at the top of `tiles.py`. Uncertainty buckets
   (`common.UNC_LEVELS_FT`): indices 0..14 are 0, .25, .5, .75, 1, 1.5, 2, 3, 4, 5, 7.5, 10, 15, 20, 45+ ft (rounded up,
-  >= 45 clamps to 14); **index 15 means UNKNOWN and nothing else**. Dates outside 1880..2059 are clamped with a logged warning.
+  >= 45 clamps to 14); **index 15 means UNKNOWN and nothing else** (NaN, infinite and negative uncertainty all encode as unknown). Dates outside 1880..2059 are clamped with a logged warning.
 * **Index entries for products that do not exist yet** (e.g. `fleet` in Phase 1) are listed with `bytes: 0`
   and are not uploaded.
 * **Tide JSON** (`data/tides/<station_id>.json`): `station_id, name, datum, units, lat, lon, predictions`; lat/lon come from the
   CO-OPS metadata API.
 * Merge input rasters must carry `VERTICAL_CRS=MLLW` + `VERTICAL_UNITS=ft`; anything else is rejected. LAZ files need an
   explicit vertical datum and units in the manifest (no defaults).
-* `waterline` masks cells with fewer than 5 usable scenes, but `n.tif` keeps the raw count. Scenes within 60 s of each
+* `waterline` masks cells with fewer than 5 usable scenes or a bracket that is not strictly positive (and <= 3 ft); `n.tif` keeps the raw
+  count. A non-finite or implausible (outside -10..+20 ft) scene tide raises instead of silently NaN-ing the whole DEM. In the merge,
+  waterline uncertainty is half the bracket floored at 0.3 ft. Scenes within 60 s of each
   other count as ONE satellite pass (duplicates / overlapping granules are combined per cell before counting).
 * Files of one source with different dates (e.g. CUDEM `2023v1` + `2024v1` tiles) are warped separately and mosaicked
   together with their own per-cell dates; mixed metadata is never collapsed into one date.
@@ -112,7 +133,8 @@ shoreline datum check, CO-OPS parsing/interpolation and the fetch orchestration 
 
 * **Real downloads were never run.** `fetch_baseline` network code is unit-tested through injected fakes only.
   * CUDEM needs NOAA's tile index converted to GeoJSON (`--cudem-index`); URL layout unverified.
-  * BlueTopo: wrapper calls `nbs.bluetopo.fetch_tiles(dir, desired_area_filename=...)` - confirm the signature for the pinned version.
+  * BlueTopo: wrapper calls `nbs.bluetopo.fetch_tiles.main(abs_project_dir, desired_area_filename=...)` - signature, absolute-path
+    requirement and `(successful, failed)` return checked against the BlueTopo 0.5.0 wheel (it needs GDAL's `osgeo`; it does not need xarray).
   * Sentinel-2: Planetary Computer STAC search + COG window read implemented, untested against the live service.
 * **Manual downloads** (register with `fetch_baseline --register FILE --source NAME --vertical-crs NAVD88 --units m --meta '{"flight_date": "2014-09-15"}'`):
   CoNED tiles, 2014 and 2020/21 lidar DEMs/LAZ, eHydro XYZ rasterized to a DEM, ENC `.000` cells in `fetch/enc/`, VDatum GTX grid.
@@ -128,8 +150,14 @@ shoreline datum check, CO-OPS parsing/interpolation and the fetch orchestration 
 * **Tide tagging** uses hi/lo predictions with cosine interpolation (subordinate stations publish nothing else): expect a few
   tenths of a foot of error. Subordinate station IDs (La Conner, Stanwood, Everett, Coupeville) are resolved at runtime from the
   CO-OPS metadata API by name; coordinates in `coops.py` are approximate.
-* **Tiles**: GDAL (MBTILES driver), `tippecanoe` and the `pmtiles` CLI must be on PATH. `stage_vector` only emits ENC layers - WDFW boundaries,
-  OSM land (separate PMTiles file for ODbL) and the Sound-wide low-zoom file are not built yet. The fleet layer (Phase 2) is not built.
-* **Publish**: needs `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET` (scoped to `tiles/`). `--dry-run` works without them.
+* **Tiles**: GDAL (MBTILES driver), `tippecanoe` and the `pmtiles` CLI must be on PATH. The Sound-wide low-zoom file and the fleet
+  layer (Phase 2) are not built.
+  * **Boundaries**: put WDFW boundaries (EPSG:4326 GeoJSON FeatureCollection) at `data/<aoi>/fetch/boundaries.geojson`; when present
+    `base.pmtiles` gets a `boundaries` vector layer (otherwise a note is printed and the layer is absent).
+  * **OSM land**: put land polygons at `data/<aoi>/fetch/osm_land.geojson`; they are tiled into a SEPARATE `tiles/land.pmtiles`
+    (layer `land`) and never into `base.pmtiles` (ODbL share-alike isolation). `publish` uploads it when present as
+    `tiles/<aoi>/<version>/land.pmtiles` - by path convention, **not** listed in `tiles/index.json` (like `depth_meta.pmtiles`),
+    and exempt from the validation-freshness gates because it is not derived from the merge.
+* **Publish**: needs `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET` (token scoped to write `tiles/` **and** `tides/`). `--dry-run` works without them.
 * **Ground truth**: at least three sounder-run CSVs (`time,lat,lon,depth,speed[,tide_ft]`) in `data/ground_truth/<aoi>/` are required before `make <aoi>` will publish; the Skagit runs need waterline coverage on each run.
 * Regression diff (`validate.regression_shallower`) is a function, not yet wired into the CLI.

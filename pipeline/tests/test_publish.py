@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 
 from pipeline import publish
-from pipeline.common import AOI_SLUGS, DATE_NODATA, days_since_epoch
+from pipeline.common import AOI_SLUGS, DATE_NODATA, REQUIRED_CHECKS, days_since_epoch
 from pipeline.jsonschema_lite import validate
 
 FIXTURE = Path(__file__).parent / "fixtures" / "tiles_index.example.json"
@@ -31,25 +31,43 @@ class FakeStore:
         return self.index
 
 
-def make_tree(root, passed=True, aoi="skagit", report_aoi=None):
-    """tiles/*.pmtiles older than the validation report, newer than merged_elev.tif."""
+FULL_CHECKS = {n: {"passed": True, "reason": "ok"} for n in REQUIRED_CHECKS}
+
+
+def good_report(aoi="skagit", **over):
+    r = {"aoi": aoi, "gate": {"passed": True, "reason": "ok", "checks": copy.deepcopy(FULL_CHECKS), "dev_overrides": []},
+         "dev_overrides": []}
+    r.update(over)
+    return r
+
+
+def make_tree(root, passed=True, aoi="skagit", report_aoi=None, report=None, with_meta=True):
+    """Tiles newer than every merged raster, older than the validation report."""
     tiles = root / aoi / "tiles"
     tiles.mkdir(parents=True, exist_ok=True)
     (root / aoi / "merge").mkdir(parents=True, exist_ok=True)
     (root / aoi / "validate").mkdir(parents=True, exist_ok=True)
     merged = root / aoi / "merge" / "merged_elev.tif"
-    merged.write_bytes(b"m")
-    files = {"depth.pmtiles": b"d" * 10, "base.pmtiles": b"b" * 4, "depth_meta.pmtiles": b"m"}
+    for name in publish.MERGED_RASTERS:
+        (root / aoi / "merge" / name).write_bytes(b"m")
+    files = {"depth.pmtiles": b"d" * 10, "base.pmtiles": b"b" * 4}
+    if with_meta:
+        files["depth_meta.pmtiles"] = b"m"
     for name, data in files.items():
         (tiles / name).write_bytes(data)
-    report = root / aoi / "validate" / "report.json"
-    report.write_text(json.dumps({"aoi": report_aoi or aoi, "gate": {"passed": passed, "reason": "ok" if passed else "p90 too high"}}))
+    rep = report if report is not None else good_report(report_aoi or aoi)
+    if report is None and not passed:
+        rep["gate"]["passed"] = False
+        rep["gate"]["reason"] = "p90 too high"
+    report_path = root / aoi / "validate" / "report.json"
+    report_path.write_text(json.dumps(rep))
     t0 = 1_700_000_000
-    os.utime(merged, (t0, t0))
+    for name in publish.MERGED_RASTERS:
+        os.utime(root / aoi / "merge" / name, (t0, t0))
     for name in files:
         os.utime(tiles / name, (t0 + 100, t0 + 100))
-    os.utime(report, (t0 + 200, t0 + 200))
-    return tiles, merged, report
+    os.utime(report_path, (t0 + 200, t0 + 200))
+    return tiles, merged, report_path
 
 
 def test_fixture_validates_against_schema():
@@ -162,7 +180,7 @@ def test_publish_refuses_without_or_with_failed_validation(tmp_path):
     make_tree(tmp_path, report_aoi="nisqually")
     with pytest.raises(publish.PublishRefused, match="AOI"):
         publish.publish_aoi("skagit", tmp_path, store, now=NOW, date_range=("2014-01-01", "2015-01-01"))
-    (tmp_path / "skagit" / "validate" / "report.json").write_text('{"aoi": "skagit", "gate": {"passed": "yes"}}')
+    make_tree(tmp_path, report={"aoi": "skagit", "gate": {"passed": "yes"}})
     with pytest.raises(publish.PublishRefused):  # only literal true counts
         publish.publish_aoi("skagit", tmp_path, store, now=NOW, date_range=("2014-01-01", "2015-01-01"))
     assert store.events == []
@@ -181,7 +199,7 @@ def test_publish_refuses_stale_tiles_older_than_merged_elev(tmp_path):
     newer = merged.stat().st_mtime + 1000  # merged raster rebuilt after the tiles (and the report)
     os.utime(merged, (newer, newer))
     os.utime(report, (newer + 10, newer + 10))
-    with pytest.raises(publish.PublishRefused, match="older than merged_elev"):
+    with pytest.raises(publish.PublishRefused, match="older than the merged rasters"):
         publish.publish_aoi("skagit", tmp_path, FakeStore(), now=NOW, date_range=("2014-01-01", "2015-01-01"))
 
 

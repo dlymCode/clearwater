@@ -118,6 +118,8 @@ def resolve_stations(
 
 
 def nearest_station(lon: float, lat: float, stations: Sequence[Station]) -> Station:
+    if not (math.isfinite(lon) and math.isfinite(lat)):
+        raise ValueError("nearest_station needs finite coordinates")
     usable = [s for s in stations if s.id is not None]
     if not usable:
         raise ValueError("no stations with resolved IDs")
@@ -141,8 +143,40 @@ def parse_hilo(payload: dict) -> list[Event]:
     return out
 
 
-def cosine_interpolate(events: Sequence[Event], t: dt.datetime) -> float:
-    """Height at ``t`` by half-cosine interpolation between the surrounding hi/lo events."""
+#: Largest believable gap between successive hi/lo events. Real semidiurnal gaps are ~6-7 h (up to ~9 h);
+#: a bigger gap means CO-OPS dropped an event and cosine interpolation across it would be garbage.
+MAX_EVENT_GAP = dt.timedelta(hours=10)
+
+
+def normalize_events(events: Sequence[Event]) -> list[Event]:
+    """Validate hi/lo events: tz-aware, finite, strictly time-ordered. Exact duplicates collapse;
+    conflicting values at one timestamp or out-of-order input raise (never silently re-sorted)."""
+    out: list[Event] = []
+    for t, v in events:
+        if t.tzinfo is None:
+            raise ValueError("hi/lo event time must be timezone-aware (UTC)")
+        if not math.isfinite(v):
+            raise ValueError(f"non-finite tide value at {t.isoformat()}")
+        if out:
+            if t < out[-1][0]:
+                raise ValueError(f"hi/lo events out of order at {t.isoformat()}")
+            if t == out[-1][0]:
+                if v != out[-1][1]:
+                    raise ValueError(f"conflicting hi/lo values at {t.isoformat()}: {out[-1][1]} vs {v}")
+                continue
+        out.append((t, v))
+    return out
+
+
+def cosine_interpolate(events: Sequence[Event], t: dt.datetime, *, validated: bool = False) -> float:
+    """Height at ``t`` by half-cosine interpolation between the surrounding hi/lo events.
+
+    ``validated=True`` skips :func:`normalize_events` for callers that already normalized once.
+    """
+    if t.tzinfo is None:
+        raise ValueError("query time must be timezone-aware (UTC)")
+    if not validated:
+        events = normalize_events(events)
     if len(events) < 2:
         raise ValueError("need at least two hi/lo events")
     lo, hi = 0, len(events) - 1
@@ -155,18 +189,22 @@ def cosine_interpolate(events: Sequence[Event], t: dt.datetime) -> float:
         else:
             hi = mid
     (t0, v0), (t1, v1) = events[lo], events[hi]
-    span = (t1 - t0).total_seconds()
-    f = 0.0 if span <= 0 else (t - t0).total_seconds() / span
+    if t1 - t0 > MAX_EVENT_GAP:
+        raise ValueError(f"hi/lo events {t0.isoformat()}..{t1.isoformat()} are more than {MAX_EVENT_GAP} apart (missing event?)")
+    f = (t - t0).total_seconds() / (t1 - t0).total_seconds()
     return v0 + (v1 - v0) * (1.0 - math.cos(math.pi * f)) / 2.0
 
 
 def densify(events: Sequence[Event], start: dt.datetime, end: dt.datetime, step_min: int = 15) -> list[Event]:
     """Regular grid between start and end (inclusive) plus the exact hi/lo extremes, time-sorted."""
+    if not step_min > 0:
+        raise ValueError("step_min must be > 0")
+    events = normalize_events(events)
     pts: dict[dt.datetime, float] = {}
     t = start
     step = dt.timedelta(minutes=step_min)
     while t <= end:
-        pts[t] = cosine_interpolate(events, t)
+        pts[t] = cosine_interpolate(events, t, validated=True)
         t += step
     for et, ev in events:
         if start <= et <= end:

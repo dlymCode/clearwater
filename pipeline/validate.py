@@ -5,16 +5,22 @@
 Everything below must pass for ``report.json`` to say ``gate.passed: true`` (publish.py refuses
 otherwise). All checks fail closed:
 
-* **Waterline gate** - p90 absolute error vs. the sounder runs must be <= 1.5 ft, from >= 30 waterline
-  samples in total, >= 1 sample from *each* run, and >= 3 runs (PRD: 3 known runs).
+* **Waterline gate** - p90 absolute error vs. the sounder runs must be <= 1.5 ft, from >= 30 *unique grid
+  cells* with a waterline prediction (duplicate CSV rows in one cell count once), >= 1 unique cell from
+  *each* run, and >= 3 runs (PRD: 3 known runs). A NaN p90 fails.
   ``--skip-waterline-gate`` is a dev override.
 * **Shoreline datum check (mandatory)** - merged elevation at ENC COALNE shoreline cells must sit within
   +/- 1.5 ft of the AOI's expected MHHW (``common.AOI_MHHW_FT``). No COALNE file or too few shoreline
   cells = failure. ``--skip-shoreline-check`` is a dev override. Catches a forgotten/sign-flipped VDatum offset.
+* **Plausibility** - cells masked by the merge as physically implausible (outside -1500..+500 ft MLLW)
+  must stay under 0.1 % of a source's covered cells (``merge/merge_stats.json``).
 * **Bias gate** - any NAVD88-derived source (CUDEM, CoNED, lidar) with |mean bias| > 1.5 ft against the
   runs fails (a constant bias is the signature of a datum error).
-* **Encode consistency** - when ``tiles/depth_rgb.tif`` exists, the *decoded* Terrain-RGB raster sampled
-  at the truth points must match the merged raster (catches encode bugs); absent = warning only.
+* **Encode consistency** - the *decoded* Terrain-RGB raster (``tiles/depth_rgb.tif``) sampled at the truth
+  points must match the merged raster (catches encode bugs). The CLI fails when the file is absent.
+
+Dev overrides (``--skip-*``) are recorded as ``dev_overrides`` in the report; ``publish`` refuses such reports.
+The report must contain every check in ``common.REQUIRED_CHECKS``, all passed and none skipped.
 
 Run CSV columns: ``time,lat,lon,depth,speed`` (+ optional ``tide_ft``). ``depth`` is feet
 below the surface at ``time``; with a ``tide_ft`` column truth elevation = tide_ft - depth,
@@ -36,7 +42,8 @@ from typing import Mapping, Sequence
 
 import numpy as np
 
-from .common import AOI_MHHW_FT, SHORELINE_TOL_FT, SOURCE_BY_CODE, step_dir, utc_now_iso
+from .common import (AOI_MHHW_FT, MAX_IMPLAUSIBLE_FRACTION, REQUIRED_CHECKS, SHORELINE_TOL_FT, SOURCE_BY_CODE, step_dir,
+                     utc_now_iso)
 from .geo import Grid, lonlat_to_utm10, sample_grid
 
 P90_GATE_FT = 1.5
@@ -61,6 +68,11 @@ class TruthPoints:
     n_runs: int | None = None
 
     def __post_init__(self) -> None:
+        n = len(self.lon)
+        if not (len(self.lat) == len(self.elev_ft) == len(self.speed_kt) == n):
+            raise ValueError("lon/lat/elev_ft/speed_kt must have equal lengths")
+        if self.run_id is not None and len(self.run_id) != n:
+            raise ValueError("run_id must have one entry per truth point")
         if self.run_id is None:
             self.run_id = np.zeros(len(self.lon), dtype=np.int64)
         if self.n_runs is None:
@@ -68,21 +80,34 @@ class TruthPoints:
 
 
 def load_run_csv(path: str | Path, min_speed_kt: float = MIN_SPEED_KT) -> TruthPoints:
+    """Read one run. Drops rows that are unparsable, non-finite, slower than ``min_speed_kt`` (NaN speed
+    included) or exact duplicates of an earlier row, so repeated lines can never inflate the sample."""
     lon: list[float] = []
     lat: list[float] = []
     elev: list[float] = []
     spd: list[float] = []
-    with open(path, newline="") as fh:
-        for row in csv.DictReader(fh):
+    seen: set[tuple] = set()
+    with open(path, newline="", encoding="utf-8-sig") as fh:
+        reader = csv.DictReader(fh)
+        if reader.fieldnames:
+            reader.fieldnames = [f.strip().lower() for f in reader.fieldnames]
+        for row in reader:
             try:
                 depth = float(row["depth"])
                 speed = float(row["speed"])
                 la, lo = float(row["lat"]), float(row["lon"])
-                tide = float(row["tide_ft"]) if row.get("tide_ft") not in (None, "") else None
+                raw_tide = row.get("tide_ft")
+                tide = float(raw_tide) if raw_tide not in (None, "") else None
             except (KeyError, ValueError):
                 continue
-            if speed < min_speed_kt or not np.isfinite([depth, la, lo]).all():
+            if not (speed >= min_speed_kt) or not np.isfinite([depth, la, lo, speed]).all():
+                continue  # `not (>=)` so NaN speed is dropped too
+            if tide is not None and not np.isfinite(tide):
                 continue
+            key = (row.get("time"), la, lo, depth, speed, tide)
+            if key in seen:
+                continue
+            seen.add(key)
             lon.append(lo)
             lat.append(la)
             elev.append((tide - depth) if tide is not None else -depth)
@@ -112,6 +137,7 @@ class ValidationResult:
     gate: dict = field(default_factory=dict)
     checks: dict[str, dict] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
+    dev_overrides: list[str] = field(default_factory=list)
 
     @property
     def passed(self) -> bool:
@@ -121,80 +147,141 @@ class ValidationResult:
         self.checks[name] = {"passed": bool(passed), "reason": reason, **detail}
         self._finalize()
 
+    def override(self, name: str) -> None:
+        """Record a dev-only override; publish refuses any report that carries one."""
+        if name not in self.dev_overrides:
+            self.dev_overrides.append(name)
+        self._finalize()
+
     def _finalize(self) -> None:
         failures = [f"{n}: {c['reason']}" for n, c in self.checks.items() if not c["passed"]]
         self.gate["passed"] = not failures and bool(self.checks)
         self.gate["reason"] = "ok" if self.gate["passed"] else "; ".join(failures) or "no checks ran"
         self.gate["checks"] = self.checks
+        self.gate["dev_overrides"] = list(self.dev_overrides)
 
     def to_dict(self) -> dict:
-        return {"per_source": self.per_source, "gate": self.gate, "warnings": self.warnings}
+        return json_safe({"per_source": self.per_source, "gate": self.gate, "warnings": self.warnings,
+                          "dev_overrides": self.dev_overrides, "required_checks": list(REQUIRED_CHECKS)})
 
 
-def evaluate_waterline(stats: dict | None, per_run_counts: Sequence[int], n_runs: int, *,
+def json_safe(obj):
+    """Replace NaN/inf (invalid JSON tokens) by None, recursively."""
+    if isinstance(obj, float):
+        return obj if np.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [json_safe(v) for v in obj]
+    return obj
+
+
+def unique_cell_counts(grid: Grid, x, y, mask: np.ndarray, run_id: np.ndarray, n_runs: int) -> tuple[int, list[int]]:
+    """(unique grid cells overall, unique cells per run) among points where ``mask`` is true and the point is on the grid."""
+    row, col = grid.xy_to_rowcol(x, y)
+    ok = np.asarray(mask) & grid.contains_rowcol(row, col)
+    cells = set(zip(row[ok].tolist(), col[ok].tolist()))
+    per_run = []
+    for r in range(n_runs):
+        sel = ok & (run_id == r)
+        per_run.append(len(set(zip(row[sel].tolist(), col[sel].tolist()))))
+    return len(cells), per_run
+
+
+def evaluate_waterline(stats: dict | None, per_run_cells: Sequence[int], n_runs: int, *,
                        threshold: float = P90_GATE_FT, enforce: bool = True,
                        min_samples: int = MIN_WATERLINE_SAMPLES, min_runs: int = MIN_RUNS) -> dict:
-    """The Gate-1 check. Fails closed on too few runs, too few samples or a run with no sample."""
+    """The Gate-1 check. ``stats["n_cells"]`` is the number of UNIQUE grid cells with a waterline prediction
+    (``per_run_cells`` likewise per run). Fails closed on too few runs/cells, a run with no cell, or a p90
+    that is not provably <= threshold (NaN fails)."""
     base = {"threshold_ft": threshold, "waterline_p90_ft": None if not stats else stats.get("p90_abs"),
-            "n_samples": 0 if not stats else stats.get("n", 0), "per_run_samples": list(per_run_counts)}
+            "n_samples": 0 if not stats else stats.get("n", 0), "n_cells": 0 if not stats else stats.get("n_cells", 0),
+            "per_run_samples": list(per_run_cells)}
     if not enforce:
-        return {**base, "passed": True, "reason": "waterline gate skipped"}
+        return {**base, "passed": True, "skipped": True, "reason": "waterline gate skipped"}
     if not stats or not stats.get("n"):
         return {**base, "passed": False, "reason": "no waterline samples (gate fails closed)"}
     problems = []
     if n_runs < min_runs:
         problems.append(f"only {n_runs} ground-truth run(s) (< {min_runs})")
-    if stats["n"] < min_samples:
-        problems.append(f"only {stats['n']} waterline samples (< {min_samples})")
-    empty = [i for i, c in enumerate(per_run_counts) if c < 1]
+    if not (base["n_cells"] >= min_samples):
+        problems.append(f"only {base['n_cells']} unique waterline cells (< {min_samples})")
+    empty = [i for i, c in enumerate(per_run_cells) if not (c >= 1)]
     if empty:
         problems.append(f"run(s) {empty} have no waterline sample")
-    if stats["p90_abs"] > threshold:
+    if not (stats["p90_abs"] <= threshold):
         problems.append(f"waterline p90 {stats['p90_abs']:.2f} ft > {threshold} ft")
     return {**base, "passed": not problems, "reason": "; ".join(problems) or "ok"}
 
 
 def evaluate_bias(per_source: Mapping[str, dict], limit: float = BIAS_GATE_FT,
                   min_samples: int = MIN_BIAS_SAMPLES) -> dict:
-    """|mean bias| of every NAVD88-derived source must stay within ``limit`` (needs >= min_samples)."""
-    offenders = {n: s["bias"] for n, s in per_source.items()
-                 if n in NAVD88_DERIVED and s["n"] >= min_samples and abs(s["bias"]) > limit}
-    checked = [n for n, s in per_source.items() if n in NAVD88_DERIVED and s["n"] >= min_samples]
+    """|mean bias| of every NAVD88-derived source must stay within ``limit`` (needs >= min_samples unique cells)."""
+    judged = {n: s for n, s in per_source.items() if n in NAVD88_DERIVED and s.get("n_cells", 0) >= min_samples}
+    offenders = {n: s["bias"] for n, s in judged.items() if not (abs(s["bias"]) <= limit)}  # NaN bias fails
     reason = "ok" if not offenders else "constant bias (datum error?): " + ", ".join(f"{n} {b:+.2f} ft" for n, b in offenders.items())
-    return {"passed": not offenders, "reason": reason, "limit_ft": limit, "sources_checked": checked, "offenders": offenders}
+    return {"passed": not offenders, "reason": reason, "limit_ft": limit, "sources_checked": list(judged), "offenders": offenders}
+
+
+def evaluate_plausibility(merge_stats: Mapping | None, max_fraction: float = MAX_IMPLAUSIBLE_FRACTION) -> dict:
+    """Fail when the merge had to mask too many implausible elevations (sentinels like -9999 m, 1e30...)."""
+    if not merge_stats or not isinstance(merge_stats.get("sources"), dict) or not merge_stats["sources"]:
+        return {"passed": False, "reason": "merge_stats.json missing or empty (gate fails closed)"}
+    offenders = {}
+    for name, st in merge_stats["sources"].items():
+        covered, bad = int(st.get("covered", 0)), int(st.get("implausible", 0))
+        if bad and not (bad <= max_fraction * covered):  # also fails when covered == 0
+            offenders[name] = {"implausible": bad, "covered": covered}
+    total_bad = sum(int(st.get("implausible", 0)) for st in merge_stats["sources"].values())
+    reason = "ok" if not offenders else "implausible elevations masked: " + ", ".join(
+        f"{n} {v['implausible']}/{v['covered']}" for n, v in offenders.items())
+    return {"passed": not offenders, "reason": reason, "max_fraction": max_fraction, "masked_total": total_bad,
+            "offenders": offenders, "masked_by_source": {n: int(st.get("implausible", 0)) for n, st in merge_stats["sources"].items()}}
 
 
 def validate(truth: TruthPoints, grid: Grid, merged_elev: np.ndarray, merged_src: np.ndarray | None = None,
              waterline_elev: np.ndarray | None = None, depth_decoded: np.ndarray | None = None, *,
-             threshold: float = P90_GATE_FT, enforce_waterline: bool = True, min_runs: int = MIN_RUNS,
-             min_waterline_samples: int = MIN_WATERLINE_SAMPLES) -> ValidationResult:
+             merge_stats: Mapping | None = None, threshold: float = P90_GATE_FT, enforce_waterline: bool = True,
+             min_runs: int = MIN_RUNS, min_waterline_samples: int = MIN_WATERLINE_SAMPLES) -> ValidationResult:
     x, y = lonlat_to_utm10(truth.lon, truth.lat)
     total = max(len(truth.lon), 1)
+    n_runs = truth.n_runs or 0
     res = ValidationResult()
+
+    def stats_for(sel: np.ndarray, err_arr: np.ndarray) -> dict:
+        n_cells, _ = unique_cell_counts(grid, x, y, sel & np.isfinite(err_arr), truth.run_id, n_runs)
+        return {**error_stats(err_arr[sel]), "n_cells": n_cells, "coverage": float((sel & np.isfinite(err_arr)).sum()) / total}
+
     pred = sample_grid(merged_elev, grid, x, y)
     err = pred - truth.elev_ft
-    res.per_source["merged"] = {**error_stats(err), "coverage": float(np.isfinite(pred).sum()) / total}
+    res.per_source["merged"] = stats_for(np.ones(len(err), bool), err)
     if merged_src is not None:
         codes = sample_grid(merged_src.astype(np.float64), grid, x, y, fill=0.0).astype(int)
         for code in sorted(set(codes.tolist()) - {0}):
             name = SOURCE_BY_CODE[code].name if code in SOURCE_BY_CODE else f"code_{code}"
-            sel = codes == code
-            res.per_source[name] = {**error_stats(err[sel]), "coverage": float(sel.sum()) / total}
+            res.per_source[name] = stats_for(codes == code, err)
     wl_stats = None
-    per_run = [0] * (truth.n_runs or 0)
+    per_run = [0] * n_runs
     if waterline_elev is not None:
         wl_pred = sample_grid(waterline_elev, grid, x, y)
-        wl_stats = {**error_stats(wl_pred - truth.elev_ft), "coverage": float(np.isfinite(wl_pred).sum()) / total}
+        wl_err = wl_pred - truth.elev_ft
+        wl_stats = stats_for(np.ones(len(wl_err), bool), wl_err)
+        _, per_run = unique_cell_counts(grid, x, y, np.isfinite(wl_pred), truth.run_id, n_runs)
         res.per_source["waterline"] = wl_stats
-        per_run = np.bincount(truth.run_id[np.isfinite(wl_pred)], minlength=truth.n_runs or 0).tolist()
-    wl = evaluate_waterline(wl_stats, per_run, truth.n_runs or 0, threshold=threshold, enforce=enforce_waterline,
+    wl = evaluate_waterline(wl_stats, per_run, n_runs, threshold=threshold, enforce=enforce_waterline,
                             min_samples=min_waterline_samples, min_runs=min_runs)
     res.gate.update(threshold_ft=threshold, waterline_p90_ft=wl["waterline_p90_ft"])
     res.checks["waterline"] = wl
+    if not enforce_waterline:
+        res.dev_overrides.append("skip-waterline-gate")
     res.checks["bias"] = evaluate_bias(res.per_source)
+    if merge_stats is not None:
+        res.checks["plausibility"] = evaluate_plausibility(merge_stats)
+    else:
+        res.warnings.append("merge_stats not supplied: implausible-elevation masking was not checked")
     if depth_decoded is not None:
         dec = sample_grid(depth_decoded, grid, x, y)
-        res.per_source["depth_tiles_decoded"] = {**error_stats(dec - truth.elev_ft), "coverage": float(np.isfinite(dec).sum()) / total}
+        res.per_source["depth_tiles_decoded"] = stats_for(np.ones(len(dec), bool), dec - truth.elev_ft)
         both = np.isfinite(pred)
         mismatch = both & (~np.isfinite(dec) | (np.abs(np.nan_to_num(dec) - np.nan_to_num(pred)) > ENCODE_TOL_FT))
         res.checks["encode_consistency"] = {
@@ -237,40 +324,38 @@ def coalne_lines_from_geojson(gj: dict) -> list[list[tuple[float, float]]]:
     return lines
 
 
-def expected_shoreline_window(aoi: str, tol_ft: float = SHORELINE_TOL_FT) -> tuple[float, float]:
-    mhhw = AOI_MHHW_FT[aoi]
-    return (mhhw - tol_ft, mhhw + tol_ft)
-
-
 def shoreline_datum_check(grid: Grid, merged_elev: np.ndarray, lon: np.ndarray, lat: np.ndarray,
                           expected_mhhw_ft: float, tol_ft: float = SHORELINE_TOL_FT,
                           min_cells: int = SHORELINE_MIN_CELLS, search_radius_cells: int = 1) -> dict:
-    """Median merged elevation at ENC COALNE shoreline cells must be within ``tol_ft`` of the AOI's MHHW.
+    """Median merged elevation at ENC COALNE shoreline cells must be within ``tol_ft`` of the AOI's MHHW
+    (window = ``expected_mhhw_ft`` +/- ``tol_ft``, see ``common.AOI_MHHW_FT``).
 
-    Each shoreline point looks at its (2r+1)^2 cell neighbourhood and takes the neighbourhood
-    maximum, since the charted shoreline can fall a cell or two off the DEM's own waterline.
-    Fewer than ``min_cells`` shoreline cells with data is a failure (fail closed).
+    Counting is by UNIQUE grid cell (a densified line or a repeated point counts a cell once), each cell is
+    valued by the MEDIAN of its (2r+1)^2 neighbourhood (a max would let a single spike pull a low DEM up to the
+    expected value), and fewer than ``min_cells`` cells with data is a failure (fail closed).
     """
     expected = (expected_mhhw_ft - tol_ft, expected_mhhw_ft + tol_ft)
     x, y = lonlat_to_utm10(lon, lat)
     row, col = grid.xy_to_rowcol(x, y)
-    vals = []
+    ok = grid.contains_rowcol(row, col)
     r = search_radius_cells
-    for rr, cc in zip(row.tolist(), col.tolist()):
+    vals = []
+    for rr, cc in sorted(set(zip(row[ok].tolist(), col[ok].tolist()))):
         if rr - r < 0 or cc - r < 0 or rr + r >= grid.nrows or cc + r >= grid.ncols:
             continue
         patch = merged_elev[rr - r:rr + r + 1, cc - r:cc + r + 1]
-        if np.isfinite(patch).any():
-            vals.append(float(np.nanmax(patch)))
+        finite = patch[np.isfinite(patch)]
+        if finite.size:
+            vals.append(float(np.median(finite)))
     n = len(vals)
     base = {"n": n, "expected_mhhw_ft": expected_mhhw_ft, "expected_ft": list(expected)}
     if n < min_cells:
         return {**base, "passed": False, "median_ft": None,
-                "reason": f"only {n} shoreline cells with data (< {min_cells}); gate fails closed"}
+                "reason": f"only {n} unique shoreline cells with data (< {min_cells}); gate fails closed"}
     med = float(np.median(vals))
-    ok = expected[0] <= med <= expected[1]
-    return {**base, "passed": ok, "median_ft": med,
-            "reason": "ok" if ok else f"median shoreline {med:.1f} ft MLLW outside {expected[0]:.1f}..{expected[1]:.1f} - check VDatum offset/sign"}
+    ok_med = expected[0] <= med <= expected[1]
+    return {**base, "passed": bool(ok_med), "median_ft": med,
+            "reason": "ok" if ok_med else f"median shoreline {med:.1f} ft MLLW outside {expected[0]:.1f}..{expected[1]:.1f} - check VDatum offset/sign"}
 
 
 def regression_shallower(new: np.ndarray, old: np.ndarray, threshold_ft: float = 3.0) -> np.ndarray:
@@ -295,6 +380,8 @@ def render_report_html(result: ValidationResult, title: str = "Clearwater valida
         for n, c in result.checks.items()
     )
     warn = "".join(f"<li>{html.escape(w)}</li>" for w in result.warnings)
+    if result.dev_overrides:
+        warn = f"<li><b>DEV OVERRIDES ACTIVE: {html.escape(', '.join(result.dev_overrides))} - publish will refuse this report</b></li>" + warn
     g = result.gate
     status = "PASS" if result.passed else "FAIL"
     extra_html = "".join(
@@ -344,15 +431,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     if rgb_path.exists():
         with rasterio.open(rgb_path) as ds:
             decoded = decode_terrain_rgb(np.moveaxis(ds.read([1, 2, 3]), 0, -1))
-    else:
-        print(f"warning: {rgb_path} not found; skipping encode-consistency check", file=sys.stderr)
+    stats_path = merge_dir / "merge_stats.json"
+    merge_stats = json.loads(stats_path.read_text()) if stats_path.exists() else {}
     truth = concat_truth([load_run_csv(r) for r in a.runs])
-    result = validate(truth, grid, merged, src, wl, decoded, enforce_waterline=not a.skip_waterline_gate)
+    result = validate(truth, grid, merged, src, wl, decoded, merge_stats=merge_stats,
+                      enforce_waterline=not a.skip_waterline_gate)
+    if decoded is None:  # the CLI always runs after the tiles stage: a missing raster is a failure, not a warning
+        result.add_check("encode_consistency", False, f"{rgb_path} not found; run the tiles stage first (gate fails closed)")
 
     extras: dict[str, dict] = {}
     if a.skip_shoreline_check:
         result.warnings.append("shoreline datum check skipped (--skip-shoreline-check)")
-        result.add_check("shoreline_datum", True, "skipped")
+        result.add_check("shoreline_datum", True, "skipped", skipped=True)
+        result.override("skip-shoreline-check")
     elif not a.coalne:
         result.add_check("shoreline_datum", False, "no COALNE GeoJSON supplied; the datum check is mandatory (gate fails closed)")
     else:
@@ -369,7 +460,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     out = step_dir(a.data_dir, a.aoi, "validate")
     out.mkdir(parents=True, exist_ok=True)
     (out / "report.html").write_text(render_report_html(result, f"Clearwater validation - {a.aoi}", extras))
-    (out / "report.json").write_text(json.dumps({"aoi": a.aoi, "generated_at": utc_now_iso(), **result.to_dict()}, indent=2))
+    (out / "report.json").write_text(json.dumps({"aoi": a.aoi, "generated_at": utc_now_iso(), **result.to_dict()},
+                                                indent=2, allow_nan=False))
     print(result.gate["reason"])
     return exit_code(result)
 

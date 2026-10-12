@@ -3,7 +3,7 @@
     python -m pipeline.publish --aoi skagit [--version 2026-10-09T00:00:00Z] [--dry-run]
 
 Environment (never on disk): ``R2_ACCOUNT_ID``, ``R2_ACCESS_KEY_ID``, ``R2_SECRET_ACCESS_KEY``,
-``R2_BUCKET``. The R2 token should be scoped to write ``tiles/`` only.
+``R2_BUCKET``. The R2 token should be scoped to write ``tiles/`` AND ``tides/`` only.
 
 The index follows AGENT-PLAN.md exactly and validates against
 ``pipeline/schemas/tiles_index.schema.json``. Products that do not exist yet (e.g. the fleet
@@ -13,10 +13,14 @@ Tide predictions (``data/tides/<station_id>.json`` from ``fetch_tides``) are upl
 ``tides/<station_id>.json`` (unversioned: they refresh daily) and are NOT listed in ``tiles/index.json``.
 Old versions are kept for 30 days *after they are superseded* (:func:`versions_to_prune`).
 
-Safety gates (always on, also for a direct ``python -m pipeline.publish``; there is no CLI bypass):
-  * ``data/<aoi>/validate/report.json`` must exist, name this AOI and say ``gate.passed: true``;
-  * the report must be NEWER than every tile file being published (validation ran on these tiles);
-  * no tile file may be OLDER than ``merge/merged_elev.tif`` (stale-output guard).
+Safety gates (always on, also for a direct ``python -m pipeline.publish``; the CLI has no skip flag):
+  * ``data/<aoi>/validate/report.json`` must be a JSON object whose ``aoi`` equals this AOI exactly, with
+    ``gate.passed is True``, every check in ``common.REQUIRED_CHECKS`` present, ``passed is True`` and not
+    skipped, and no ``dev_overrides`` (a report produced with ``--skip-*`` flags is never publishable);
+  * the report must be NEWER than every gated tile file (validation ran on exactly these tiles);
+  * no gated tile may be OLDER than any ``merge/merged_*.tif`` (stale-output guard);
+  * ``base``, ``depth`` and ``depth_meta`` must exist (``waterline`` / ``fleet`` are optional).
+  ``land.pmtiles`` (OSM, ODbL, separate file) is uploaded when present, outside the index and the freshness gates.
 """
 
 from __future__ import annotations
@@ -25,13 +29,14 @@ import argparse
 import datetime as dt
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence
 
 import numpy as np
 
-from .common import AOI_SLUGS, DATE_NODATA, TILE_KINDS, date_from_days, step_dir
+from .common import AOI_SLUGS, DATE_NODATA, REQUIRED_CHECKS, TILE_KINDS, date_from_days, iso_z, parse_iso_z, step_dir
 from .jsonschema_lite import validate as validate_schema
 
 SCHEMA_PATH = Path(__file__).parent / "schemas" / "tiles_index.schema.json"
@@ -46,10 +51,6 @@ def load_schema() -> dict:
 def validate_index(index: Mapping[str, Any]) -> list[str]:
     """Errors against the tiles-index JSON Schema (empty = valid)."""
     return validate_schema(index, load_schema())
-
-
-def iso_z(t: dt.datetime) -> str:
-    return t.astimezone(dt.timezone.utc).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def date_range_from_days(days: np.ndarray) -> tuple[str, str]:
@@ -72,16 +73,43 @@ def build_aoi_entry(aoi: str, version: str, sizes: Mapping[str, int], date_range
     }
 
 
+def check_existing_index(existing: Any) -> dict:
+    """The live index must be a well-formed object; otherwise refuse (overwriting it would wipe other AOIs)."""
+    if not isinstance(existing, dict) or not isinstance(existing.get("aois"), list):
+        raise ValueError("live tiles/index.json is malformed (expected an object with an 'aois' list); refusing to overwrite it")
+    for a in existing["aois"]:
+        if not isinstance(a, dict) or not isinstance(a.get("aoi"), str):
+            raise ValueError("live tiles/index.json has a malformed AOI entry; refusing to overwrite it")
+    return existing
+
+
 def update_index(existing: Mapping[str, Any] | None, entry: dict, now: dt.datetime) -> dict:
-    """Replace/insert one AOI entry; AOIs stay in canonical order. Other AOIs untouched."""
-    by_aoi = {a["aoi"]: a for a in (existing or {}).get("aois", [])}
+    """Replace/insert one AOI entry; known AOIs stay in canonical order and other AOIs are untouched.
+    Entries with an unknown slug are preserved (appended), never silently dropped - the schema check
+    in :func:`publish_aoi` then fails loudly instead."""
+    by_aoi = {a["aoi"]: a for a in check_existing_index(existing)["aois"]} if existing is not None else {}
     by_aoi[entry["aoi"]] = entry
-    aois = [by_aoi[s] for s in AOI_SLUGS if s in by_aoi]
+    aois = [by_aoi[s] for s in AOI_SLUGS if s in by_aoi] + [a for k, a in by_aoi.items() if k not in AOI_SLUGS]
     return {"updated_at": iso_z(now), "aois": aois}
 
 
 def parse_version(key_part: str) -> dt.datetime:
-    return dt.datetime.strptime(key_part, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)
+    """Strict version stamp ``YYYY-MM-DDTHH:MM:SSZ`` (no trailing newline, real calendar date)."""
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", key_part):
+        raise ValueError(f"invalid version {key_part!r}; expected YYYY-MM-DDTHH:MM:SSZ")
+    return parse_iso_z(key_part)
+
+
+def valid_versions(versions: Sequence[str]) -> list[str]:
+    """Only well-formed version names (stray prefixes such as ``tmp/`` are ignored, never pruned)."""
+    out = []
+    for v in versions:
+        try:
+            parse_version(v)
+            out.append(v)
+        except ValueError:
+            pass
+    return out
 
 
 def versions_to_prune(listing: Mapping[str, Sequence[str]], current: Mapping[str, str], now: dt.datetime,
@@ -94,7 +122,7 @@ def versions_to_prune(listing: Mapping[str, Sequence[str]], current: Mapping[str
     """
     out: list[tuple[str, str]] = []
     for aoi, versions in listing.items():
-        ordered = sorted(versions, key=parse_version)
+        ordered = sorted(valid_versions(versions), key=parse_version)
         for i, v in enumerate(ordered):
             if v == current.get(aoi) or i + 1 >= len(ordered):
                 continue
@@ -108,6 +136,9 @@ class PublishRefused(RuntimeError):
     """A safety gate blocked the publish."""
 
 
+MERGED_RASTERS = ("merged_elev.tif", "merged_src.tif", "merged_date.tif", "merged_unc.tif")
+
+
 def check_publish_gates(aoi: str, data_dir: Path, tile_files: Sequence[Path]) -> None:
     """Raise :class:`PublishRefused` unless validation passed on exactly these (fresh) tiles."""
     report_path = step_dir(data_dir, aoi, "validate") / "report.json"
@@ -115,22 +146,48 @@ def check_publish_gates(aoi: str, data_dir: Path, tile_files: Sequence[Path]) ->
         raise PublishRefused(f"{report_path} missing: run `validate` before publishing")
     try:
         report = json.loads(report_path.read_text())
-    except json.JSONDecodeError as exc:
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise PublishRefused(f"{report_path} is not valid JSON: {exc}") from exc
-    if report.get("aoi") not in (None, aoi):
+    if not isinstance(report, dict):
+        raise PublishRefused(f"{report_path} is not a JSON object")
+    if report.get("aoi") != aoi:
         raise PublishRefused(f"{report_path} is for AOI {report.get('aoi')!r}, not {aoi!r}")
-    if report.get("gate", {}).get("passed") is not True:
-        raise PublishRefused(f"validation gate did not pass: {report.get('gate', {}).get('reason', 'no gate in report')}")
+    gate = report.get("gate")
+    if not isinstance(gate, dict):
+        raise PublishRefused(f"{report_path} has no gate object")
+    if gate.get("passed") is not True:
+        raise PublishRefused(f"validation gate did not pass: {gate.get('reason', 'no reason in report')}")
+    overrides = list(report.get("dev_overrides") or []) + list(gate.get("dev_overrides") or [])
+    if overrides:
+        raise PublishRefused(f"report was produced with dev overrides ({', '.join(map(str, overrides))}); rerun validate without them")
+    checks = gate.get("checks")
+    if not isinstance(checks, dict):
+        raise PublishRefused("report has no checks; rerun validate")
+    problems = []
+    for name in REQUIRED_CHECKS:
+        c = checks.get(name)
+        if not isinstance(c, dict):
+            problems.append(f"{name}: missing")
+        elif c.get("passed") is not True:
+            problems.append(f"{name}: did not pass")
+        elif c.get("skipped"):
+            problems.append(f"{name}: skipped")
+    failing = [n for n, c in checks.items() if not isinstance(c, dict) or c.get("passed") is not True]
+    problems += [f"{n}: did not pass" for n in failing if n not in REQUIRED_CHECKS]
+    if problems:
+        raise PublishRefused("validation report incomplete: " + "; ".join(problems))
     report_mtime = report_path.stat().st_mtime
     stale_report = [p.name for p in tile_files if p.stat().st_mtime >= report_mtime]
     if stale_report:
         raise PublishRefused(f"tiles changed after validation ({', '.join(stale_report)}); rerun validate")
-    merged = step_dir(data_dir, aoi, "merge") / "merged_elev.tif"
-    if not merged.exists():
-        raise PublishRefused(f"{merged} missing")
-    stale_tiles = [p.name for p in tile_files if p.stat().st_mtime < merged.stat().st_mtime]
+    merge_dir = step_dir(data_dir, aoi, "merge")
+    missing = [n for n in MERGED_RASTERS if not (merge_dir / n).exists()]
+    if missing:
+        raise PublishRefused(f"missing merge output(s): {', '.join(missing)}")
+    newest_merge = max((merge_dir / n).stat().st_mtime for n in MERGED_RASTERS)
+    stale_tiles = [p.name for p in tile_files if p.stat().st_mtime < newest_merge]
     if stale_tiles:
-        raise PublishRefused(f"tiles older than merged_elev.tif ({', '.join(stale_tiles)}); rerun tiles")
+        raise PublishRefused(f"tiles older than the merged rasters ({', '.join(stale_tiles)}); rerun tiles")
 
 
 class ObjectStore(Protocol):
@@ -177,15 +234,16 @@ class R2Store:
     def get_json(self, key: str) -> dict | None:
         try:
             body = self.client.get_object(Bucket=self.bucket, Key=key)["Body"].read()
-        except Exception as exc:  # noqa: BLE001 - botocore ClientError without importing botocore
-            if "NoSuchKey" in str(exc) or "404" in str(exc):
+        except Exception as exc:  # noqa: BLE001 - botocore ClientError is detected structurally (no botocore import)
+            code = str(((getattr(exc, "response", None) or {}).get("Error") or {}).get("Code", ""))
+            if code in ("NoSuchKey", "404"):  # ONLY a genuinely missing key means "no index yet"
                 return None
-            raise
+            raise  # AccessDenied, InternalError, network errors ... must never look like an empty bucket
         return json.loads(body)
 
     def list_versions(self, aoi: str) -> list[str]:
         resp = self.client.list_objects_v2(Bucket=self.bucket, Prefix=f"tiles/{aoi}/", Delimiter="/")
-        return sorted(p["Prefix"].split("/")[2] for p in resp.get("CommonPrefixes", []))
+        return sorted(valid_versions([p["Prefix"].split("/")[2] for p in resp.get("CommonPrefixes", [])]))
 
     def delete_version(self, aoi: str, version: str) -> None:
         prefix = f"tiles/{aoi}/{version}/"
@@ -208,8 +266,11 @@ class NullStore:
         return None
 
 
-#: Extra files shipped next to the four indexed products (not in the index schema).
-EXTRA_FILES = ("depth_meta.pmtiles",)
+#: Extra files shipped next to the four indexed products (not in the index schema; mobile finds them by path).
+#: ``depth_meta`` is derived from the merge and is freshness-gated; ``land`` (OSM, ODbL) is optional and exempt.
+GATED_EXTRA_FILES = ("depth_meta.pmtiles",)
+UNGATED_EXTRA_FILES = ("land.pmtiles",)
+REQUIRED_TILES = ("base", "depth")  # + depth_meta; waterline and fleet are optional
 
 
 def publish_aoi(aoi: str, data_dir: Path, store: ObjectStore, *, version: str | None = None,
@@ -217,22 +278,30 @@ def publish_aoi(aoi: str, data_dir: Path, store: ObjectStore, *, version: str | 
                 dry_run: bool = False) -> dict:
     """Validate gates, build the index, upload tiles then the index (dry-run: gates + index only)."""
     now = now or dt.datetime.now(dt.timezone.utc)
-    version = version or iso_z(now)
+    version = iso_z(now) if version is None else version
+    parse_version(version)  # strict: no path tricks, no month 13, no trailing newline
     tiles_dir = step_dir(data_dir, aoi, "tiles")
     sizes: dict[str, int] = {}
-    uploads: list[tuple[Path, str]] = []
+    gated: list[tuple[Path, str]] = []
     for kind in TILE_KINDS:
         p = tiles_dir / f"{kind}.pmtiles"
         if p.exists():
             sizes[kind] = p.stat().st_size
-            uploads.append((p, f"tiles/{aoi}/{version}/{kind}.pmtiles"))
-    for name in EXTRA_FILES:
+            gated.append((p, f"tiles/{aoi}/{version}/{kind}.pmtiles"))
+    for name in GATED_EXTRA_FILES:
         p = tiles_dir / name
         if p.exists():
-            uploads.append((p, f"tiles/{aoi}/{version}/{name}"))
-    if not sizes.get("depth"):
-        raise FileNotFoundError(f"{tiles_dir}/depth.pmtiles missing: nothing to publish")
-    check_publish_gates(aoi, data_dir, [local for local, _ in uploads])
+            gated.append((p, f"tiles/{aoi}/{version}/{name}"))
+    required = [f"{k}.pmtiles" for k in REQUIRED_TILES] + list(GATED_EXTRA_FILES)
+    missing = [n for n in required if not (tiles_dir / n).exists()]
+    if missing:
+        raise FileNotFoundError(f"{tiles_dir}: required tile file(s) missing: {', '.join(missing)} (waterline/fleet are optional)")
+    empty = [p.name for p, _ in gated if p.stat().st_size == 0]
+    if empty:
+        raise PublishRefused(f"zero-byte tile file(s): {', '.join(empty)}")
+    check_publish_gates(aoi, data_dir, [local for local, _ in gated])
+    ungated = [(tiles_dir / n, f"tiles/{aoi}/{version}/{n}") for n in UNGATED_EXTRA_FILES if (tiles_dir / n).exists()]
+    uploads = gated + ungated
     if date_range is None:
         import rasterio  # lazy
 
@@ -257,6 +326,10 @@ TIDES_PREFIX = "tides"
 MIN_TIDE_DAYS_AHEAD = 7  # refuse to publish a stale tide file that no longer covers the next week
 
 
+def _finite_number(v: Any) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and np.isfinite(v)
+
+
 def load_tide_files(tides_dir: Path, now: dt.datetime, min_days_ahead: int = MIN_TIDE_DAYS_AHEAD) -> dict[str, dict]:
     """Read and sanity-check every ``<station_id>.json`` in ``tides_dir`` -> {station_id: payload}."""
     files = sorted(Path(tides_dir).glob("*.json"))
@@ -265,18 +338,34 @@ def load_tide_files(tides_dir: Path, now: dt.datetime, min_days_ahead: int = MIN
     out: dict[str, dict] = {}
     for f in files:
         d = json.loads(f.read_text())
+        if not isinstance(d, dict):
+            raise ValueError(f"{f}: top-level JSON must be an object")
         problems = []
         if d.get("station_id") != f.stem:
             problems.append(f"station_id {d.get('station_id')!r} != file name")
         if d.get("datum") != "MLLW" or d.get("units") != "ft":
             problems.append("expected datum MLLW / units ft")
-        preds = d.get("predictions") or []
-        if not preds:
-            problems.append("no predictions")
+        lat, lon = d.get("lat"), d.get("lon")
+        if not (_finite_number(lat) and _finite_number(lon) and -90 <= lat <= 90 and -180 <= lon <= 180):
+            problems.append(f"lat/lon must be finite numbers in range, got {lat!r}, {lon!r}")
+        preds = d.get("predictions")
+        if not isinstance(preds, list) or not preds:
+            problems.append("predictions must be a non-empty list")
         else:
-            last = dt.datetime.strptime(preds[-1]["t"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)
-            if last < now + dt.timedelta(days=min_days_ahead):
-                problems.append(f"predictions end {preds[-1]['t']}, less than {min_days_ahead} days ahead (stale)")
+            times = []
+            for p in preds:
+                try:
+                    if not isinstance(p, dict) or not _finite_number(p.get("v")):
+                        raise ValueError
+                    times.append(parse_iso_z(p["t"]))
+                except (ValueError, KeyError, TypeError):
+                    problems.append(f"malformed prediction {p!r}")
+                    break
+            else:
+                if any(b <= a for a, b in zip(times, times[1:])):
+                    problems.append("predictions are not strictly time-ordered")
+                elif times[-1] < now + dt.timedelta(days=min_days_ahead):
+                    problems.append(f"predictions end {preds[-1]['t']}, less than {min_days_ahead} days ahead (stale)")
         if problems:
             raise ValueError(f"{f}: " + "; ".join(problems))
         out[f.stem] = d

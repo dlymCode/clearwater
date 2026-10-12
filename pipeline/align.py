@@ -6,7 +6,7 @@
 The grid origin and extent are snapped to 1,000 m multiples (``geo.grid_for_lonlat_bbox``) and
 passed to gdalwarp as ``-te`` together with ``-tr 2 2 -tap`` so every layer has identical
 shape and transform. DEMs use bilinear, lidar point DEMs over the flats use ``-r min``
-(shoalest wins on downsampling), categorical/date rasters use nearest. The command builders
+(shoalest wins on downsampling). The command builders
 are pure and unit-tested; the subprocess calls need GDAL/PDAL on PATH.
 """
 
@@ -24,7 +24,7 @@ from .common import (CELL_M, WORK_CRS, Manifest, MissingVerticalCRS, require_mll
                      vertical_tags)
 from .geo import Grid, grid_for_lonlat_bbox
 
-RESAMPLING = {"dem": "bilinear", "lidar": "min", "categorical": "near"}
+RESAMPLING = {"dem": "bilinear", "lidar": "min"}
 LIDAR_SOURCES = ("lidar_2014", "lidar_ncmp", "wa_lidar")
 GROUND_CLASS = 2
 BATHY_CLASS = 29  # LAS 1.4 "bathymetric point" (bathy bottom)
@@ -115,6 +115,7 @@ def stage_laz(aoi: str, data_dir: Path, classes: Sequence[int] = (GROUND_CLASS, 
     datum is exactly the kind of silent 2.4 ft error the pipeline exists to prevent.
     """
     fetch = Manifest.load(step_dir(data_dir, aoi, "fetch"), aoi, "fetch")
+    fetch.verify(kinds=["laz"])
     for e in fetch.select(kind="laz"):
         if not e.vertical_crs or not e.vertical_units:
             raise MissingVerticalCRS(f"{e.path}: LAZ manifest entry lacks vertical_crs/vertical_units; "
@@ -138,6 +139,7 @@ def verify_inputs_mllw(files: Sequence[Path]) -> None:
 
 def stage_warp(aoi: str, data_dir: Path) -> Manifest:
     mllw = Manifest.load(step_dir(data_dir, aoi, "mllw"), aoi, "mllw")
+    mllw.verify()
     out_dir = step_dir(data_dir, aoi, "align")
     grid = aoi_grid(aoi)
     out = Manifest(out_dir, aoi, "align")

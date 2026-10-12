@@ -43,6 +43,11 @@ def lonlat_to_utm10(lon, lat):
     """WGS84 lon/lat (deg) -> EPSG:32610 easting/northing (m). Accepts scalars or arrays."""
     lon = np.asarray(lon, dtype=np.float64)
     lat = np.asarray(lat, dtype=np.float64)
+    # Kruger series is only good inside the zone; NaN passes through (callers mask non-finite results).
+    if np.any((lat < -84.0) | (lat > 84.0)):
+        raise ValueError("latitude outside [-84, 84]: not a UTM latitude")
+    if np.any((lon < _LON0 - 9.0) | (lon > _LON0 + 9.0)):
+        raise ValueError(f"longitude more than 9 degrees from the zone 10 central meridian ({_LON0}): not EPSG:32610 territory")
     phi = np.radians(lat)
     dlam = np.radians(lon - _LON0)
     c = 2.0 * math.sqrt(_N) / (1.0 + _N)
@@ -117,10 +122,16 @@ class Grid:
         return cls(float(d["xmin"]), float(d["ymax"]), int(d["ncols"]), int(d["nrows"]), float(d.get("res", CELL_M)), d.get("crs", WORK_CRS))
 
     def xy_to_rowcol(self, x, y):
-        """Cell indices (row, col) containing UTM points; floats so callers can range-check."""
-        col = np.floor((np.asarray(x, dtype=np.float64) - self.xmin) / self.res)
-        row = np.floor((self.ymax - np.asarray(y, dtype=np.float64)) / self.res)
-        return row.astype(np.int64), col.astype(np.int64)
+        """Cell indices (row, col) containing UTM points. Non-finite coordinates map to (-1, -1), which
+        :meth:`contains_rowcol` rejects (a NaN cast to int64 would otherwise alias a real cell)."""
+        x = np.asarray(x, dtype=np.float64)
+        y = np.asarray(y, dtype=np.float64)
+        ok = np.isfinite(x) & np.isfinite(y)
+        col = np.floor((np.where(ok, x, self.xmin - self.res) - self.xmin) / self.res)
+        row = np.floor((self.ymax - np.where(ok, y, self.ymax + self.res)) / self.res)
+        col = np.clip(col, -1e15, 1e15).astype(np.int64)
+        row = np.clip(row, -1e15, 1e15).astype(np.int64)
+        return np.where(ok, row, -1), np.where(ok, col, -1)
 
     def rowcol_to_xy(self, row, col):
         """Cell-centre coordinates."""

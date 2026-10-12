@@ -9,6 +9,7 @@ from __future__ import annotations
 import datetime as _dt
 import hashlib
 import json
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -18,7 +19,6 @@ from typing import Any, Callable, Iterable
 # --------------------------------------------------------------------------
 AOI_SLUGS: tuple[str, ...] = ("skagit", "port_susan", "snohomish", "padilla_samish", "nisqually")
 
-WORK_EPSG = 32610
 WORK_CRS = "EPSG:32610"  # UTM 10N, WGS84
 OUT_CRS = "EPSG:3857"  # tiles only, at the very end
 CELL_M = 2.0  # working-grid cell size, metres
@@ -53,6 +53,21 @@ AOI_MHHW_FT: dict[str, float] = {
     "nisqually": 13.7,  # TODO-verify (Nisqually Reach; south Sound range is larger than Seattle)
 }
 SHORELINE_TOL_FT = 1.5
+
+#: Plausible elevation window (ft MLLW) applied at merge entry: anything outside (1e30, an unlabeled
+#: -9999 m sentinel, ...) becomes a hole instead of winning by date. validate.py fails when too many
+#: cells of a source had to be masked.
+ELEV_MIN_FT = -1500.0
+ELEV_MAX_FT = 500.0
+MAX_IMPLAUSIBLE_FRACTION = 0.001  # of a source's covered cells
+#: Floor for the waterline layer's uncertainty in the merge (half the bracket can be ~0).
+WATERLINE_MIN_UNC_FT = 0.3
+#: Tide heights outside this window (ft MLLW) are data errors, not tides.
+TIDE_MIN_FT = -10.0
+TIDE_MAX_FT = 20.0
+
+#: Checks that must be present AND passed (not skipped) in validate/report.json for publish to proceed.
+REQUIRED_CHECKS: tuple[str, ...] = ("waterline", "bias", "plausibility", "shoreline_datum", "encode_consistency")
 
 #: Vertical-uncertainty buckets packed into the depth_meta tiles (mobile mirrors these constants).
 #: Index 0..14 are the levels below (a value is rounded UP to the next level; anything >= 45 ft
@@ -92,6 +107,10 @@ KNOWN_UNITS = ("m", "ft")
 
 class MissingVerticalCRS(ValueError):
     """Raised when a raster has no (or an unrecognised) vertical CRS metadata."""
+
+
+class ChecksumMismatch(ValueError):
+    """A file on disk no longer matches the checksum its manifest recorded."""
 
 
 class MixedMetaError(ValueError):
@@ -158,10 +177,6 @@ BASELINE_SOURCES: tuple[str, ...] = tuple(n for n in SOURCES if n != "waterline"
 # --------------------------------------------------------------------------
 # Paths and manifests
 # --------------------------------------------------------------------------
-def default_data_dir() -> Path:
-    return Path("data")
-
-
 def step_dir(data_dir: str | Path, aoi: str, step: str) -> Path:
     if aoi not in AOI_SLUGS:
         raise ValueError(f"unknown AOI {aoi!r}; expected one of {AOI_SLUGS}")
@@ -176,8 +191,24 @@ def sha256_file(path: str | Path, chunk: int = 1 << 20) -> str:
     return h.hexdigest()
 
 
+#: The one UTC timestamp format used everywhere (manifests, reports, versions, tide files, index).
+ISO_UTC_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+
+
+def iso_z(t: _dt.datetime) -> str:
+    """UTC ISO-8601 with trailing Z, whole seconds."""
+    return t.astimezone(_dt.timezone.utc).replace(microsecond=0).strftime(ISO_UTC_FORMAT)
+
+
+def parse_iso_z(text: str) -> _dt.datetime:
+    """Strict inverse of :func:`iso_z` (raises ValueError on anything else, incl. trailing newline)."""
+    if len(text) != 20:
+        raise ValueError(f"not an ISO UTC timestamp: {text!r}")
+    return _dt.datetime.strptime(text, ISO_UTC_FORMAT).replace(tzinfo=_dt.timezone.utc)
+
+
 def utc_now_iso() -> str:
-    return _dt.datetime.now(_dt.timezone.utc).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return iso_z(_dt.datetime.now(_dt.timezone.utc))
 
 
 @dataclass
@@ -275,8 +306,37 @@ class Manifest:
 
     def save(self) -> Path:
         self.directory.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(self.to_dict(), indent=2, sort_keys=True) + "\n")
+        tmp = self.path.with_name(self.path.name + ".part")
+        tmp.write_text(json.dumps(self.to_dict(), indent=2, sort_keys=True) + "\n")
+        os.replace(tmp, self.path)  # atomic: a crash never leaves a truncated manifest
         return self.path
+
+    def entry_for(self, path: str | Path) -> ManifestEntry | None:
+        rel = self._relative(Path(path))
+        return next((e for e in self.entries if e.path == rel), None)
+
+    def is_intact(self, path: str | Path) -> bool:
+        """True iff the file exists, is non-empty and matches the checksum recorded for it."""
+        e = self.entry_for(path)
+        full = self.directory / self._relative(Path(path))
+        return bool(e) and full.is_file() and full.stat().st_size > 0 and sha256_file(full) == e.sha256
+
+    def verify(self, *, kinds: Iterable[str] | None = None, sources: Iterable[str] | None = None) -> None:
+        """Recompute SHA-256 of every (selected) recorded file; raise :class:`ChecksumMismatch` on any
+        missing, empty or altered file. Call this before a step trusts what a previous step recorded."""
+        kinds = set(kinds) if kinds is not None else None
+        sources = set(sources) if sources is not None else None
+        bad: list[str] = []
+        for e in self.entries:
+            if (kinds is not None and e.kind not in kinds) or (sources is not None and e.source not in sources):
+                continue
+            full = self.directory / e.path
+            if not full.is_file():
+                bad.append(f"{e.path}: missing")
+            elif sha256_file(full) != e.sha256:
+                bad.append(f"{e.path}: checksum differs from manifest")
+        if bad:
+            raise ChecksumMismatch(f"{self.path}: " + "; ".join(bad))
 
     @classmethod
     def load(cls, directory: str | Path, aoi: str, step: str = "fetch",
@@ -284,6 +344,8 @@ class Manifest:
         m = cls(directory, aoi, step, crs_reader)
         if m.path.exists():
             data = json.loads(m.path.read_text())
+            if data.get("aoi") != aoi or data.get("step") != step:
+                raise ValueError(f"{m.path} belongs to {data.get('aoi')}/{data.get('step')}, not {aoi}/{step}")
             m.entries = [ManifestEntry(**f) for f in data.get("files", [])]
         return m
 
@@ -312,14 +374,3 @@ def uniform_meta(entries: Iterable["ManifestEntry"]) -> dict[str, Any] | None:
     if not metas:
         return {}
     return metas[0] if all(m == metas[0] for m in metas[1:]) else None
-
-
-def chunks(seq: Iterable[Any], n: int) -> Iterable[list[Any]]:
-    buf: list[Any] = []
-    for item in seq:
-        buf.append(item)
-        if len(buf) == n:
-            yield buf
-            buf = []
-    if buf:
-        yield buf

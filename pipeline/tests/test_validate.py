@@ -7,6 +7,9 @@ from pipeline.common import AOI_MHHW_FT, SOURCES
 from pipeline.geo import Grid, utm10_to_lonlat
 
 
+GOOD_STATS = {"sources": {"bluetopo": {"covered": 1000, "implausible": 0}}}
+
+
 def make_grid_and_truth(n_pts=400, seed=0):
     grid = Grid(xmin=548000.0, ymax=5340000.0, ncols=400, nrows=400, res=2.0)
     rng = np.random.default_rng(seed)
@@ -88,7 +91,7 @@ def test_gate_cannot_pass_on_a_single_sample():
     wl2 = np.full(grid.shape, np.nan, dtype=np.float32)
     wl2[first] = wl[first]  # one perfect sample
     r = V.validate(truth, grid, merged, src, wl2)
-    assert not r.passed and "only 1 waterline samples" in r.gate["reason"]
+    assert not r.passed and "only 1 unique waterline cells" in r.gate["reason"]
 
 
 def test_gate_needs_30_samples_total():
@@ -97,7 +100,7 @@ def test_gate_needs_30_samples_total():
     wl2 = np.full(grid.shape, np.nan, dtype=np.float32)
     for r_, c_ in idx[:29]:
         wl2[r_, c_] = wl[r_, c_]
-    assert "29 waterline samples" in V.validate(truth, grid, merged, src, wl2).gate["reason"]
+    assert "29 unique waterline cells" in V.validate(truth, grid, merged, src, wl2).gate["reason"]
     wl3 = np.full(grid.shape, np.nan, dtype=np.float32)
     for r_, c_ in idx[:60]:
         wl3[r_, c_] = wl[r_, c_]
@@ -156,8 +159,9 @@ def test_points_outside_grid_are_ignored():
 def test_encode_consistency_check():
     truth, grid, merged, src, wl = build_case(lambda n: np.zeros(n))
     good = tiles.decode_terrain_rgb(tiles.encode_terrain_rgb(merged))
-    r = V.validate(truth, grid, merged, src, wl, good)
-    assert r.passed and r.checks["encode_consistency"]["passed"] and not r.warnings
+    r = V.validate(truth, grid, merged, src, wl, good, merge_stats=GOOD_STATS)
+    assert r.passed and r.checks["encode_consistency"]["passed"]
+    assert not [w for w in r.warnings if "depth_rgb" in w]
     bad = good + np.float32(0.5)  # an encode bug shifting everything half a foot
     r = V.validate(truth, grid, merged, src, wl, bad)
     assert not r.passed and "decoded depth tiles" in r.gate["reason"]
@@ -195,7 +199,7 @@ def test_shoreline_datum_check_passes_at_expected_mhhw():
     grid, elev, lon, lat = shoreline_case(AOI_MHHW_FT["skagit"])
     ok = V.shoreline_datum_check(grid, elev, lon, lat, AOI_MHHW_FT["skagit"])
     assert ok["passed"] and ok["median_ft"] == pytest.approx(10.0)
-    assert V.expected_shoreline_window("skagit") == (8.5, 11.5)
+    assert ok["expected_ft"] == [8.5, 11.5]
 
 
 @pytest.mark.parametrize("aoi", sorted(AOI_MHHW_FT))

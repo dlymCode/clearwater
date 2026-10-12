@@ -40,6 +40,8 @@ def navd88_to_mllw_ft(z_navd88_m, offset_m):
 
 def convert_array(z, src_datum: str, src_units: str, offset_m=None, nodata: float | None = None) -> np.ndarray:
     """Convert an elevation array to float32 feet MLLW (NaN where nodata / outside the datum grid)."""
+    if src_units not in ("m", "ft"):
+        raise ValueError(f"unsupported source units {src_units!r}; expected exactly 'm' or 'ft'")
     src_datum = src_datum.upper()
     z = np.asarray(z, dtype=np.float64)
     bad = ~np.isfinite(z)
@@ -141,6 +143,7 @@ def convert_raster(src_path: str | Path, dst_path: str | Path, provider: OffsetP
 
 def run(aoi: str, data_dir: Path, provider: OffsetProvider | None) -> Manifest:
     fetch = Manifest.load(step_dir(data_dir, aoi, "fetch"), aoi, "fetch")
+    fetch.verify(kinds=["dem"])  # never convert a truncated/altered download
     out_dir = step_dir(data_dir, aoi, "mllw")
     out = Manifest(out_dir, aoi, "mllw")
     for e in fetch.select(kind="dem"):

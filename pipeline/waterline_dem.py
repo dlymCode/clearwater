@@ -10,7 +10,7 @@ water have NDWI > threshold, cloud/shadow/snow cells (SCL) are excluded. For eac
     elev    = (h_dry + h_wet) / 2
     bracket = h_wet - h_dry
 
-A cell needs >= 5 usable scenes and a non-negative bracket <= 3 ft; everything else is
+A cell needs >= 5 usable scenes and a positive bracket (0 < bracket <= 3 ft); everything else is
 masked (NaN elev/bracket, DATE_NODATA date). ``n`` is always the usable-scene count so the
 app can hatch low-evidence cells. The core (:class:`WaterlineAccumulator`,
 :func:`waterline_dem`) is pure numpy and streams scene-by-scene.
@@ -29,7 +29,7 @@ from typing import Iterable, Sequence
 
 import numpy as np
 
-from .common import DATE_NODATA, step_dir, vertical_tags
+from .common import DATE_NODATA, TIDE_MAX_FT, TIDE_MIN_FT, Manifest, step_dir, vertical_tags
 
 MIN_SCENES = 5
 MAX_BRACKET_FT = 3.0
@@ -73,6 +73,9 @@ class WaterlineAccumulator:
         self.newest = np.full(shape, DATE_NODATA, dtype=np.int32)
 
     def update(self, green: np.ndarray, nir: np.ndarray, scl: np.ndarray, tide_ft: float, day: int) -> None:
+        if not np.isfinite(tide_ft) or not (TIDE_MIN_FT <= tide_ft <= TIDE_MAX_FT):
+            # one NaN/implausible tide would otherwise silently poison every cell it touches
+            raise ValueError(f"scene tide {tide_ft!r} ft is not finite or outside {TIDE_MIN_FT}..{TIDE_MAX_FT} ft MLLW")
         idx = ndwi(green, nir)
         ok = usable_mask(scl, self.usable_classes) & np.isfinite(idx)
         wet = ok & (idx > self.ndwi_threshold)
@@ -87,7 +90,7 @@ class WaterlineAccumulator:
         seen_both = np.isfinite(self.max_dry) & np.isfinite(self.min_wet)
         with np.errstate(invalid="ignore"):
             bracket = self.min_wet - self.max_dry
-        good = seen_both & (self.n >= min_scenes) & (bracket >= 0) & (bracket <= max_bracket_ft)
+        good = seen_both & (self.n >= min_scenes) & (bracket > 0) & (bracket <= max_bracket_ft)
         elev = np.where(good, (self.max_dry + self.min_wet) / 2.0, np.nan).astype(np.float32)
         br = np.where(good, bracket, np.nan).astype(np.float32)
         date = np.where(good, self.newest, np.int32(DATE_NODATA)).astype(np.int32)
@@ -162,9 +165,13 @@ def run(aoi: str, data_dir: Path, *, ndwi_threshold: float = NDWI_THRESHOLD, str
     fetch_dir = step_dir(data_dir, aoi, "fetch")
     grid = Grid.from_dict(json.loads((step_dir(data_dir, aoi, "align") / "grid.json").read_text()))
     scenes = json.loads((fetch_dir / "scenes.json").read_text())["scenes"]
+    Manifest.load(fetch_dir, aoi, "fetch").verify(kinds=["scene_band"])  # bands must match recorded checksums
     scenes = [s for s in scenes if s.get("tide_ft") is not None and len(s.get("files", {})) == 3]
     if not scenes:
         raise RuntimeError("no downloaded, tide-tagged scenes in scenes.json")
+    for s in scenes:  # fail loudly before any raster work: a bad tide poisons the whole DEM
+        if not np.isfinite(s["tide_ft"]) or not (TIDE_MIN_FT <= s["tide_ft"] <= TIDE_MAX_FT):
+            raise ValueError(f"scene {s.get('id')}: tide_ft {s['tide_ft']!r} not finite / outside {TIDE_MIN_FT}..{TIDE_MAX_FT}")
 
     out_dir = step_dir(data_dir, aoi, "waterline")
     out_dir.mkdir(parents=True, exist_ok=True)
