@@ -16,6 +16,14 @@ export class AuthError extends Error {
   }
 }
 
+/** The signing keys could not be loaded: a temporary server-side problem, not a bad token (503, not 401). */
+export class UpstreamError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "UpstreamError";
+  }
+}
+
 export interface VerifiedToken {
   sub: string;
   role: string;
@@ -34,6 +42,7 @@ export interface JwtConfig {
 }
 
 const CLOCK_SKEW_SECONDS = 5;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 function b64urlToBytes(s: string): Uint8Array<ArrayBuffer> {
   if (!/^[A-Za-z0-9_-]*$/.test(s)) throw new AuthError("malformed token");
@@ -72,9 +81,19 @@ async function defaultGetJwks(supabaseUrl: string, force: boolean): Promise<Json
     const age = now - jwksCache.fetchedAt;
     if (age < JWKS_TTL_MS && (!force || age < JWKS_MISS_REFETCH_MS)) return jwksCache.keys;
   }
-  const res = await fetch(url, { headers: { accept: "application/json" } });
-  if (!res.ok) throw new AuthError("cannot load signing keys");
-  const body = (await res.json()) as { keys?: JsonWebKey[] };
+  let res: Response;
+  try {
+    res = await fetch(url, { headers: { accept: "application/json" } });
+  } catch {
+    throw new UpstreamError("cannot reach the signing-key endpoint");
+  }
+  if (!res.ok) throw new UpstreamError(`signing-key endpoint returned ${res.status}`);
+  let body: { keys?: JsonWebKey[] };
+  try {
+    body = (await res.json()) as { keys?: JsonWebKey[] };
+  } catch {
+    throw new UpstreamError("signing-key endpoint returned invalid JSON");
+  }
   const keys = Array.isArray(body.keys) ? body.keys : [];
   jwksCache = { url, keys, fetchedAt: now };
   return keys;
@@ -146,7 +165,8 @@ export async function verifySupabaseJwt(token: string, cfg: JwtConfig): Promise<
   if (!(aud === "authenticated" || (Array.isArray(aud) && aud.includes("authenticated")))) throw new AuthError("wrong audience");
   // The anon key is also a valid Supabase JWT (role "anon"); it must never mint tile URLs.
   if (payload.role !== "authenticated") throw new AuthError("not a signed-in user");
-  if (typeof payload.sub !== "string" || !/^[0-9a-f-]{36}$/i.test(payload.sub)) throw new AuthError("missing subject");
+  if (payload.is_anonymous === true) throw new AuthError("anonymous sessions cannot download tiles");
+  if (typeof payload.sub !== "string" || !UUID_RE.test(payload.sub)) throw new AuthError("missing subject");
 
   return { sub: payload.sub.toLowerCase(), role: payload.role, exp };
 }

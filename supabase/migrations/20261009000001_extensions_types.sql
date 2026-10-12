@@ -13,7 +13,7 @@ create extension if not exists pgcrypto with schema extensions;
 -- Deny-by-default for objects created from now on in `public` (by the migration role).
 alter default privileges in schema public revoke all on tables from anon, authenticated;
 alter default privileges in schema public revoke all on sequences from anon, authenticated;
-alter default privileges in schema public revoke execute on functions from anon, authenticated;
+alter default privileges in schema public revoke execute on functions from public, anon, authenticated;
 
 -- Ping types: exact strings from docs/AGENT-PLAN.md (shared contract).
 create type public.ping_type as enum (
@@ -76,6 +76,6 @@ comment on function public.weighted_quantile(double precision[], double precisio
   'Lower weighted quantile. weighted_quantile({10,20},{1,3},0.5) = 20 (cum weights 1,4; half of 4 is 2).';
 
 revoke execute on function public.in_salish_sea(extensions.geometry) from public, anon, authenticated;
-grant execute on function public.in_salish_sea(extensions.geometry) to anon, authenticated, service_role;
+grant execute on function public.in_salish_sea(extensions.geometry) to authenticated, service_role;
 revoke execute on function public.weighted_quantile(double precision[], double precision[], double precision) from public, anon, authenticated;
 grant execute on function public.weighted_quantile(double precision[], double precision[], double precision) to service_role;

@@ -41,7 +41,8 @@ create policy profiles_insert_own on public.profiles
   for insert to authenticated with check (id = (select auth.uid()));
 create policy profiles_update_own on public.profiles
   for update to authenticated
-  using (id = (select auth.uid())) with check (id = (select auth.uid()));
+  using (id = (select auth.uid()) and public.auth_is_active())
+  with check (id = (select auth.uid()) and public.auth_is_active());
 -- No delete policy: accounts are removed by the account-delete edge function.
 
 -- groups: members read; any active user creates their own; owner renames/deletes -------------
@@ -52,6 +53,10 @@ grant insert (id, name, owner_id) on public.groups to authenticated;
 grant update (name) on public.groups to authenticated;
 grant delete on public.groups to authenticated;
 
+-- The owner_id branch is NOT redundant even though the AFTER INSERT trigger makes the owner a member:
+-- `INSERT ... RETURNING` (supabase-js `.insert().select()`) checks this SELECT policy against the new row
+-- BEFORE that AFTER trigger has run, so without it creating a group would fail with 42501.
+-- (pgTAP: "B1: a client can create a group ... even with RETURNING".)
 create policy groups_select_member on public.groups
   for select to authenticated
   using (owner_id = (select auth.uid()) or public.is_group_member(id));
@@ -100,12 +105,14 @@ create policy pings_insert_author on public.pings
     and (group_id is null or public.is_group_member(group_id))
   );
 create policy pings_delete_author on public.pings
-  for delete to authenticated using (author_id = (select auth.uid()));
+  for delete to authenticated using (author_id = (select auth.uid()) and public.auth_is_active());
 -- No update policy: pings are append-only; use promote_ping() to move a group ping public.
 
 -- ping_votes: a voter sees only their OWN votes (to reconcile optimistic client votes). Everyone else's
--- voter_id / voter_dist_m would trilaterate a named boat, so other people's votes are read through
--- public.ping_votes_feed (no identity, no distance). Written only through cast_vote().
+-- voter_id / voter_dist_m would trilaterate a named boat, and even an exact voter reputation would join
+-- back to profiles, so NO per-vote data of other people is exposed anywhere: clients get the server-side
+-- aggregates in ping_feed (vote_sum, last_confirmed_at, confirm_count, dispute_count).
+-- Written only through cast_vote().
 grant select on public.ping_votes to authenticated;
 
 create policy ping_votes_select_own on public.ping_votes
@@ -132,7 +139,7 @@ create policy messages_insert_member on public.messages
   );
 create policy messages_delete_author_or_owner on public.messages
   for delete to authenticated
-  using (author_id = (select auth.uid()) or public.is_group_owner(group_id));
+  using ((author_id = (select auth.uid()) or public.is_group_owner(group_id)) and public.auth_is_active());
 
 -- last_positions: own row + fellow group members, never older than 24 h ----------------------
 -- Writes go through report_position() only (validates the Salish Sea box, snaps to 100 m, throttles to
@@ -161,12 +168,13 @@ create policy depth_cell_aggregates_select on public.depth_cell_aggregates
 
 -- depth_uploads, depth_batches, baseline_cells, rate_events, audit_log, app_config ------------------
 -- RLS enabled, NO policies and NO grants for anon/authenticated: service role only.
--- (depth_uploads is "insert-only, never selectable" for clients; inserts go through the
---  depth-upload edge function because uploader_hash must be computed server-side. See README.)
+-- (The plan calls depth_uploads "insert-only for signed-in users". It is not client-writable at all:
+--  uploader_hash must be computed server-side, so only the depth-upload edge function, running as the
+--  service role, inserts. See README "Deviations".)
 
 -- read-model views (owner-run, security_barrier; see migration 4) ------------------------------------
 grant select on public.ping_feed to authenticated;
-grant select on public.ping_votes_feed to authenticated;
+grant select on public.messages_feed to authenticated;
 
 -- service_role keeps everything --------------------------------------------------------------
 grant all on all tables in schema public to service_role;

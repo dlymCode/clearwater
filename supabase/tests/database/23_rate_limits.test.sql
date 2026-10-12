@@ -58,20 +58,22 @@ insert into public.profiles (id, handle, vessel_name) values
   ('00000000-0000-0000-0000-0000000000a1', 'owner_one', 'F/V One'),
   ('00000000-0000-0000-0000-0000000000a2', 'member_two', 'F/V Two'),
   ('00000000-0000-0000-0000-0000000000a3', 'outsider_three', 'F/V Three'),
-  ('00000000-0000-0000-0000-0000000000a4', 'bystander_four', 'F/V Four');
+  ('00000000-0000-0000-0000-0000000000a4', 'bystander_four', 'F/V Four')
+on conflict (id) do update set handle = excluded.handle, vessel_name = excluded.vessel_name;  -- (a trigger already created placeholder rows)
 -- Group G owned by u1 (the groups trigger makes u1 the owner member), u2 joins as member.
 insert into public.groups (id, name, owner_id) values
   ('00000000-0000-0000-0000-0000000000b1', 'Skagit Crew', '00000000-0000-0000-0000-0000000000a1');
 insert into public.group_members (group_id, user_id, role) values
   ('00000000-0000-0000-0000-0000000000b1', '00000000-0000-0000-0000-0000000000a2', 'member');
 
-select plan(35);
+select plan(41);
 
 -- 30 pings/h, 60 votes/h, 10 messages/min, 1 depth batch / 15 min, 10 join attempts / 15 min,
 -- 1 position / 5 min -> HTTP 429 (SQLSTATE PT429). Counted from the append-only rate_events ledger.
 select tests.act_admin();
 insert into auth.users (id, email) select tests.u(i), 'v' || i || '@example.test' from generate_series(5, 8) i;
-insert into public.profiles (id, handle) select tests.u(i), 'voter_' || i from generate_series(5, 8) i;
+insert into public.profiles (id, handle) select tests.u(i), 'voter_' || i from generate_series(5, 8) i
+  on conflict (id) do update set handle = excluded.handle;
 
 -- ---- pings: the 31st in an hour is refused -----------------------------------------------------------
 select tests.act_as(tests.u(1));
@@ -165,6 +167,26 @@ select throws_ok($$select * from public.rate_events$$, '42501', null, 'rate_even
 select throws_ok($$delete from public.rate_events$$, '42501', null, 'rate_events: not deletable by clients (cannot reset own limits)');
 select throws_ok($$insert into public.rate_events (user_id, bucket) values (tests.u(1), 'ping')$$, '42501', null, 'rate_events: not writable by clients');
 select throws_ok($$select public.rate_limit_consume(tests.u(1), 'ping')$$, '42501', null, 'rate_limit_consume: not callable by clients');
+
+-- ---- E9: promote_ping 30/h --------------------------------------------------------------------------------------------
+select tests.act_admin();
+insert into public.pings (author_id, group_id, type, geom)
+  select tests.u(1), tests.g(), 'log', st_setsrid(st_makepoint(-122.5, 48.3), 4326) from generate_series(1, 31);
+create temp table _gp as select id from public.pings where author_id = tests.u(1) and group_id = tests.g();
+grant select on _gp to authenticated;
+select tests.act_as(tests.u(1));
+select lives_ok($$select public.promote_ping(id) from (select id from _gp order by id limit 30) x$$, 'E9: 30 promotions in an hour');
+select throws_ok($$select public.promote_ping(id) from (select id from _gp order by id offset 30 limit 1) x$$, 'PT429', null, 'E9: the 31st promote_ping returns 429');
+
+-- ---- E4/M3: refund removes only the newest event -----------------------------------------------------------------------------
+select tests.act_service();
+select public.rate_limit_consume(tests.u(8), 'message');
+select public.rate_limit_consume(tests.u(8), 'message');
+select public.rate_limit_refund(tests.u(8), 'message');
+select is((select used from public.rate_limit_status(tests.u(8), 'message')), 1, 'refund removes exactly one event');
+select is((select max_allowed from public.rate_limit_status(tests.u(8), 'group_create')), 5, 'group_create limit is 5 per hour');
+select is((select max_allowed from public.rate_limit_status(tests.u(8), 'promote')), 30, 'promote limit is 30 per hour');
+select is((select max_allowed from public.rate_limit_status(tests.u(8), 'rotate_invite')), 10, 'rotate_invite limit is 10 per hour');
 
 select * from finish();
 rollback;

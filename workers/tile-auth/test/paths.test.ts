@@ -5,7 +5,7 @@ import { validateTilePath } from "../src/paths.ts";
 test("accepts PMTiles archives and the index under tiles/", () => {
   for (const p of [
     "tiles/index.json",
-    "tiles/skagit/2026-10-09T00:00:00Z/base.pmtiles".replace(/:/g, "-"),
+    "tiles/skagit/2026-10-09T00:00:00Z/base.pmtiles", // real version directories are ISO timestamps WITH colons
     "tiles/skagit/v1/depth.pmtiles",
     "tiles/sound/lowzoom.pmtiles".replace("sound/", "sound/x/"),
     "tides/9447130.json",
@@ -21,6 +21,12 @@ test("rejects everything else", () => {
     "index.json",
     "tiles/",
     "tiles/skagit/v1/depth.tif",
+    "tiles/skagit/2026-10-09T00:00:00Z/de:pth.pmtiles", // ':' is allowed in version directories only, never in the file name
+    "tiles/skagit/2026-10-09T00:00:00Z/depth.pmtiles:x",
+    "tiles/skagit/:/depth.pmtiles",
+    "tiles/:/depth.pmtiles",
+    "tiles/skagit/..:/depth.pmtiles".replace("..:", "..") ,
+    "tides/9447:130.json",
     "tiles/skagit/v1/depth.pmtiles.bak",
     "tiles/../secrets/x.pmtiles",
     "tiles/skagit/../x.pmtiles",

@@ -58,14 +58,15 @@ insert into public.profiles (id, handle, vessel_name) values
   ('00000000-0000-0000-0000-0000000000a1', 'owner_one', 'F/V One'),
   ('00000000-0000-0000-0000-0000000000a2', 'member_two', 'F/V Two'),
   ('00000000-0000-0000-0000-0000000000a3', 'outsider_three', 'F/V Three'),
-  ('00000000-0000-0000-0000-0000000000a4', 'bystander_four', 'F/V Four');
+  ('00000000-0000-0000-0000-0000000000a4', 'bystander_four', 'F/V Four')
+on conflict (id) do update set handle = excluded.handle, vessel_name = excluded.vessel_name;  -- (a trigger already created placeholder rows)
 -- Group G owned by u1 (the groups trigger makes u1 the owner member), u2 joins as member.
 insert into public.groups (id, name, owner_id) values
   ('00000000-0000-0000-0000-0000000000b1', 'Skagit Crew', '00000000-0000-0000-0000-0000000000a1');
 insert into public.group_members (group_id, user_id, role) values
   ('00000000-0000-0000-0000-0000000000b1', '00000000-0000-0000-0000-0000000000a2', 'member');
 
-select plan(72);
+select plan(73);
 
 -- =============================== retention ===================================================
 select tests.act_admin();
@@ -91,12 +92,14 @@ update public.last_positions set updated_at = now() - interval '25 hours' where 
 alter table public.last_positions enable trigger last_positions_before_write;
 insert into public.depth_batches (batch_id, user_id, received_at) values
   (tests.c(1), tests.u(1), now() - interval '8 days'), (tests.c(2), tests.u(1), now() - interval '1 day');
-insert into public.depth_uploads (uploader_hash, cell_id, day, median_ft, p10_ft, n, held, held_reason) values
-  (repeat('a', 64), '8c2a1072b59ff01', (now() at time zone 'utc')::date - 200, -10, -12, 5, false, null),     -- >180 d: deleted
-  (repeat('b', 64), '8c2a1072b59ff02', (now() at time zone 'utc')::date - 5,   -10, -12, 5, false, null),     -- recent: kept
-  (repeat('c', 64), '8c2a1072b59ff03', (now() at time zone 'utc')::date - 40,  -50, -52, 5, true, 'baseline_disagreement'), -- stale hold: deleted
-  (repeat('d', 64), '8c2a1072b59ff04', (now() at time zone 'utc')::date - 10,  -50, -52, 5, true, 'baseline_disagreement'), -- fresh hold: kept
-  (repeat('e', 64), '8c2a1072b59ff05', (now() at time zone 'utc')::date - 40,  -50, -52, 5, true, 'admin');                  -- admin hold: kept
+-- E7: baseline holds are purged by RECEIPT day (held_on), not by the age of the sounding
+insert into public.depth_uploads (uploader_hash, cell_id, day, median_ft, p10_ft, n, held_reason, held_on) values
+  (repeat('a', 64), '8c2a1072b59ff01', (now() at time zone 'utc')::date - 200, -10, -12, 5, null, null),     -- >180 d: deleted
+  (repeat('b', 64), '8c2a1072b59ff02', (now() at time zone 'utc')::date - 5,   -10, -12, 5, null, null),     -- recent: kept
+  (repeat('c', 64), '8c2a1072b59ff03', (now() at time zone 'utc')::date - 5,   -50, -52, 5, 'baseline_disagreement', (now() at time zone 'utc')::date - 31), -- held 31 days ago: deleted
+  (repeat('d', 64), '8c2a1072b59ff04', (now() at time zone 'utc')::date - 10,  -50, -52, 5, 'baseline_disagreement', (now() at time zone 'utc')::date - 30), -- boundary (held_on = today - 30): kept
+  (repeat('e', 64), '8c2a1072b59ff05', (now() at time zone 'utc')::date - 40,  -50, -52, 5, 'admin', null),                                                  -- admin hold: kept
+  (repeat('f', 64), '8c2a1072b59ff06', (now() at time zone 'utc')::date - 60,  -50, -52, 5, 'baseline_disagreement', (now() at time zone 'utc')::date - 2);  -- old sounding, uploaded late: kept
 
 -- daily cells to roll: three old days in ONE 90-day bucket for cell X, plus a recent cell Y
 create temp table _b as select public.depth_bucket_start((now() at time zone 'utc')::date - 300) as b;
@@ -129,8 +132,9 @@ select is((select count(*) from public.depth_batches where batch_id = tests.c(1)
 select is((select count(*) from public.depth_batches where batch_id = tests.c(2)), 1::bigint, 'recent batch ledger kept');
 select is((select count(*) from public.depth_uploads where uploader_hash = repeat('a', 64)), 0::bigint, 'uploads older than 180 days are deleted');
 select is((select count(*) from public.depth_uploads where uploader_hash = repeat('b', 64)), 1::bigint, 'recent uploads kept');
-select is((select count(*) from public.depth_uploads where uploader_hash = repeat('c', 64)), 0::bigint, 'baseline holds older than 30 days are purged');
-select is((select count(*) from public.depth_uploads where uploader_hash = repeat('d', 64)), 1::bigint, 'fresh baseline holds are kept');
+select is((select count(*) from public.depth_uploads where uploader_hash = repeat('c', 64)), 0::bigint, 'E7: a baseline hold received 31 UTC days ago is purged');
+select is((select count(*) from public.depth_uploads where uploader_hash = repeat('d', 64)), 1::bigint, 'E7: boundary: a hold received exactly 30 UTC days ago is still kept (purged on day 31)');
+select is((select count(*) from public.depth_uploads where uploader_hash = repeat('f', 64)), 1::bigint, 'E7: an old sounding uploaded late (held 2 days ago) is kept: retention counts from receipt, not from the sounding day');
 select is((select count(*) from public.depth_uploads where uploader_hash = repeat('e', 64)), 1::bigint, 'admin holds are never auto-purged');
 
 select is((select count(*) from public.depth_cells where cell_id = '8c2a1072b59ff10'), 0::bigint, 'daily cells older than 180 days are deleted');
@@ -142,7 +146,7 @@ select is((select count(*) from public.depth_cell_aggregates where cell_id = '8c
 select is((select count(*) from public.depth_cells where cell_id = '8c2a1072b59ff12'), 0::bigint, 'S10: ...and its daily row is still deleted after 180 days');
 select is((select boats from public.depth_cell_aggregates where cell_id = '8c2a1072b59ff10'), 4, 'rolled aggregate keeps the max daily boat count');
 select is((select period_start from public.depth_cell_aggregates where cell_id = '8c2a1072b59ff10'), (select b from _b), 'aggregate period starts at the bucket start');
-select is((select period_end - period_start from public.depth_cell_aggregates where cell_id = '8c2a1072b59ff10'), 90, 'aggregate spans 90 days');
+select hasnt_column('public', 'depth_cell_aggregates', 'period_end', 'the aggregate period is implied: [period_start, period_start + 90 days)');
 
 -- incremental: another old day for the same cell and bucket merges into the existing aggregate
 insert into public.depth_cells (cell_id, day, median_ft, p10_ft, n, boats)

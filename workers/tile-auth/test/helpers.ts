@@ -60,13 +60,22 @@ export async function makeEs256(kid = "key-1"): Promise<EcKeys> {
 export class FakeKv implements KvLike {
   store = new Map<string, string>();
   puts: Array<{ key: string; value: string; ttl?: number }> = [];
-  get(key: string): Promise<string | null> {
-    return Promise.resolve(this.store.get(key) ?? null);
+  /** Simulated network latency per KV call, to make concurrent requests really interleave. */
+  readonly delayMs: number;
+  constructor(delayMs = 0) {
+    this.delayMs = delayMs;
   }
-  put(key: string, value: string, options?: { expirationTtl?: number }): Promise<void> {
+  private async wait(): Promise<void> {
+    if (this.delayMs > 0) await new Promise((r) => setTimeout(r, this.delayMs));
+  }
+  async get(key: string): Promise<string | null> {
+    await this.wait();
+    return this.store.get(key) ?? null;
+  }
+  async put(key: string, value: string, options?: { expirationTtl?: number }): Promise<void> {
+    await this.wait();
     this.store.set(key, value);
     this.puts.push({ key, value, ttl: options?.expirationTtl });
-    return Promise.resolve();
   }
 }
 

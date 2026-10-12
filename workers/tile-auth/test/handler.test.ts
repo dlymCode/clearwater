@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { DEFAULT_COST_MB, handle, URL_TTL_SECONDS } from "../src/index.ts";
 import { quotaKey } from "../src/quota.ts";
-import { claims, fakeR2, makeEnv, NOW, signHs256, USER } from "./helpers.ts";
+import { claims, FakeKv, fakeR2, makeEnv, makeEs256, NOW, signHs256, USER } from "./helpers.ts";
 
 const deps = { now: () => NOW };
 const PATH = "tiles/skagit/v1/depth.pmtiles";
@@ -150,4 +150,55 @@ test("misconfiguration fails closed with a generic 500", async () => {
   const res = await get(PATH, await signHs256(claims()), env);
   assert.equal(res.status, 500);
   assert.ok(!(await res.text()).includes("R2_"));
+});
+
+test("E11/B5: DAILY_QUOTA_MB that is not a finite positive number falls back to the default", async () => {
+  for (const bad of ["Infinity", "NaN", "-5", "0", "abc", ""]) {
+    const env = makeEnv({ DAILY_QUOTA_MB: bad, TILES: fakeR2({ [PATH]: 2000 * MB }) });
+    const t = await signHs256(claims());
+    assert.equal((await get(PATH, t, env)).status, 200, bad); // 2000 MB fits in the 3000 MB default
+    assert.equal((await get(PATH, t, env)).status, 429, bad); // but not twice: the limit is the default, not infinite
+  }
+});
+
+test("B5: 50 parallel sign requests for the same account cannot exceed the quota", async () => {
+  const env = makeEnv({ QUOTA: new FakeKv(1), TILES: fakeR2({ [PATH]: 100 * MB }), DAILY_QUOTA_MB: "1000" });
+  const t = await signHs256(claims());
+  const statuses = await Promise.all(Array.from({ length: 50 }, () => get(PATH, t, env).then((r) => r.status)));
+  assert.equal(statuses.filter((s) => s === 200).length, 10);
+  assert.equal(statuses.filter((s) => s === 429).length, 40);
+});
+
+test("B5: POST /sign bodies are capped (413)", async () => {
+  const env = makeEnv();
+  const t = await signHs256(claims());
+  const big = JSON.stringify({ paths: [PATH], pad: "x".repeat(5000) });
+  const res = await handle(new Request("https://tiles.example/sign", { method: "POST", headers: { authorization: `Bearer ${t}` }, body: big }), env, deps);
+  assert.equal(res.status, 413);
+  // the declared length alone is enough to refuse
+  const res2 = await handle(
+    new Request("https://tiles.example/sign", { method: "POST", headers: { authorization: `Bearer ${t}`, "content-length": "99999" }, body: "{}" }),
+    env,
+    deps,
+  );
+  assert.equal(res2.status, 413);
+  assert.equal(env.QUOTA.puts.length, 0);
+});
+
+test("E11: signing keys unreachable -> 503 with Retry-After (the user stays signed in)", async () => {
+  const k = await makeEs256("kid-503");
+  const token = await k.sign(claims());
+  const env = makeEnv({ SUPABASE_JWT_SECRET: undefined });
+  const res = await handle(
+    new Request(`https://tiles.example/sign?path=${encodeURIComponent(PATH)}`, { headers: { authorization: `Bearer ${token}` } }),
+    env,
+    { now: () => NOW, getJwks: () => Promise.reject(new Error("jwks fetch failed")) },
+  );
+  assert.equal(res.status, 503);
+  assert.equal(res.headers.get("retry-after"), "5");
+  assert.equal((await res.json()).error, "auth_unavailable");
+});
+
+test("E11: an anonymous Supabase session cannot mint tile URLs", async () => {
+  assert.equal((await get(PATH, await signHs256(claims({ is_anonymous: true })))).status, 401);
 });

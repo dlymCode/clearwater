@@ -58,14 +58,15 @@ insert into public.profiles (id, handle, vessel_name) values
   ('00000000-0000-0000-0000-0000000000a1', 'owner_one', 'F/V One'),
   ('00000000-0000-0000-0000-0000000000a2', 'member_two', 'F/V Two'),
   ('00000000-0000-0000-0000-0000000000a3', 'outsider_three', 'F/V Three'),
-  ('00000000-0000-0000-0000-0000000000a4', 'bystander_four', 'F/V Four');
+  ('00000000-0000-0000-0000-0000000000a4', 'bystander_four', 'F/V Four')
+on conflict (id) do update set handle = excluded.handle, vessel_name = excluded.vessel_name;  -- (a trigger already created placeholder rows)
 -- Group G owned by u1 (the groups trigger makes u1 the owner member), u2 joins as member.
 insert into public.groups (id, name, owner_id) values
   ('00000000-0000-0000-0000-0000000000b1', 'Skagit Crew', '00000000-0000-0000-0000-0000000000a1');
 insert into public.group_members (group_id, user_id, role) values
   ('00000000-0000-0000-0000-0000000000b1', '00000000-0000-0000-0000-0000000000a2', 'member');
 
-select plan(66);
+select plan(83);
 
 -- ---- structure --------------------------------------------------------------------------
 select has_table('public', t, 'table exists: ' || t)
@@ -82,7 +83,9 @@ select enum_has_labels('public', 'ping_type',
   'ping_type has the six contract values in order');
 
 select has_index('public', 'pings', 'pings_geom_gix', 'pings: gist index on geom');
-select has_index('public', 'pings', 'pings_created_at_idx', 'pings: index on created_at');
+select hasnt_index('public', 'pings', 'pings_created_at_idx', 'dead index dropped: pings created_at');
+select has_index('public', 'messages', 'messages_received_idx', 'messages: index on received_at (cursor sync + retention)');
+select hasnt_index('public', 'messages', 'messages_created_idx', 'dead index dropped: messages created_at');
 select has_index('public', 'messages', 'messages_group_created_idx', 'messages: index on (group, created)');
 select has_index('public', 'depth_cells', 'depth_cells_pkey', 'depth_cells: keyed by (cell_id, day)');
 select has_index('public', 'last_positions', 'last_positions_pkey', 'last_positions: keyed by user');
@@ -173,7 +176,7 @@ select throws_ok($$update public.profiles set reputation = 3.5 where handle = 'o
 select throws_ok($$update public.profiles set reputation = 0.1 where handle = 'owner_one'$$,
                  '23514', null, 'reputation below 0.2 is rejected');
 select throws_ok($$insert into auth.users (id, email) values ('00000000-0000-0000-0000-0000000000a9', 'u9@example.test');
-                   insert into public.profiles (id, handle) values ('00000000-0000-0000-0000-0000000000a9', 'x!')$$,
+                   update public.profiles set handle = 'x!' where id = '00000000-0000-0000-0000-0000000000a9'$$,
                  '23514', null, 'handle with illegal characters is rejected');
 select throws_ok($$update public.groups set invite_code = 'SHORT' where id = '00000000-0000-0000-0000-0000000000b1'$$,
                  '23514', null, 'invite code must be 8 characters');
@@ -202,6 +205,37 @@ select throws_ok($$insert into public.depth_uploads (uploader_hash, cell_id, day
 select throws_ok($$insert into public.ping_votes (ping_id, voter_id, vote)
                    select id, '00000000-0000-0000-0000-0000000000a2', 0 from public.pings limit 1$$,
                  '23514', null, 'ping_votes.vote must be +1 or -1');
+
+-- ---- hardening round: B3 p10, E6 day, dropped columns, E1/E10 function privileges ---------------------
+select tests.act_admin();
+select throws_ok($$insert into public.depth_uploads (uploader_hash, cell_id, day, median_ft, p10_ft, n)
+                   values (repeat('1', 64), '8c2a1072b59ffff', '2026-10-01', 10, 11, 5)$$,
+                 '23514', null, 'B3: depth_uploads rejects p10 deeper than the median (p10 is shoal-biased)');
+select throws_ok($$insert into public.depth_uploads (uploader_hash, cell_id, day, median_ft, p10_ft, n)
+                   values (repeat('1', 64), '8c2a1072b59ffff', '2026-10-01', 10, -2500, 5)$$,
+                 '23514', null, 'B3: depth_uploads rejects p10 outside +-2000 ft');
+select throws_ok($$insert into public.depth_cells (cell_id, day, median_ft, p10_ft, n, boats)
+                   values ('8c2a1072b59ffff', '2026-10-02', 10, 11, 5, 3)$$,
+                 '23514', null, 'B3: depth_cells rejects p10 deeper than the median');
+select throws_ok($$insert into public.depth_uploads (uploader_hash, cell_id, day, median_ft, p10_ft, n)
+                   values (repeat('1', 64), '8c2a1072b59ffff', 'infinity', 10, 9, 5)$$,
+                 '23514', null, 'E6: depth_uploads rejects day = infinity');
+select throws_ok($$insert into public.depth_uploads (uploader_hash, cell_id, day, median_ft, p10_ft, n, held)
+                   values (repeat('1', 64), '8c2a1072b59ffff', '2026-10-01', 10, 9, 5, true)$$,
+                 '428C9', null, 'depth_uploads.held is derived from held_reason and cannot be written');
+select hasnt_column('public', 'depth_batches', 'row_count', 'dead column dropped: depth_batches.row_count');
+select hasnt_column('public', 'depth_batches', 'held_count', 'dead column dropped: depth_batches.held_count');
+select hasnt_column('public', 'depth_cell_aggregates', 'period_end', 'dead column dropped: depth_cell_aggregates.period_end');
+select is(has_function_privilege('authenticated', 'public.author_publicly_visible(uuid)', 'execute'), false, 'E1: authenticated cannot call author_publicly_visible (it would reveal revoked accounts)');
+select is(has_function_privilege('authenticated', 'public.ping_visible(uuid, uuid)', 'execute'), true, 'ping_visible stays callable (RLS policy)');
+select is(has_function_privilege('anon', 'public.in_salish_sea(extensions.geometry)', 'execute'), false, 'E10: anon cannot execute in_salish_sea');
+select is(has_function_privilege('anon', 'public.vote_weight(double precision)', 'execute'), false, 'E10: anon cannot execute vote_weight');
+select is(has_function_privilege('authenticated', 'public.rate_limit_refund(uuid, text)', 'execute'), false, 'rate_limit_refund is service-only');
+select is(has_function_privilege('authenticated', 'public.ping_vote_stats(uuid, timestamptz)', 'execute'), true, 'ping_vote_stats is callable (ping_feed lateral); it re-checks visibility itself');
+select ok(pg_get_expr((select adbin from pg_attrdef d join pg_attribute a on a.attrelid = d.adrelid and a.attnum = d.adnum
+                        where d.adrelid = 'public.groups'::regclass and a.attname = 'owner_id'), 'public.groups'::regclass) ilike '%auth.uid()%',
+          'B1: groups.owner_id defaults to auth.uid()');
+select hasnt_constraint('public', 'groups', 'groups_invite_len', 'dead constraint dropped: groups_invite_len (implied by the charset check)');
 
 select * from finish();
 rollback;

@@ -22,6 +22,8 @@ declare
   v_n bigint;
   v_boats integer;
 begin
+  -- same lock key as ingest_depth_batch (re-entrant within a transaction)
+  perform pg_advisory_xact_lock(hashtextextended(p_cell || '|' || p_day::text, 0));
   select
     public.weighted_quantile(array_agg(u.median_ft order by u.median_ft, u.id),
                              array_agg(least(u.n, 100)::double precision order by u.median_ft, u.id), 0.5),
@@ -60,20 +62,28 @@ $$;
 --   p_user_id      JWT subject, stored only in depth_batches (rate limit + idempotency).
 --   p_rows         [{h3_cell, day, median_ft, p10_ft, n, uploader_hash}], hash per row because
 --                  the salt is per DAY OF THE ROW (a boat's hashes differ across days).
---   p_self_hashes  this user's hashes for the surrounding 90 days (same secret, same epoch), so
---                  "another boat" is exact even though hashes rotate daily.
+--   p_self_hashes  this user's hashes for the surrounding 90 days under every salt epoch that was
+--                  active in that window, so "another boat" is exact even though hashes rotate daily.
 --
 -- Hold rule (PRD "Depth log trust" #4, docs/AGENT-PLAN.md):
---   a row is HELD (kept, excluded from depth_cells) when |median_ft - (-baseline_elev_ft)| > 15 AND
---   no other boat corroborates it. Corroboration (a deliberate tightening of the PRD wording, which
+--   a row is HELD (kept, excluded from depth_cells) when |median_ft - (-baseline_elev_ft)| > 15 OR
+--   |p10_ft - (-baseline_elev_ft)| > 15 (a fake shoal in the p10 alone is as dangerous as a fake median),
+--   AND no other boat corroborates it. Corroboration (a deliberate tightening of the PRD wording, which
 --   only says "no other boat has logged that cell within 90 days"; flagged to the owner because with
 --   the literal wording any unrelated nearby reading would let a poisoned value through):
---     * a NON-held upload from another boat within 90 days whose median is within 5 ft of this one, or
---     * a HELD upload from another boat within 30 days within 5 ft of this one (that boat's row is
---       then RELEASED together with this row).
+--     * a NON-held upload from another boat within 90 days whose median AND p10 are each within 5 ft of
+--       this one, or
+--     * a HELD upload from another boat within 30 days within 5 ft (median and p10) of this one (that
+--       boat's row is then RELEASED together with this row).
 --   Rows with no baseline are never held. Admin-held rows (held_reason = 'admin') are never
 --   auto-released. A repeat upload by the same boat for the same (cell, day) REPLACES the earlier one
 --   (unique index), so a boat cannot add weight by re-sending.
+--
+-- Concurrency: an advisory lock per (cell, day), taken for the whole batch in sorted key order
+-- BEFORE anything is read or written, serialises concurrent batches that touch the same aggregate (two
+-- boats uploading the same cell at the same moment used to overwrite each other's aggregate, boats = 1).
+-- Sorted acquisition avoids deadlocks between batches. Released rows on other days are locked inside
+-- recompute_depth_cell(), which takes the same lock.
 -- ======================================================================================
 create or replace function public.ingest_depth_batch(
   p_batch_id uuid,
@@ -108,7 +118,6 @@ declare
   v_key text;
   v_inserted integer;
   v_owner uuid;
-  v_exists boolean;
   rel record;
 begin
   if p_rows is null or jsonb_typeof(p_rows) <> 'array'
@@ -118,6 +127,30 @@ begin
   if exists (select 1 from public.profiles where id = p_user_id and revoked_at is not null) then
     raise exception 'account_revoked' using errcode = 'PT403';
   end if;
+
+  -- Validate every row before anything is written (finite numbers, a real calendar day, p10 <= median).
+  for v_row in select * from jsonb_array_elements(p_rows) loop
+    begin
+      v_day := (v_row ->> 'day')::date;
+      v_med := (v_row ->> 'median_ft')::double precision;
+      v_p10 := (v_row ->> 'p10_ft')::double precision;
+      v_n   := (v_row ->> 'n')::integer;
+    exception when others then
+      raise exception 'invalid_row' using errcode = 'PT400';
+    end;
+    if not isfinite(v_day) or v_day not between date '2020-01-01' and date '2100-01-01'
+       or v_med in ('NaN', 'Infinity', '-Infinity') or v_p10 in ('NaN', 'Infinity', '-Infinity')
+       or v_p10 > v_med or (v_row ->> 'h3_cell') is null or (v_row ->> 'uploader_hash') is null then
+      raise exception 'invalid_row' using errcode = 'PT400';
+    end if;
+    v_keys := v_keys || ((v_row ->> 'h3_cell') || '|' || v_day::text);
+  end loop;
+
+  -- Serialise on every aggregate this batch touches, in sorted order (deadlock-free).
+  for v_key in select distinct k from unnest(v_keys) as k order by k loop
+    perform pg_advisory_xact_lock(hashtextextended(v_key, 0));
+  end loop;
+  v_keys := '{}';
 
   -- Unlink uploader ids from batch ledger rows once the 15-minute rate window has passed.
   update public.depth_batches set user_id = null
@@ -146,25 +179,28 @@ begin
     -- Sign convention: uploads are depth positive DOWN, the baseline is elevation positive UP,
     -- so the baseline depth is the negated elevation.
     select -b.baseline_elev_ft into v_base from public.baseline_cells b where b.cell_id = v_cell;
-    v_disagree := v_base is not null and abs(v_med - v_base) > c_hold_ft;
+    v_disagree := v_base is not null
+                  and (abs(v_med - v_base) > c_hold_ft or abs(v_p10 - v_base) > c_hold_ft);
     v_held := false;
 
     if v_disagree then
       select count(*) into v_agreeing
         from public.depth_uploads u
        where u.cell_id = v_cell
-         and u.held and u.held_reason = 'baseline_disagreement'
+         and u.held_reason = 'baseline_disagreement'
          and u.day between v_day - 30 and v_day + 30
          and abs(u.median_ft - v_med) <= c_agree_ft
+         and abs(u.p10_ft - v_p10) <= c_agree_ft
          and u.uploader_hash <> v_hash
          and u.uploader_hash <> all (p_self_hashes);
 
       select exists (
         select 1 from public.depth_uploads u
          where u.cell_id = v_cell
-           and not u.held
+           and u.held_reason is null
            and u.day between v_day - 90 and v_day + 90
            and abs(u.median_ft - v_med) <= c_agree_ft
+           and abs(u.p10_ft - v_p10) <= c_agree_ft
            and u.uploader_hash <> v_hash
            and u.uploader_hash <> all (p_self_hashes)
       ) into v_corroborated;
@@ -174,11 +210,12 @@ begin
       if v_agreeing > 0 and not v_held then
         for rel in
           update public.depth_uploads u
-             set held = false, held_reason = null
+             set held_reason = null, held_on = null
            where u.cell_id = v_cell
-             and u.held and u.held_reason = 'baseline_disagreement'
+             and u.held_reason = 'baseline_disagreement'
              and u.day between v_day - 30 and v_day + 30
              and abs(u.median_ft - v_med) <= c_agree_ft
+             and abs(u.p10_ft - v_p10) <= c_agree_ft
              and u.uploader_hash <> v_hash
              and u.uploader_hash <> all (p_self_hashes)
           returning u.cell_id, u.day
@@ -191,29 +228,27 @@ begin
 
     -- Upsert-replace per (boat, cell, day). An admin hold on the existing row survives the replacement.
     insert into public.depth_uploads
-      (uploader_hash, cell_id, day, median_ft, p10_ft, n, held, held_reason)
+      (uploader_hash, cell_id, day, median_ft, p10_ft, n, held_reason, held_on)
     values
-      (v_hash, v_cell, v_day, v_med, v_p10, v_n, v_held,
-       case when v_held then 'baseline_disagreement' end)
+      (v_hash, v_cell, v_day, v_med, v_p10, v_n,
+       case when v_held then 'baseline_disagreement' end,
+       case when v_held then (now() at time zone 'utc')::date end)
     on conflict (uploader_hash, cell_id, day) do update
       set median_ft   = excluded.median_ft,
           p10_ft      = excluded.p10_ft,
           n           = excluded.n,
-          held        = coalesce(depth_uploads.held_reason = 'admin', false) or excluded.held,
           held_reason = case when depth_uploads.held_reason = 'admin' then 'admin'
-                             when excluded.held then 'baseline_disagreement' end;
+                             else excluded.held_reason end,
+          held_on     = case when depth_uploads.held_reason = 'admin' then null
+                             else excluded.held_on end;
 
     if v_held then v_held_count := v_held_count + 1; else v_accepted := v_accepted + 1; end if;
     v_keys := v_keys || (v_cell || '|' || v_day::text);
   end loop;
 
-  for v_key in select distinct k from unnest(v_keys) as k loop
+  for v_key in select distinct k from unnest(v_keys) as k order by k loop
     perform public.recompute_depth_cell(split_part(v_key, '|', 1), split_part(v_key, '|', 2)::date);
   end loop;
-
-  update public.depth_batches
-     set row_count = v_accepted + v_held_count, held_count = v_held_count
-   where batch_id = p_batch_id;
 
   return jsonb_build_object('duplicate', false, 'accepted', v_accepted,
                             'held', v_held_count, 'released', v_released);
@@ -269,14 +304,16 @@ declare
   v_cell text;
   v_day date;
 begin
-  update public.depth_uploads
-     set held = p_held,
-         held_reason = case when p_held then 'admin' end
-   where id = p_upload
-  returning cell_id, day into v_cell, v_day;
+  select cell_id, day into v_cell, v_day from public.depth_uploads where id = p_upload;
   if not found then
     raise exception 'upload_not_found' using errcode = 'PT404';
   end if;
+  -- same per-aggregate lock as ingest, taken before the row changes
+  perform pg_advisory_xact_lock(hashtextextended(v_cell || '|' || v_day::text, 0));
+  update public.depth_uploads
+     set held_reason = case when p_held then 'admin' end,
+         held_on = null
+   where id = p_upload;
   perform public.recompute_depth_cell(v_cell, v_day);
   insert into public.audit_log (actor, action, target_type, target_id, details)
   values (p_actor, case when p_held then 'admin.hold_upload' else 'admin.release_upload' end,
@@ -317,10 +354,27 @@ begin
      set value = to_jsonb(((value #>> '{}')::integer + 1)), updated_at = now()
    where key = 'hmac_salt_epoch'
   returning (value #>> '{}')::integer into v_epoch;
+  -- remember the UTC day this epoch became active (depth-upload only recomputes self-hashes for epochs
+  -- that overlap a batch's +-90 day window)
+  update public.app_config
+     set value = value || jsonb_build_array(jsonb_build_object('epoch', v_epoch,
+                                                               'from', to_char(now() at time zone 'utc', 'YYYY-MM-DD'))),
+         updated_at = now()
+   where key = 'hmac_salt_epochs';
   insert into public.audit_log (actor, action, target_type, target_id, details)
   values (p_actor, 'admin.rotate_salt', 'app_config', 'hmac_salt_epoch', jsonb_build_object('epoch', v_epoch));
   return v_epoch;
 end
+$$;
+
+create or replace function public.get_salt_epochs()
+returns jsonb
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select value from public.app_config where key = 'hmac_salt_epochs';
 $$;
 
 create or replace function public.get_salt_epoch()
@@ -421,7 +475,7 @@ begin
       join pg_namespace n on n.oid = p.pronamespace
      where n.nspname = 'public'
        and p.proname in ('recompute_depth_cell','ingest_depth_batch','admin_set_upload_held',
-                         'admin_revoke_account','admin_rotate_salt','get_salt_epoch','admin_list_held',
+                         'admin_revoke_account','admin_rotate_salt','get_salt_epoch','get_salt_epochs','admin_list_held',
                          'delete_account_data','depth_batch_lookup','admin_audit')
   loop
     execute format('revoke all on function %s from public, anon, authenticated', f);

@@ -3,12 +3,15 @@
 --   pings            1 year in the database (clients hide them at 48 h)
 --   ping_votes       1 year (cascade from pings; also purged by their own age)
 --   depth daily cells 180 days, then rolled into 90-day aggregates only
---   depth_uploads    180 days (same horizon as the daily cells they feed); baseline-held rows
---                    that never found a second boat are purged after 30 days
+--   depth_uploads    180 days of sounding age (same horizon as the daily cells they feed);
+--                    baseline-held rows that never found a second boat are purged by RECEIPT day
+--                    (held_on), not sounding day: a row survives through held_on + 30 and goes in
+--                    the first run on UTC day held_on + 31. A late backlog upload of an old
+--                    sounding therefore still gets its full 30-day chance to be corroborated.
 --   last_positions   24 hours
 --   messages         90 days (by server receipt time, so a device clock cannot extend it)
 --   rate_events      2 hours (the longest window is 1 h)
---   depth_batches    7 days (idempotency window; carries a uid, so it is not kept longer)
+--   depth_batches    7 days (idempotency ledger); its uid is nulled after 15 minutes
 --
 -- All functions take an explicit "now" so pgTAP can run them against fixtures.
 
@@ -59,8 +62,8 @@ begin
       from samples s
      group by s.cell_id, s.bs
   )
-  insert into public.depth_cell_aggregates (cell_id, period_start, period_end, median_ft, p10_ft, n, boats)
-  select m.cell_id, m.bs, m.bs + 90, m.median_ft, m.p10_ft, m.n, m.boats
+  insert into public.depth_cell_aggregates (cell_id, period_start, median_ft, p10_ft, n, boats)
+  select m.cell_id, m.bs, m.median_ft, m.p10_ft, m.n, m.boats
     from merged m
   on conflict (cell_id, period_start) do update
     set median_ft = excluded.median_ft,
@@ -118,7 +121,7 @@ begin
   get diagnostics v_uploads = row_count;
 
   delete from public.depth_uploads
-   where held and held_reason = 'baseline_disagreement' and day < v_today - 30;
+   where held_reason = 'baseline_disagreement' and held_on < v_today - 30;
   get diagnostics v_held = row_count;
 
   delete from public.ping_votes where created_at < p_now - interval '1 year';

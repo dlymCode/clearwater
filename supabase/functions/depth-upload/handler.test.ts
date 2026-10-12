@@ -1,17 +1,21 @@
 import { assert, assertEquals, assertFalse } from "jsr:@std/assert@1";
+import { latLngToCell } from "npm:h3-js@4.1.0";
 import { handleDepthUpload, shuffle } from "./handler.ts";
+import { dayRange, uploaderHash } from "../_shared/hmac.ts";
 import { authed, dbError, mockDb, req } from "../_shared/testing.ts";
 
 const SECRET = "unit-test-only-not-a-real-secret-0123456789";
 const UID = "00000000-0000-0000-0000-0000000000a1";
 const NOW = () => new Date("2026-10-09T12:00:00Z");
 const BATCH = "11111111-2222-4333-8444-555555555555";
-const ROW = { h3_cell: "8c2a1072b59ffff", day: "2026-10-08", median_ft: -12.5, p10_ft: -14, n: 40 };
+const ROW = { h3_cell: "8c28d1c1da823ff", day: "2026-10-08", median_ft: -12.5, p10_ft: -14, n: 40 };
+
+const EPOCH0 = [{ epoch: 0, from: "1970-01-01" }];
 
 const ok = {
   depth_batch_lookup: () => ({ found: false, owner: null }),
   rate_limit_consume: () => ({ allowed: true, used: 0, max_allowed: 1, retry_after_s: 0 }),
-  get_salt_epoch: () => 0,
+  get_salt_epochs: () => EPOCH0,
   ingest_depth_batch: () => ({ duplicate: false, accepted: 0, held: 1, released: 0 }),
 };
 
@@ -102,7 +106,7 @@ Deno.test("429 when a second batch arrives inside 15 minutes", async () => {
 Deno.test("a salt-epoch change produces different hashes", async () => {
   const a = setup();
   await a.call(authed("POST", "tok", { batch_id: BATCH, rows: [ROW] }));
-  const b = setup({ get_salt_epoch: () => 1 });
+  const b = setup({ get_salt_epochs: () => [...EPOCH0, { epoch: 1, from: "2026-10-01" }] });
   await b.call(authed("POST", "tok", { batch_id: BATCH, rows: [ROW] }));
   const h = (s: ReturnType<typeof setup>) =>
     (s.db.calls.find((c) => c.fn === "ingest_depth_batch")!.args.p_rows as Array<{ uploader_hash: string }>)[0]
@@ -130,26 +134,60 @@ Deno.test("500 when HMAC_SALT_SECRET is missing or short", async () => {
   assertEquals(res.status, 500);
 });
 
-Deno.test("S4: self hashes cover every salt epoch up to the current one", async () => {
-  const a = setup({ get_salt_epoch: () => 0 });
+Deno.test("E5: self hashes are computed per epoch only for the days that epoch was active in the +-90 day window", async () => {
+  const epochs = [
+    { epoch: 0, from: "1970-01-01" },
+    { epoch: 1, from: "2026-09-01" },
+    { epoch: 2, from: "2026-10-05" },
+  ];
+  const a = setup();
   await a.call(authed("POST", "tok", { batch_id: BATCH, rows: [ROW] }));
-  const b = setup({ get_salt_epoch: () => 2 });
+  const b = setup({ get_salt_epochs: () => epochs });
   await b.call(authed("POST", "tok", { batch_id: BATCH, rows: [ROW] }));
   const self = (s: ReturnType<typeof setup>) =>
     s.db.calls.find((c) => c.fn === "ingest_depth_batch")!.args.p_self_hashes as string[];
-  assertEquals(self(a).length, 181);
-  assertEquals(self(b).length, 181 * 3, "epochs 0, 1 and 2 are all included");
   const rowHash = (s: ReturnType<typeof setup>) =>
     (s.db.calls.find((c) => c.fn === "ingest_depth_batch")!.args.p_rows as Array<{ uploader_hash: string }>)[0]
       .uploader_hash;
-  assert(self(b).includes(rowHash(a)), "epoch-0 hash of the same day is still recognised as this boat");
-  assert(self(b).includes(rowHash(b)));
+  assertEquals(self(a).length, 181, "one epoch: 2026-10-08 +- 90 days");
+
+  // window 2026-07-10 .. 2027-01-06 (181 days); boundaries between epochs belong to both
+  const window = dayRange("2026-07-10", "2027-01-06");
+  const expected = new Set<string>([rowHash(b)]);
+  for (const [i, e] of epochs.entries()) {
+    const to = i + 1 < epochs.length ? epochs[i + 1].from : "9999-12-31";
+    for (const d of window) if (d >= e.from && d <= to) expected.add(await uploaderHash(SECRET, UID, d, e.epoch));
+  }
+  assertEquals(new Set(self(b)), expected);
+  assert(self(b).includes(await uploaderHash(SECRET, UID, "2026-08-01", 0)), "epoch 0 covers August");
+  assertFalse(
+    self(b).includes(await uploaderHash(SECRET, UID, "2026-10-07", 0)),
+    "epoch 0 was no longer active on Oct 7",
+  );
+  assertFalse(self(b).includes(await uploaderHash(SECRET, UID, "2026-08-01", 2)), "epoch 2 did not exist in August");
+  assert(self(b).includes(rowHash(b)), "the row's own (current-epoch) hash is always included");
+  assert(self(b).length < 181 * 2, "cost is bounded by the window, not by the number of rotations");
+});
+
+Deno.test("E4: a failed ingest gives the rate-limit slot back, so the retry is not blocked for 15 minutes", async () => {
+  const s = setup({ ingest_depth_batch: () => dbError("XX000", "transient") });
+  const res = await s.call(authed("POST", "tok", { batch_id: BATCH, rows: [ROW] }));
+  assertEquals(res.status, 500);
+  const fns = s.db.calls.map((c) => c.fn);
+  assert(fns.indexOf("rate_limit_consume") < fns.indexOf("ingest_depth_batch"));
+  const refund = s.db.calls.find((c) => c.fn === "rate_limit_refund");
+  assert(refund, "refund called");
+  assertEquals(refund.args, { p_user: UID, p_bucket: "depth_batch" });
+
+  const ok2 = setup();
+  await ok2.call(authed("POST", "tok", { batch_id: BATCH, rows: [ROW] }));
+  assertFalse(ok2.db.calls.some((c) => c.fn === "rate_limit_refund"), "no refund on success");
 });
 
 Deno.test("S5: rows are shuffled before they reach the database", async () => {
   const rows = Array.from({ length: 200 }, (_, i) => ({
     ...ROW,
-    h3_cell: "8c2a1072b59" + i.toString(16).padStart(2, "0") + "ff",
+    h3_cell: latLngToCell(48.2 + i * 0.001, -122.5, 12),
   }));
   const s = setup();
   await s.call(authed("POST", "tok", { batch_id: BATCH, rows }));

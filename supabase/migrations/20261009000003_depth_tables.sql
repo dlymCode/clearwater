@@ -11,9 +11,9 @@
 --                  never client-insertable either (the edge function writes with the
 --                  service role; see supabase/README.md "Deviations").
 --   depth_cells    server-side aggregate per (cell, day). Raw soundings are never stored.
---   depth_batches  idempotency + rate-limit ledger: (client batch UUID, uid, received_at).
---                  It holds no cell data, and depth_uploads holds no time, so the two
---                  cannot be joined to follow a boat.
+--   depth_batches  idempotency ledger: (client batch UUID, uid until 15 minutes after receipt,
+--                  received_at). It holds no cell data, and depth_uploads holds no time of day,
+--                  so the two cannot be joined to follow a boat.
 
 -- H3 resolution-12 cell ids are 15 hex chars beginning "8c" (mode 1, res 12).
 create domain public.h3_res12 as text
@@ -29,6 +29,7 @@ create table public.depth_cells (
   primary key (cell_id, day),
   constraint depth_cells_median_range check (median_ft between -2000 and 2000),
   constraint depth_cells_p10_range    check (p10_ft between -2000 and 2000),
+  constraint depth_cells_p10_shoal    check (p10_ft <= median_ft),     -- p10 is the shoal-biased percentile
   constraint depth_cells_n_pos        check (n > 0),
   constraint depth_cells_boats_pos    check (boats > 0)
 );
@@ -45,14 +46,17 @@ create table public.depth_uploads (
   median_ft      double precision not null,
   p10_ft         double precision not null,
   n              integer not null,
-  held           boolean not null default false,
-  held_reason    text,
+  held_reason    text,                                   -- null = published; otherwise why it is held
+  held_on        date,                                   -- UTC day a baseline hold was received (retention); no time of day
+  held           boolean generated always as (held_reason is not null) stored,
   constraint depth_uploads_hash_hex    check (uploader_hash ~ '^[0-9a-f]{64}$'),
+  constraint depth_uploads_day_sane    check (day between date '2020-01-01' and date '2100-01-01'),  -- also rejects +-infinity
   constraint depth_uploads_median_range check (median_ft between -2000 and 2000),
   constraint depth_uploads_p10_range    check (p10_ft between -2000 and 2000),
+  constraint depth_uploads_p10_shoal    check (p10_ft <= median_ft),
   constraint depth_uploads_n_range      check (n between 1 and 86400),
-  constraint depth_uploads_held_reason  check ((held and held_reason in ('baseline_disagreement', 'admin'))
-                                               or (not held and held_reason is null))
+  constraint depth_uploads_held_reason  check (held_reason is null or held_reason in ('baseline_disagreement', 'admin')),
+  constraint depth_uploads_held_on      check (held_on is null or held_reason = 'baseline_disagreement')
 );
 -- One row per boat per cell per day: a later upload of the same (hash, cell, day) REPLACES the earlier
 -- one, so a boat cannot stack weight by re-uploading (see ingest_depth_batch).
@@ -78,22 +82,18 @@ create table public.baseline_cells (
 create table public.depth_batches (
   batch_id     uuid primary key,
   user_id      uuid references public.profiles (id) on delete cascade,   -- nulled 15 min after receipt
-  received_at  timestamptz not null default now(),
-  row_count    integer not null default 0,
-  held_count   integer not null default 0
+  received_at  timestamptz not null default now()
 );
 create index depth_batches_unlink_idx on public.depth_batches (received_at) where user_id is not null;
 
 -- 90-day rollups of daily cells older than 180 days (PRD retention table).
 create table public.depth_cell_aggregates (
   cell_id       public.h3_res12 not null,
-  period_start  date not null,
-  period_end    date not null,
+  period_start  date not null,          -- the period is [period_start, period_start + 90 days)
   median_ft     double precision not null,
   p10_ft        double precision not null,
   n             integer not null,
   boats         integer not null,       -- max boats seen on any rolled day (distinct count across days is not knowable by design)
   primary key (cell_id, period_start),
-  constraint depth_cell_aggregates_period check (period_end > period_start),
   constraint depth_cell_aggregates_n_pos  check (n > 0)
 );

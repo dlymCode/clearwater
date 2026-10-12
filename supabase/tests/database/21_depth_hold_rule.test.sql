@@ -58,14 +58,15 @@ insert into public.profiles (id, handle, vessel_name) values
   ('00000000-0000-0000-0000-0000000000a1', 'owner_one', 'F/V One'),
   ('00000000-0000-0000-0000-0000000000a2', 'member_two', 'F/V Two'),
   ('00000000-0000-0000-0000-0000000000a3', 'outsider_three', 'F/V Three'),
-  ('00000000-0000-0000-0000-0000000000a4', 'bystander_four', 'F/V Four');
+  ('00000000-0000-0000-0000-0000000000a4', 'bystander_four', 'F/V Four')
+on conflict (id) do update set handle = excluded.handle, vessel_name = excluded.vessel_name;  -- (a trigger already created placeholder rows)
 -- Group G owned by u1 (the groups trigger makes u1 the owner member), u2 joins as member.
 insert into public.groups (id, name, owner_id) values
   ('00000000-0000-0000-0000-0000000000b1', 'Skagit Crew', '00000000-0000-0000-0000-0000000000a1');
 insert into public.group_members (group_id, user_id, role) values
   ('00000000-0000-0000-0000-0000000000b1', '00000000-0000-0000-0000-0000000000a2', 'member');
 
-select plan(84);
+select plan(105);
 
 create or replace function tests.row(p_cell text, p_day date, p_med float8, p_p10 float8, p_n int, p_hash text)
 returns jsonb language sql immutable as $$
@@ -286,6 +287,59 @@ select is((public.ingest_depth_batch(tests.c(21), tests.u(3),
           '1', 'a flat that dries 4 ft (baseline elevation +4 = depth -4) vs an uploaded 30 ft is held');
 select is((select baseline_depth_ft from public.admin_list_held(tests.u(1), 100) where cell_id = tests.cell(9)::text), -4::float8,
           'admin_list_held reports the baseline as depth (negated elevation: +4 ft elevation -> -4 ft depth)');
+
+-- ---- B3. p10 is validated and compared with the baseline like the median ------------------------------------------
+select tests.act_admin();
+insert into public.baseline_cells (cell_id, baseline_elev_ft) values (tests.cell(13), -10), (tests.cell(14), -10);
+select tests.act_service();
+select is((public.ingest_depth_batch(tests.c(50), tests.u(1),
+            jsonb_build_array(tests.row(tests.cell(13), '2026-10-01', 12, -1500, 5, tests.h('a'))), '{}')) ->> 'held',
+          '1', 'B3: a normal median with a fake p10 of -1500 ft (a dry hazard) is HELD, not published');
+select is((select count(*) from public.depth_cells where cell_id = tests.cell(13)), 0::bigint, 'B3: nothing from the fake-hazard upload reaches depth_cells');
+select throws_ok(format($$select public.ingest_depth_batch(%L, %L, %L::jsonb, '{}')$$, tests.c(51), tests.u(2),
+            jsonb_build_array(tests.row(tests.cell(14), '2026-10-01', 12, 14, 5, tests.h('b')))::text),
+          'PT400', 'invalid_row', 'B3: p10 deeper than the median is rejected');
+-- a second boat whose median matches but whose p10 does not agree cannot release it
+select is((public.ingest_depth_batch(tests.c(52), tests.u(2),
+            jsonb_build_array(tests.row(tests.cell(13), '2026-10-02', 12, -1400, 5, tests.h('b'))), '{}')) ->> 'released',
+          '0', 'B3: agreement must hold for p10 too (-1500 vs -1400 is not within 5 ft)');
+select is((public.ingest_depth_batch(tests.c(53), tests.u(3),
+            jsonb_build_array(tests.row(tests.cell(13), '2026-10-03', 12, -1498, 5, tests.h('c'))), '{}')) ->> 'released',
+          '1', 'B3: a boat that genuinely agrees on median and p10 corroborates (and releases) it');
+
+-- ---- E6. non-finite / absurd days and numbers are refused before anything is written -----------------------------
+select throws_ok(format($$select public.ingest_depth_batch(%L, %L, %L::jsonb, '{}')$$, tests.c(54), tests.u(1),
+            '[{"h3_cell":"8c2a1072b59ff0d","day":"infinity","median_ft":10,"p10_ft":9,"n":5,"uploader_hash":"' || repeat('a', 64) || '"}]'),
+          'PT400', 'invalid_row', 'E6: day = infinity rejected');
+select throws_ok(format($$select public.ingest_depth_batch(%L, %L, %L::jsonb, '{}')$$, tests.c(55), tests.u(1),
+            '[{"h3_cell":"8c2a1072b59ff0d","day":"1999-01-01","median_ft":10,"p10_ft":9,"n":5,"uploader_hash":"' || repeat('a', 64) || '"}]'),
+          'PT400', 'invalid_row', 'E6: a day before 2020 is rejected');
+select throws_ok(format($$select public.ingest_depth_batch(%L, %L, %L::jsonb, '{}')$$, tests.c(56), tests.u(1),
+            '[{"h3_cell":"8c2a1072b59ff0d","day":"2026-10-01","median_ft":"NaN","p10_ft":9,"n":5,"uploader_hash":"' || repeat('a', 64) || '"}]'),
+          'PT400', 'invalid_row', 'E6: NaN median rejected');
+select is((select count(*) from public.depth_batches where batch_id in (tests.c(54), tests.c(55), tests.c(56))), 0::bigint, 'E6: rejected batches leave no ledger row');
+
+-- ---- B2. advisory locks serialise batches on the same (cell, day) -----------------------------------------------------
+select lives_ok($$select public.ingest_depth_batch(tests.c(57), tests.u(1),
+            jsonb_build_array(tests.row(tests.cell(15), '2026-10-01', 12, 10, 5, tests.h('a')), tests.row(tests.cell(15), '2026-10-02', 12, 10, 5, tests.h('a'))), '{}')$$,
+          'B2: a batch touching two aggregates');
+select cmp_ok((select count(*) from pg_locks where locktype = 'advisory' and pid = pg_backend_pid()), '>=', 2::bigint,
+              'B2: the batch holds an advisory lock for each (cell, day) it touched until commit');
+
+-- ---- E4. a failed ingest can give its rate-limit slot back ------------------------------------------------------------------
+select is((select allowed from public.rate_limit_consume(tests.u(2), 'depth_batch')), true, 'E4: slot consumed');
+select is((select allowed from public.rate_limit_status(tests.u(2), 'depth_batch')), false, 'E4: window full');
+select lives_ok($$select public.rate_limit_refund(tests.u(2), 'depth_batch')$$, 'E4: refund');
+select is((select allowed from public.rate_limit_status(tests.u(2), 'depth_batch')), true, 'E4: slot available again after a refund');
+select lives_ok($$select public.rate_limit_refund(gen_random_uuid(), 'depth_batch')$$, 'E4: refunding a user with no events is harmless');
+
+-- ---- E5. salt epochs carry their activation day ---------------------------------------------------------------------------------
+select is((select jsonb_array_length(public.get_salt_epochs())), 2, 'E5: epochs recorded so far (0 and the rotation tested above)');
+select is((public.get_salt_epochs() -> 0 ->> 'epoch'), '0', 'E5: epoch 0 ...');
+select is((public.get_salt_epochs() -> 0 ->> 'from'), '1970-01-01', 'E5: ... active since the beginning');
+select public.admin_rotate_salt(tests.u(1));
+select is((select jsonb_array_length(public.get_salt_epochs())), 3, 'E5: another rotation appends an epoch');
+select is((public.get_salt_epochs() -> 2 ->> 'from'), to_char(now() at time zone 'utc', 'YYYY-MM-DD'), 'E5: ... stamped with the UTC activation day');
 
 select * from finish();
 rollback;

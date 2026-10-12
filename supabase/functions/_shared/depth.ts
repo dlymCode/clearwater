@@ -13,6 +13,7 @@
 // Privacy rule (FLT-5): the payload must carry no uid / boat id / track order and nothing finer
 // than a UTC day. This is enforced as an ALLOW-LIST: any field outside the five below is rejected,
 // and fields that look identifying get a specific error so a misbehaving client is easy to spot.
+import { cellToLatLng, getResolution, isValidCell } from "npm:h3-js@4.1.0";
 import { addDays, isIsoDay, utcDay } from "./hmac.ts";
 import { HttpError, isUuid } from "./http.ts";
 
@@ -44,6 +45,21 @@ const TIMEY =
 
 const H3_RES12 = /^8c[0-9a-f]{13}$/;
 const DEPTH_LIMIT_FT = 2000;
+
+// Salish Sea box, the same one the database CHECKs use (supabase/migrations/..._extensions_types.sql).
+const SALISH = { minLon: -124.0, maxLon: -121.9, minLat: 46.9, maxLat: 49.1 };
+
+/** A real H3 cell at resolution 12 whose centre lies inside the Salish Sea box. */
+export function isSalishCell(cell: string): boolean {
+  if (!H3_RES12.test(cell)) return false;
+  try {
+    if (!isValidCell(cell) || getResolution(cell) !== 12) return false;
+    const [lat, lon] = cellToLatLng(cell);
+    return lon >= SALISH.minLon && lon <= SALISH.maxLon && lat >= SALISH.minLat && lat <= SALISH.maxLat;
+  } catch {
+    return false;
+  }
+}
 
 function fail(code: string, message: string): never {
   throw new HttpError(400, code, message);
@@ -108,6 +124,9 @@ export function parseDepthBatch(body: unknown, idempotencyKey: string | null, no
     if (typeof cell !== "string" || !H3_RES12.test(cell)) {
       fail("invalid_cell", `${where}: h3_cell must be a lowercase H3 resolution-12 index.`);
     }
+    if (!isSalishCell(cell)) {
+      fail("invalid_cell", `${where}: h3_cell is not a valid cell inside the Salish Sea.`);
+    }
     const day = o.day;
     if (typeof day !== "string") fail("invalid_day", `${where}: day must be a YYYY-MM-DD string.`);
     if (!isIsoDay(day)) {
@@ -119,6 +138,8 @@ export function parseDepthBatch(body: unknown, idempotencyKey: string | null, no
 
     const median = finiteInRange(o.median_ft, "median_ft", where);
     const p10 = finiteInRange(o.p10_ft, "p10_ft", where);
+    // depth is positive down and p10 is the shoal-biased percentile, so it can never exceed the median
+    if (p10 > median) fail("invalid_value", `${where}: p10_ft must not be deeper than median_ft.`);
     const n = o.n;
     if (typeof n !== "number" || !Number.isInteger(n) || n < 1 || n > 86400) {
       fail("invalid_value", `${where}: n must be an integer between 1 and 86400.`);

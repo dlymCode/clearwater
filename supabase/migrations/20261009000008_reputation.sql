@@ -35,8 +35,8 @@ begin
   create temporary table _rep_eligible on commit drop as
   select p.id as ping_id,
          p.author_id,
-         (count(*) filter (where v.vote = 1  and v.voter_dist_m <= 500)) as confirms,
-         (count(*) filter (where v.vote = -1 and v.voter_dist_m <= 500)) as disputes
+         (count(*) filter (where v.vote = 1  and public.vote_weight(v.voter_dist_m) > 0)) as confirms,
+         (count(*) filter (where v.vote = -1 and public.vote_weight(v.voter_dist_m) > 0)) as disputes
     from public.pings p
     left join public.ping_votes v on v.ping_id = p.id
    where p.rep_processed_at is null

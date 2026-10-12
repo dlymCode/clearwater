@@ -3,7 +3,7 @@ import { type Db, rpc } from "../_shared/db.ts";
 import { MAX_BODY_BYTES, parseDepthBatch } from "../_shared/depth.ts";
 import { addDays, dayRange, uploaderHash, utcDay } from "../_shared/hmac.ts";
 import { errorResponse, HttpError, json, readJsonLimited } from "../_shared/http.ts";
-import { enforceRateLimit } from "../_shared/rate-limit.ts";
+import { enforceRateLimit, refundRateLimit } from "../_shared/rate-limit.ts";
 
 export interface DepthUploadDeps {
   db: Db;
@@ -13,6 +13,26 @@ export interface DepthUploadDeps {
 }
 
 const HOLD_WINDOW_DAYS = 90;
+
+export interface SaltEpoch {
+  epoch: number;
+  /** UTC day (YYYY-MM-DD) on which this epoch became active. */
+  from: string;
+}
+
+/** Validate app_config.hmac_salt_epochs: [{epoch, from}], ascending, at least one entry. */
+export function parseEpochs(raw: unknown): SaltEpoch[] {
+  if (!Array.isArray(raw) || raw.length === 0) throw new Error("get_salt_epochs returned a bad value");
+  const out = raw.map((e) => {
+    const o = e as { epoch?: unknown; from?: unknown };
+    if (!Number.isInteger(o.epoch) || (o.epoch as number) < 0 || typeof o.from !== "string") {
+      throw new Error("get_salt_epochs returned a bad entry");
+    }
+    return { epoch: o.epoch as number, from: o.from };
+  });
+  out.sort((a, b) => a.epoch - b.epoch);
+  return out;
+}
 
 /** Fisher-Yates with crypto randomness. */
 export function shuffle<T>(items: readonly T[]): T[] {
@@ -77,35 +97,51 @@ export async function handleDepthUpload(req: Request, deps: DepthUploadDeps): Pr
     const limited = await enforceRateLimit(deps.db, user.id, "depth_batch");
     if (limited) return limited;
 
-    const epoch = Number(await rpc<number>(deps.db, "get_salt_epoch"));
-    if (!Number.isInteger(epoch) || epoch < 0) throw new Error("get_salt_epoch returned a bad value");
+    const epochs = parseEpochs(await rpc<unknown>(deps.db, "get_salt_epochs"));
+    const epoch = epochs[epochs.length - 1].epoch;
 
     const days = batch.rows.map((r) => r.day).sort();
     const first = addDays(days[0], -HOLD_WINDOW_DAYS);
     const last = addDays(days[days.length - 1], HOLD_WINDOW_DAYS);
     const span = dayRange(first, last);
-    // Hashes for the row days use the CURRENT epoch. "Self" hashes cover every epoch 0..current, so a
-    // salt rotation does not make this boat look like a stranger to its own earlier uploads.
+    // Row hashes use the CURRENT epoch. "Self" hashes cover, for every epoch, only the days of this
+    // batch's +-90 day window on which that epoch was active (its activation day up to the next
+    // epoch's), so a salt rotation does not make this boat look like a stranger to its own earlier
+    // uploads and the cost stays bounded no matter how many rotations there have been.
     const hashByDay = new Map<string, string>();
-    for (const d of span) hashByDay.set(d, await uploaderHash(deps.secret, user.id, d, epoch));
+    for (const d of batch.rows.map((r) => r.day)) {
+      if (!hashByDay.has(d)) hashByDay.set(d, await uploaderHash(deps.secret, user.id, d, epoch));
+    }
     const selfHashes = new Set(hashByDay.values());
-    for (let e = 0; e < epoch; e++) {
-      for (const d of span) selfHashes.add(await uploaderHash(deps.secret, user.id, d, e));
+    for (let i = 0; i < epochs.length; i++) {
+      const from = epochs[i].from;
+      const to = i + 1 < epochs.length ? epochs[i + 1].from : "9999-12-31";
+      for (const d of span) {
+        if (d >= from && d <= to) selfHashes.add(await uploaderHash(deps.secret, user.id, d, epochs[i].epoch));
+      }
     }
 
     // Row order is the order the boat drove its track in; the server must not retain or be able to
     // infer it, so shuffle before anything is written.
     const rows = shuffle(batch.rows.map((r) => ({ ...r, uploader_hash: hashByDay.get(r.day)! })));
-    const result = await rpc<{ duplicate: boolean; accepted?: number; held?: number }>(
-      deps.db,
-      "ingest_depth_batch",
-      {
+    let result: { duplicate: boolean; accepted?: number; held?: number };
+    try {
+      result = await rpc<typeof result>(deps.db, "ingest_depth_batch", {
         p_batch_id: batch.batchId,
         p_user_id: user.id,
         p_rows: rows,
         p_self_hashes: [...selfHashes],
-      },
-    );
+      });
+    } catch (e) {
+      // The slot was consumed before the work: give it back, so a transient 5xx does not cost the
+      // boat its 15-minute window (the client will retry the same batch id).
+      try {
+        await refundRateLimit(deps.db, user.id, "depth_batch");
+      } catch (refundError) {
+        console.error("rate limit refund failed", refundError instanceof Error ? refundError.message : "");
+      }
+      throw e;
+    }
 
     return json(200, {
       batch_id: batch.batchId,

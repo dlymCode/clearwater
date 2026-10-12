@@ -58,14 +58,15 @@ insert into public.profiles (id, handle, vessel_name) values
   ('00000000-0000-0000-0000-0000000000a1', 'owner_one', 'F/V One'),
   ('00000000-0000-0000-0000-0000000000a2', 'member_two', 'F/V Two'),
   ('00000000-0000-0000-0000-0000000000a3', 'outsider_three', 'F/V Three'),
-  ('00000000-0000-0000-0000-0000000000a4', 'bystander_four', 'F/V Four');
+  ('00000000-0000-0000-0000-0000000000a4', 'bystander_four', 'F/V Four')
+on conflict (id) do update set handle = excluded.handle, vessel_name = excluded.vessel_name;  -- (a trigger already created placeholder rows)
 -- Group G owned by u1 (the groups trigger makes u1 the owner member), u2 joins as member.
 insert into public.groups (id, name, owner_id) values
   ('00000000-0000-0000-0000-0000000000b1', 'Skagit Crew', '00000000-0000-0000-0000-0000000000a1');
 insert into public.group_members (group_id, user_id, role) values
   ('00000000-0000-0000-0000-0000000000b1', '00000000-0000-0000-0000-0000000000a2', 'member');
 
-select plan(24);
+select plan(36);
 
 -- Hand-computed vectors for  S = R_a * (1 + SUM R_i*v_i*w(d_i)) * exp(-ln2/86400 * dt).
 -- T0 is the ping's created_at; lambda gives half-life 24 h, so exp factor = 2^(-hours/24):
@@ -75,7 +76,8 @@ select plan(24);
 
 select tests.act_admin();
 insert into auth.users (id, email) values (tests.u(5), 'u5@example.test'), (tests.u(6), 'u6@example.test'), (tests.u(7), 'u7@example.test');
-insert into public.profiles (id, handle) values (tests.u(5), 'voter_five'), (tests.u(6), 'voter_six'), (tests.u(7), 'voter_seven');
+insert into public.profiles (id, handle) values (tests.u(5), 'voter_five'), (tests.u(6), 'voter_six'), (tests.u(7), 'voter_seven')
+  on conflict (id) do update set handle = excluded.handle;
 
 -- reputations: u1 author 1.0 (default), u4 author 1.5, voters: u2 1.0 (changed per case), u3 .., u5..u7
 insert into public.pings (id, author_id, type, geom, created_at) values
@@ -115,10 +117,11 @@ update public.profiles set reputation = 0.8 where id = tests.u(3);
 insert into public.ping_votes (ping_id, voter_id, vote, voter_dist_m, created_at) values
   (tests.c(4), tests.u(2),  1, 100, timestamptz '2026-10-01 14:00:00+00'),
   (tests.c(4), tests.u(3), -1, 400, timestamptz '2026-10-01 15:00:00+00');
-select ok(abs(public.score_ping(tests.c(4), timestamptz '2026-10-02 02:00:00+00') - 1.8 * 0.7071067811865476) < 1e-12,
-          'mixed votes: 1.0*(1+1.2-0.4)*2^-0.5 = 1.2727922061357857 (t_last = confirm, a dispute does not reset decay)');
-select ok(abs(public.score_ping(tests.c(4), timestamptz '2026-10-02 02:00:00+00') - 1.2727922061357857) < 1e-12,
-          'mixed votes: literal 1.2727922061357857');
+-- raw sum 1.2*1 - 0.8*0.5 = 0.8 is QUANTISED to 0.25 steps: floor(0.8*4 + 0.5)/4 = 0.75
+select ok(abs(public.score_ping(tests.c(4), timestamptz '2026-10-02 02:00:00+00') - 1.75 * 0.7071067811865476) < 1e-12,
+          'mixed votes: 1.0*(1+q(0.8))*2^-0.5 with q(0.8) = 0.75  (t_last = confirm, a dispute does not reset decay)');
+select ok(abs(public.score_ping(tests.c(4), timestamptz '2026-10-02 02:00:00+00') - 1.2374368670764582) < 1e-12,
+          'mixed votes: literal 1.2374368670764582');
 
 -- ---- distance weights at their boundaries ---------------------------------------------------------------
 update public.profiles set reputation = 1.0 where id in (tests.u(2), tests.u(3));
@@ -174,6 +177,39 @@ select ok(abs(public.score_ping(tests.c(10), (select received_at + interval '24 
           'S6: a ping stamped 3 days in the future decays from its server receipt time (S = 0.5 at received_at + 24 h)');
 select ok(abs(public.score_ping(tests.c(10), (select received_at from public.pings where id = tests.c(10))) - 1.0) < 1e-9,
           'S6: ...and is exactly R_a at received_at');
+
+-- ---- C1 redesign: vote_sum is quantised to 0.25 steps, round half UP (floor(x*4 + 0.5)/4) --------------------
+select tests.act_admin();
+update public.profiles set reputation = 0.25 where id = tests.u(7);
+update public.profiles set reputation = 1.0 where id = tests.u(2);
+insert into public.pings (id, author_id, type, geom, created_at) values
+  (tests.c(11), tests.u(1), 'log', st_setsrid(st_makepoint(-122.5, 48.3), 4326), timestamptz '2026-10-01 12:00:00+00'),
+  (tests.c(12), tests.u(1), 'log', st_setsrid(st_makepoint(-122.5, 48.3), 4326), timestamptz '2026-10-01 12:00:00+00'),
+  (tests.c(13), tests.u(1), 'log', st_setsrid(st_makepoint(-122.5, 48.3), 4326), timestamptz '2026-10-01 12:00:00+00');
+insert into public.ping_votes (ping_id, voter_id, vote, voter_dist_m, created_at) values
+  (tests.c(11), tests.u(7),  1, 300, timestamptz '2026-10-01 13:00:00+00'),   -- 0.25 * 1 * 0.5 =  0.125  -> half up -> 0.25
+  (tests.c(12), tests.u(7), -1, 300, timestamptz '2026-10-01 13:00:00+00'),   -- 0.25 * -1 * 0.5 = -0.125 -> half up -> 0
+  (tests.c(13), tests.u(2),  1, 100, timestamptz '2026-10-01 13:00:00+00'),   -- 1.0
+  (tests.c(13), tests.u(7), -1, 100, timestamptz '2026-10-01 13:00:00+00');   -- -0.25  => sum 0.75 exactly
+select is((select vote_sum from public.ping_vote_stats(tests.c(11), timestamptz '2026-10-02 00:00:00+00')), 0.25::double precision, 'quantise: 0.125 rounds half up to 0.25');
+select is((select vote_sum from public.ping_vote_stats(tests.c(12), timestamptz '2026-10-02 00:00:00+00')), 0::double precision, 'quantise: -0.125 rounds half up to 0');
+select is((select vote_sum from public.ping_vote_stats(tests.c(13), timestamptz '2026-10-02 00:00:00+00')), 0.75::double precision, 'quantise: an exact multiple of 0.25 is unchanged');
+select ok(abs(public.score_ping(tests.c(11), timestamptz '2026-10-01 13:00:00+00') - 1.25) < 1e-12, 'score uses the quantised sum: 1*(1+0.25) at the vote');
+select is((select confirm_count from public.ping_vote_stats(tests.c(13), timestamptz '2026-10-02 00:00:00+00')), 1, 'confirm_count');
+select is((select dispute_count from public.ping_vote_stats(tests.c(13), timestamptz '2026-10-02 00:00:00+00')), 1, 'dispute_count');
+select is((select last_confirmed_at from public.ping_vote_stats(tests.c(13), timestamptz '2026-10-02 00:00:00+00')), timestamptz '2026-10-01 13:00:00+00', 'last_confirmed_at');
+-- votes dated after `at` (e.g. future-dated fixtures) are excluded from ALL four aggregates
+select is((select vote_sum from public.ping_vote_stats(tests.c(13), timestamptz '2026-10-01 12:30:00+00')), 0::double precision, 'future-dated votes excluded: vote_sum');
+select is((select confirm_count + dispute_count from public.ping_vote_stats(tests.c(13), timestamptz '2026-10-01 12:30:00+00')), 0, 'future-dated votes excluded: counts');
+select is((select last_confirmed_at from public.ping_vote_stats(tests.c(13), timestamptz '2026-10-01 12:30:00+00')), null::timestamptz, 'future-dated votes excluded: last_confirmed_at');
+-- vote_weight is the single w(d)
+select is(array(select public.vote_weight(d) from unnest(array[null, 0, 200, 200.0001, 500, 500.0001, 9000]::float8[]) d), array[0.0, 1.0, 1.0, 0.5, 0.5, 0.0, 0.0]::float8[], 'vote_weight: NULL/0/200/200.0001/500/500.0001/9000');
+-- the feed carries the same numbers a client needs
+select tests.act_as(tests.u(3));
+select ok(abs((select f.author_reputation * (1 + f.vote_sum)
+                      * exp(-(ln(2::float8) / 86400.0) * greatest(extract(epoch from (now() - greatest(least(f.created_at, f.received_at), f.last_confirmed_at)))::float8, 0))
+                 from public.ping_feed f where f.id = tests.c(13)) - public.score_ping(tests.c(13), now())) < 1e-9,
+          'client-side formula over ping_feed columns equals score_ping(now())');
 
 select * from finish();
 rollback;

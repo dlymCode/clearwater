@@ -16,6 +16,36 @@ import { presignGet } from "./sigv4.ts";
 
 export const URL_TTL_SECONDS = 24 * 60 * 60;
 export const MAX_PATHS_PER_REQUEST = 8;
+/** 8 paths of <= 200 chars is ~2 KB; anything near this cap is not a legitimate request. */
+export const MAX_BODY_BYTES = 4096;
+
+class BodyTooLarge extends Error {}
+
+async function readLimited(req: Request, max: number): Promise<string> {
+  const declared = Number(req.headers.get("content-length") ?? "0");
+  if (Number.isFinite(declared) && declared > max) throw new BodyTooLarge();
+  if (!req.body) return "";
+  const reader = req.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > max) {
+      await reader.cancel();
+      throw new BodyTooLarge();
+    }
+    chunks.push(value);
+  }
+  const all = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) {
+    all.set(c, off);
+    off += c.byteLength;
+  }
+  return new TextDecoder().decode(all);
+}
 export const DEFAULT_DAILY_QUOTA_MB = 3000;
 /** Charged when the object size is unknown (no R2 binding configured). */
 export const DEFAULT_COST_MB = 250;
@@ -96,8 +126,10 @@ export async function handle(req: Request, env: Env, deps: Deps = defaultDeps): 
     userId = v.sub;
   } catch (e) {
     if (e instanceof AuthError) return unauthorized("Invalid or expired token.");
-    console.error("jwt verification failed unexpectedly");
-    return json(502, { error: "auth_unavailable" });
+    // Anything that is not a verdict on the token (signing keys unreachable, unexpected error) is a
+    // temporary server-side problem: 503 so the app retries, never a 401 that would sign the user out.
+    console.error("jwt verification unavailable", e instanceof Error ? e.name : "");
+    return json(503, { error: "auth_unavailable" }, { "retry-after": "5" });
   }
 
   // 2. which paths ------------------------------------------------------------------------------
@@ -107,8 +139,9 @@ export async function handle(req: Request, env: Env, deps: Deps = defaultDeps): 
   } else {
     let body: unknown;
     try {
-      body = await req.json();
-    } catch {
+      body = JSON.parse(await readLimited(req, MAX_BODY_BYTES));
+    } catch (e) {
+      if (e instanceof BodyTooLarge) return json(413, { error: "payload_too_large" });
       return json(400, { error: "invalid_json" });
     }
     const paths = (body as { paths?: unknown } | null)?.paths;
@@ -141,7 +174,8 @@ export async function handle(req: Request, env: Env, deps: Deps = defaultDeps): 
 
   // 4. quota -----------------------------------------------------------------------------------------
   const now = deps.now();
-  const limitMb = Number(env.DAILY_QUOTA_MB) > 0 ? Number(env.DAILY_QUOTA_MB) : DEFAULT_DAILY_QUOTA_MB;
+  const quotaSetting = Number(env.DAILY_QUOTA_MB);
+  const limitMb = Number.isFinite(quotaSetting) && quotaSetting > 0 ? quotaSetting : DEFAULT_DAILY_QUOTA_MB;
   const quota = await consumeQuota(env.QUOTA, userId, now, costMb, limitMb);
   if (!quota.allowed) {
     return json(

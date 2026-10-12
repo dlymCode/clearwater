@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { AuthError, resetJwksCache, verifySupabaseJwt } from "../src/jwt.ts";
+import { AuthError, resetJwksCache, UpstreamError, verifySupabaseJwt } from "../src/jwt.ts";
 import { b64url, claims, HS_SECRET, makeEs256, NOW_SECONDS, signHs256, SUPABASE_URL, USER } from "./helpers.ts";
 
 const base = { supabaseUrl: SUPABASE_URL, nowSeconds: NOW_SECONDS };
@@ -102,6 +102,37 @@ test("ES256 via the default JWKS fetcher caches and refetches once on an unknown
     keys = [k1.jwk, k2.jwk];
     await verifySupabaseJwt(await k2.sign(claims()), cfg);
     assert.ok(calls >= before, "unknown kid triggers at most one refetch");
+  } finally {
+    globalThis.fetch = realFetch;
+    resetJwksCache();
+  }
+});
+
+test("E11: subject must be a real UUID (36 dashes used to pass the old shape check)", async () => {
+  for (const sub of ["-".repeat(36), "g".repeat(8) + "-0000-0000-0000-" + "0".repeat(12), "0".repeat(36), USER + "x"]) {
+    await rejects(verifySupabaseJwt(await signHs256(claims({ sub })), hs), /subject/);
+  }
+  await verifySupabaseJwt(await signHs256(claims({ sub: USER.toUpperCase() })), hs);
+});
+
+test("E11: anonymous sessions (is_anonymous) are refused", async () => {
+  await rejects(verifySupabaseJwt(await signHs256(claims({ is_anonymous: true })), hs), /anonymous/);
+  await verifySupabaseJwt(await signHs256(claims({ is_anonymous: false })), hs);
+});
+
+test("E11: an unreachable JWKS endpoint is an UpstreamError (503), not an AuthError (401)", async () => {
+  resetJwksCache();
+  const k = await makeEs256("kid-9");
+  const realFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = (() => Promise.reject(new TypeError("network down"))) as typeof fetch;
+    await assert.rejects(verifySupabaseJwt(await k.sign(claims()), base), (e: unknown) => e instanceof UpstreamError);
+    resetJwksCache();
+    globalThis.fetch = (() => Promise.resolve(new Response("oops", { status: 500 }))) as typeof fetch;
+    await assert.rejects(verifySupabaseJwt(await k.sign(claims()), base), (e: unknown) => e instanceof UpstreamError);
+    resetJwksCache();
+    globalThis.fetch = (() => Promise.resolve(new Response("not json", { status: 200 }))) as typeof fetch;
+    await assert.rejects(verifySupabaseJwt(await k.sign(claims()), base), (e: unknown) => e instanceof UpstreamError);
   } finally {
     globalThis.fetch = realFetch;
     resetJwksCache();

@@ -58,14 +58,15 @@ insert into public.profiles (id, handle, vessel_name) values
   ('00000000-0000-0000-0000-0000000000a1', 'owner_one', 'F/V One'),
   ('00000000-0000-0000-0000-0000000000a2', 'member_two', 'F/V Two'),
   ('00000000-0000-0000-0000-0000000000a3', 'outsider_three', 'F/V Three'),
-  ('00000000-0000-0000-0000-0000000000a4', 'bystander_four', 'F/V Four');
+  ('00000000-0000-0000-0000-0000000000a4', 'bystander_four', 'F/V Four')
+on conflict (id) do update set handle = excluded.handle, vessel_name = excluded.vessel_name;  -- (a trigger already created placeholder rows)
 -- Group G owned by u1 (the groups trigger makes u1 the owner member), u2 joins as member.
 insert into public.groups (id, name, owner_id) values
   ('00000000-0000-0000-0000-0000000000b1', 'Skagit Crew', '00000000-0000-0000-0000-0000000000a1');
 insert into public.group_members (group_id, user_id, role) values
   ('00000000-0000-0000-0000-0000000000b1', '00000000-0000-0000-0000-0000000000a2', 'member');
 
-select plan(96);
+select plan(113);
 
 -- Pings: c1 = u1 public, c2 = u1 in group G, c3 = u3 public. Skagit Bay, ~(-122.5, 48.3).
 select tests.act_admin();
@@ -100,6 +101,8 @@ select is((select author_handle from public.ping_feed where id = tests.c(1)), 'o
 select is((select count(*) from public.ping_feed where id = tests.c(2)), 0::bigint, 'ping_feed: a group ping does not leak to a non-member');
 select is((select count(*) from public.ping_feed where group_id = tests.g()), 0::bigint, 'ping_feed: filtering by group does not leak either');
 select has_column('public', 'ping_feed', 'author_reputation', 'ping_feed exposes author_reputation');
+select is((select count(distinct id) from public.ping_feed), (select count(*) from public.ping_feed), 'ping_feed.id is unique (keyset pagination tie-break)');
+select is((select count(*) from public.ping_feed where vote_sum is null or confirm_count is null or dispute_count is null), 0::bigint, 'ping_feed: vote_sum and the counts are never null (last_confirmed_at is null until the first confirm)');
 select has_column('public', 'ping_feed', 'received_at', 'ping_feed exposes received_at');
 select is((select author_reputation from public.ping_feed where id = tests.c(1)), 1.0::double precision, 'ping_feed: author_reputation for a normal ping');
 select tests.act_anon();
@@ -242,15 +245,21 @@ select ok((select voter_dist_m from public.ping_votes where ping_id = tests.c(1)
 select tests.act_as(tests.u(3));
 select is((select count(*) from public.ping_votes where ping_id = tests.c(1)), 1::bigint, 'ping_votes select: a voter sees only their own vote rows');
 select is((select count(*) from public.ping_votes where voter_id <> tests.u(3)), 0::bigint, 'ping_votes: other people''s voter_id / distance are not readable');
-select hasnt_column('public', 'ping_votes_feed', 'voter_id', 'ping_votes_feed has no voter_id');
-select hasnt_column('public', 'ping_votes_feed', 'voter_dist_m', 'ping_votes_feed has no distance');
-select columns_are('public', 'ping_votes_feed', array['ping_id','vote','created_at','voter_reputation','weight'], 'ping_votes_feed has exactly the agreed columns');
-select is((select array_agg(weight order by weight) from public.ping_votes_feed where ping_id = tests.c(1)),
-          array[0.0, 0.5, 1.0]::double precision[], 'ping_votes_feed: precomputed weights (far=0, 200-500 m=0.5, <=200 m=1.0)');
-select is((select count(*) from public.ping_votes_feed where ping_id = tests.c(1)), 3::bigint, 'ping_votes_feed: all votes on a public ping are visible (identity-free)');
+select hasnt_view('public', 'ping_votes_feed', 'C1: ping_votes_feed no longer exists: per-vote data never leaves the server');
+select hasnt_column('public', 'ping_feed', 'voter_id', 'ping_feed has no voter_id');
+select hasnt_column('public', 'ping_feed', 'voter_reputation', 'ping_feed has no per-voter reputation (it would join back to profiles)');
+select has_column('public', 'ping_feed', 'vote_sum', 'ping_feed.vote_sum');
+select has_column('public', 'ping_feed', 'last_confirmed_at', 'ping_feed.last_confirmed_at');
+select has_column('public', 'ping_feed', 'confirm_count', 'ping_feed.confirm_count');
+select has_column('public', 'ping_feed', 'dispute_count', 'ping_feed.dispute_count');
+-- c(1) votes: u3 dispute from ~2 km (w 0), u2 confirm ~0 m (w 1, R 1), u4 confirm ~330 m (w 0.5, R 1):  sum = 1.5
+select is((select vote_sum from public.ping_feed where id = tests.c(1)), 1.5::double precision, 'ping_feed: vote_sum = 1*1 + 1*0.5 (the far dispute weighs 0)');
+select is((select confirm_count from public.ping_feed where id = tests.c(1)), 2, 'ping_feed: confirm_count counts the weighted confirms');
+select is((select dispute_count from public.ping_feed where id = tests.c(1)), 0, 'ping_feed: a far (weight 0) dispute is not counted');
+select ok((select last_confirmed_at from public.ping_feed where id = tests.c(1)) is not null, 'ping_feed: last_confirmed_at is set');
 select tests.act_as(tests.u(1));
 select is((select count(*) from public.ping_votes where ping_id = tests.c(1)), 0::bigint, 'ping_votes: the ping author cannot read who voted either');
-select is((select count(*) from public.ping_votes_feed where ping_id = tests.c(1)), 3::bigint, 'ping_votes_feed: the author sees the weighted votes');
+select is((select vote_sum from public.ping_feed where id = tests.c(1)), 1.5::double precision, 'ping_feed: the author sees the same aggregate');
 select throws_ok($$select * from public.cast_vote(tests.c(1), 1::smallint)$$, 'PT403', null, 'cast_vote: author cannot vote on own ping');
 select tests.act_as(tests.u(2));
 select is((select vote from public.cast_vote(tests.c(1), (-1)::smallint)), 1::smallint, 'cast_vote: repeat vote is idempotent (server wins)');
@@ -276,15 +285,22 @@ insert into public.pings (id, author_id, group_id, type, geom) values
   (tests.c(7), tests.u(1), tests.g(), 'gear', st_setsrid(st_makepoint(-122.5, 48.3), 4326));
 select tests.act_as(tests.u(3));
 select throws_ok($$select * from public.cast_vote(tests.c(7), (-1)::smallint)$$, 'PT404', null, 'cast_vote: non-member cannot vote on a group ping (looks like 404)');
+select tests.act_admin();
+update public.pings set updated_at = now() - interval '2 days' where id = tests.c(7);
 select tests.act_as(tests.u(2));
 select lives_ok($$select * from public.cast_vote(tests.c(7), 1::smallint)$$, 'cast_vote: member confirms a group ping');
+select tests.act_admin();
+select ok((select updated_at from public.pings where id = tests.c(7)) > now() - interval '1 hour', 'C1: a new vote bumps pings.updated_at so cursor sync re-pulls the ping');
+select tests.act_as(tests.u(2));
 select tests.act_as(tests.u(1));
-select is((select count(*) from public.ping_votes_feed where ping_id = tests.c(7)), 1::bigint, 'ping_votes_feed: author sees the vote on the group ping');
+select is((select confirm_count from public.ping_feed where id = tests.c(7)), 1, 'ping_feed: author sees the confirm count on the group ping');
 select is((select count(*) from public.ping_votes where ping_id = tests.c(7)), 0::bigint, 'ping_votes: ...but not who cast it');
 select tests.act_as(tests.u(3));
-select is((select count(*) from public.ping_votes_feed where ping_id = tests.c(7)), 0::bigint, 'ping_votes_feed: non-member cannot see group-ping votes');
+select is((select count(*) from public.ping_feed where id = tests.c(7)), 0::bigint, 'ping_feed: non-member cannot see the group ping or its aggregates');
+select is(public.score_ping(tests.c(7), now()), null::double precision, 'score_ping: null for a group ping the caller cannot see');
+select is((select vote_sum from public.ping_vote_stats(tests.c(7), now())), null::double precision, 'ping_vote_stats: null for a group ping the caller cannot see');
 select tests.act_anon();
-select throws_ok($$select * from public.ping_votes_feed$$, '42501', null, 'ping_votes_feed: anon denied');
+select throws_ok($$select * from public.ping_vote_stats(tests.c(7))$$, '42501', null, 'ping_vote_stats: anon denied');
 select tests.act_as(tests.u(2));
 select is((select count(*) from public.ping_votes where ping_id = tests.c(7)), 1::bigint, 'ping_votes: a voter still sees their own vote');
 select tests.act_as(tests.u(3));
@@ -313,6 +329,13 @@ select tests.act_admin();
 update public.profiles set revoked_at = now() where id = tests.u(2);
 select tests.act_as(tests.u(2));
 select throws_ok($$select * from public.cast_vote(tests.c(7), (-1)::smallint)$$, 'PT403', null, 'cast_vote: revoked account denied');
+-- B4: a revoked account cannot delete its pings or rename its profile (no evading review)
+select is(tests.dml($$delete from public.pings$$), 0::bigint, 'B4: revoked account cannot delete its own pings');
+select is(tests.dml($$update public.profiles set vessel_name = 'F/V Renamed' where id = tests.u(2)$$), 0::bigint, 'B4: revoked account cannot edit its profile');
+select tests.act_admin();
+select is((select count(*) from public.pings where author_id = tests.u(2)), 3::bigint, 'B4: the revoked account''s pings are intact');
+select tests.act_as(tests.u(2));
+select throws_ok($$select public.author_publicly_visible(tests.u(2))$$, '42501', null, 'E1: author_publicly_visible is not callable by clients (no revocation oracle)');
 
 -- ---- misc hardening ------------------------------------------------------------------------------------
 select tests.act_as(tests.u(3));
@@ -320,6 +343,18 @@ select throws_ok($$insert into public.pings (type, geom, expires_at) values ('lo
                  '23514', null, 'pings: expires_at more than 7 days after created_at is rejected');
 select tests.act_admin();
 update public.profiles set revoked_at = null where id = tests.u(2);
+
+-- E8: the 0.3 visibility threshold compares reputation rounded to 4 decimals
+select tests.act_admin();
+update public.profiles set reputation = 0.29996 where id = tests.u(3);
+select tests.act_as(tests.u(4));
+select is((select count(*) from public.pings where id = tests.c(3)), 1::bigint, 'E8: reputation 0.29996 rounds to 0.3000 and stays visible');
+select tests.act_admin();
+update public.profiles set reputation = 0.29994 where id = tests.u(3);
+select tests.act_as(tests.u(4));
+select is((select count(*) from public.pings where id = tests.c(3)), 0::bigint, 'E8: reputation 0.29994 rounds to 0.2999 and is hidden');
+select tests.act_admin();
+update public.profiles set reputation = 1.0 where id = tests.u(3);
 
 select * from finish();
 rollback;

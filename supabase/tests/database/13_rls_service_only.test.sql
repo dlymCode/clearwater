@@ -58,7 +58,8 @@ insert into public.profiles (id, handle, vessel_name) values
   ('00000000-0000-0000-0000-0000000000a1', 'owner_one', 'F/V One'),
   ('00000000-0000-0000-0000-0000000000a2', 'member_two', 'F/V Two'),
   ('00000000-0000-0000-0000-0000000000a3', 'outsider_three', 'F/V Three'),
-  ('00000000-0000-0000-0000-0000000000a4', 'bystander_four', 'F/V Four');
+  ('00000000-0000-0000-0000-0000000000a4', 'bystander_four', 'F/V Four')
+on conflict (id) do update set handle = excluded.handle, vessel_name = excluded.vessel_name;  -- (a trigger already created placeholder rows)
 -- Group G owned by u1 (the groups trigger makes u1 the owner member), u2 joins as member.
 insert into public.groups (id, name, owner_id) values
   ('00000000-0000-0000-0000-0000000000b1', 'Skagit Crew', '00000000-0000-0000-0000-0000000000a1');
@@ -77,9 +78,9 @@ insert into public.depth_uploads (uploader_hash, cell_id, day, median_ft, p10_ft
   values (repeat('a', 64), '8c2a1072b59ffff', '2026-10-01', -12, -14, 40);
 insert into public.audit_log (actor, action) values (tests.u(1), 'test.seed');
 insert into public.baseline_cells (cell_id, baseline_elev_ft) values ('8c2a1072b59ffff', -11);
-insert into public.depth_cell_aggregates (cell_id, period_start, period_end, median_ft, p10_ft, n, boats) values
-  ('8c2a1072b59ffff', '2026-01-01', '2026-04-01', -12, -14, 400, 3),
-  ('8c2a1072b5a1fff', '2026-01-01', '2026-04-01', -9, -11, 100, 1);
+insert into public.depth_cell_aggregates (cell_id, period_start, median_ft, p10_ft, n, boats) values
+  ('8c2a1072b59ffff', '2026-01-01', -12, -14, 400, 3),
+  ('8c2a1072b5a1fff', '2026-01-01', -9, -11, 100, 1);
 
 -- ---- depth_cells -------------------------------------------------------------------------
 select tests.act_as(tests.u(1));
@@ -116,7 +117,7 @@ select throws_ok($$select * from public.depth_uploads$$, '42501', null, 'depth_u
 select throws_ok($$insert into public.depth_uploads (uploader_hash, cell_id, day, median_ft, p10_ft, n)
                    values (repeat('b', 64), '8c2a1072b59ffff', '2026-10-01', -12, -14, 5)$$,
                  '42501', null, 'depth_uploads insert: signed-in denied (hash must be server-computed; use depth-upload)');
-select throws_ok($$update public.depth_uploads set held = true$$, '42501', null, 'depth_uploads update: denied');
+select throws_ok($$update public.depth_uploads set held_reason = 'admin'$$, '42501', null, 'depth_uploads update: denied');
 select throws_ok($$delete from public.depth_uploads$$, '42501', null, 'depth_uploads delete: denied');
 select tests.act_as(tests.u(2));
 select throws_ok($$select * from public.depth_uploads$$, '42501', null, 'depth_uploads select: group member denied');

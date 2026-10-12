@@ -58,7 +58,8 @@ insert into public.profiles (id, handle, vessel_name) values
   ('00000000-0000-0000-0000-0000000000a1', 'owner_one', 'F/V One'),
   ('00000000-0000-0000-0000-0000000000a2', 'member_two', 'F/V Two'),
   ('00000000-0000-0000-0000-0000000000a3', 'outsider_three', 'F/V Three'),
-  ('00000000-0000-0000-0000-0000000000a4', 'bystander_four', 'F/V Four');
+  ('00000000-0000-0000-0000-0000000000a4', 'bystander_four', 'F/V Four')
+on conflict (id) do update set handle = excluded.handle, vessel_name = excluded.vessel_name;  -- (a trigger already created placeholder rows)
 -- Group G owned by u1 (the groups trigger makes u1 the owner member), u2 joins as member.
 insert into public.groups (id, name, owner_id) values
   ('00000000-0000-0000-0000-0000000000b1', 'Skagit Crew', '00000000-0000-0000-0000-0000000000a1');
@@ -70,7 +71,8 @@ select plan(17);
 -- Fixture: authors u1..u4, voters u5 and u6 (3 days old pings are eligible; the batch needs >= 48 h).
 select tests.act_admin();
 insert into auth.users (id, email) values (tests.u(5), 'u5@example.test'), (tests.u(6), 'u6@example.test');
-insert into public.profiles (id, handle) values (tests.u(5), 'voter_five'), (tests.u(6), 'voter_six');
+insert into public.profiles (id, handle) values (tests.u(5), 'voter_five'), (tests.u(6), 'voter_six')
+  on conflict (id) do update set handle = excluded.handle;
 update public.profiles set reputation = 0.25 where id = tests.u(3);
 update public.profiles set reputation = 2.98 where id = tests.u(4);
 

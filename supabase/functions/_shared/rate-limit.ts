@@ -1,24 +1,15 @@
 // Rate-limit middleware (docs/AGENT-PLAN.md: 30 pings/h, 60 votes/h, 10 msgs/min,
 // 1 depth batch / 15 min, per user -> HTTP 429).
 //
-// Single source of truth for the counting is SQL: the append-only public.rate_events ledger with
-// rate_limit_status() (peek) and rate_limit_consume() (check + record, serialised per user+bucket).
-// The BEFORE INSERT triggers on pings / ping_votes / messages call the same functions, so direct
-// PostgREST writes are limited identically. Edge functions use this module for the buckets they
-// front (depth_batch).
+// SQL is the single authority: the append-only public.rate_events ledger with rate_limit_consume()
+// (check + record, serialised per user+bucket) and rate_limit_refund(). The BEFORE INSERT triggers on
+// pings / ping_votes / messages / groups call the same functions, so direct PostgREST writes are
+// limited identically; limits and windows live in rate_limit_params(). This module only fronts the
+// bucket that goes through an edge function (depth_batch) and turns a refusal into an HTTP 429.
 import { type Db, rpc } from "./db.ts";
 import { json } from "./http.ts";
 
-export const RATE_LIMITS = {
-  ping: { max: 30, windowSeconds: 3600 },
-  vote: { max: 60, windowSeconds: 3600 },
-  message: { max: 10, windowSeconds: 60 },
-  depth_batch: { max: 1, windowSeconds: 900 },
-  join_group: { max: 10, windowSeconds: 900 },
-  position: { max: 1, windowSeconds: 300 },
-} as const;
-
-export type Bucket = keyof typeof RATE_LIMITS;
+export type Bucket = "depth_batch";
 
 export interface RateLimitStatus {
   allowed: boolean;
@@ -27,31 +18,9 @@ export interface RateLimitStatus {
   retry_after_s: number;
 }
 
-/**
- * Pure sliding-window decision, identical in semantics to the SQL function: count events with
- * timestamp > now - window; allowed while count < max; retry-after is when the oldest in-window
- * event leaves the window. Used by tests as an executable specification of the SQL behaviour.
- */
-export function slidingWindowDecision(
-  eventTimesMs: readonly number[],
-  nowMs: number,
-  max: number,
-  windowSeconds: number,
-): RateLimitStatus {
-  const windowMs = windowSeconds * 1000;
-  const inWindow = eventTimesMs.filter((t) => t > nowMs - windowMs);
-  const allowed = inWindow.length < max;
-  const oldest = inWindow.length ? Math.min(...inWindow) : null;
-  const retry = allowed || oldest === null ? 0 : Math.max(1, Math.ceil((oldest + windowMs - nowMs) / 1000));
-  return { allowed, used: inWindow.length, max_allowed: max, retry_after_s: retry };
-}
-
-async function callLimiter(
-  db: Db,
-  fn: "rate_limit_status" | "rate_limit_consume",
-  userId: string,
-  bucket: Bucket,
-): Promise<RateLimitStatus> {
+/** Check and, when allowed, record one event atomically (race-free per user and bucket). */
+export async function consumeRateLimit(db: Db, userId: string, bucket: Bucket): Promise<RateLimitStatus> {
+  const fn = "rate_limit_consume";
   const data = await rpc<RateLimitStatus | RateLimitStatus[]>(db, fn, {
     p_user: userId,
     p_bucket: bucket,
@@ -63,14 +32,9 @@ async function callLimiter(
   return row;
 }
 
-/** Peek: does not record anything. */
-export function checkRateLimit(db: Db, userId: string, bucket: Bucket): Promise<RateLimitStatus> {
-  return callLimiter(db, "rate_limit_status", userId, bucket);
-}
-
-/** Check and, when allowed, record one event atomically (race-free per user and bucket). */
-export function consumeRateLimit(db: Db, userId: string, bucket: Bucket): Promise<RateLimitStatus> {
-  return callLimiter(db, "rate_limit_consume", userId, bucket);
+/** Give the newest event back (the operation failed after consuming its slot). */
+export async function refundRateLimit(db: Db, userId: string, bucket: Bucket): Promise<void> {
+  await rpc(db, "rate_limit_refund", { p_user: userId, p_bucket: bucket });
 }
 
 export function rateLimitResponse(status: RateLimitStatus, bucket: Bucket): Response {

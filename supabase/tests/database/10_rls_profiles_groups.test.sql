@@ -58,14 +58,15 @@ insert into public.profiles (id, handle, vessel_name) values
   ('00000000-0000-0000-0000-0000000000a1', 'owner_one', 'F/V One'),
   ('00000000-0000-0000-0000-0000000000a2', 'member_two', 'F/V Two'),
   ('00000000-0000-0000-0000-0000000000a3', 'outsider_three', 'F/V Three'),
-  ('00000000-0000-0000-0000-0000000000a4', 'bystander_four', 'F/V Four');
+  ('00000000-0000-0000-0000-0000000000a4', 'bystander_four', 'F/V Four')
+on conflict (id) do update set handle = excluded.handle, vessel_name = excluded.vessel_name;  -- (a trigger already created placeholder rows)
 -- Group G owned by u1 (the groups trigger makes u1 the owner member), u2 joins as member.
 insert into public.groups (id, name, owner_id) values
   ('00000000-0000-0000-0000-0000000000b1', 'Skagit Crew', '00000000-0000-0000-0000-0000000000a1');
 insert into public.group_members (group_id, user_id, role) values
   ('00000000-0000-0000-0000-0000000000b1', '00000000-0000-0000-0000-0000000000a2', 'member');
 
-select plan(81);
+select plan(95);
 
 -- Roles in this file: u1 = owner, u2 = group member, u3 = signed-in non-member, anon.
 
@@ -80,9 +81,17 @@ select is((select reputation from public.profiles where id = tests.u(1)), 1.0::d
 select tests.act_anon();
 select throws_ok($$select * from public.profiles$$, '42501', null, 'profiles select: anon denied');
 
--- insert (u5 has an auth user but no profile yet)
+-- a new auth user gets a minimal profile row from a trigger (so their first write cannot die on the FK)
 select tests.act_admin();
 insert into auth.users (id, email) values (tests.u(5), 'u5@example.test'), (tests.u(6), 'u6@example.test');
+select is((select handle from public.profiles where id = tests.u(5)), 'user_' || right(replace(tests.u(5)::text, '-', ''), 19),
+          'auth.users trigger: a placeholder profile is created for a new user');
+select is((select reputation from public.profiles where id = tests.u(5)), 1.0::double precision, 'auth.users trigger: reputation starts at 1.0');
+select is((select count(*) from public.profiles where id in (tests.u(5), tests.u(6))), 2::bigint, 'auth.users trigger: one profile per new user');
+select tests.act_as(tests.u(5));
+select lives_ok($$update public.profiles set handle = 'onboarded_five', vessel_name = 'F/V Five' where id = tests.u(5)$$, 'onboarding: the user sets their real handle and vessel (UPDATE of the trigger-made row)');
+select tests.act_admin();
+delete from public.profiles where id = tests.u(5);   -- simulate a missing row to exercise the INSERT policy
 select tests.act_as(tests.u(5));
 select lives_ok($$insert into public.profiles (id, handle) values (tests.u(5), 'newcomer_five')$$,
                 'profiles insert: owner creates own profile');
@@ -278,6 +287,29 @@ select throws_ok($$select public.join_group('AAAAAAAA')$$, 'PT429', null, 'join_
 select tests.act_as(tests.u(1));
 select throws_ok($$select revoked_at from public.profiles$$, '42501', null, 'profiles: revoked_at is not a selectable column');
 select throws_ok($$update public.profiles set revoked_at = now()$$, '42501', null, 'profiles: revoked_at is not updatable');
+
+-- B1: owner_id defaults to auth.uid(), and INSERT ... RETURNING works with only the membership-based policy
+select tests.act_as(tests.u(4));
+select lives_ok($$insert into public.groups (id, name) values ('00000000-0000-0000-0000-0000000000b4', 'Defaulted owner') returning id, name$$,
+                'B1: a client can create a group without sending owner_id, even with RETURNING');
+select is((select owner_id from public.groups where id = '00000000-0000-0000-0000-0000000000b4'), tests.u(4), 'B1: owner_id was filled from the JWT');
+select is((select count(*) from public.group_members where group_id = '00000000-0000-0000-0000-0000000000b4' and user_id = tests.u(4) and role = 'owner'), 1::bigint,
+          'B1: the owner is always a member (trigger)');
+-- (the select policy keeps its owner_id branch: INSERT ... RETURNING is checked before the AFTER trigger adds the membership)
+-- E9: 5 groups per hour (the one above is the first for u4... plus 4 more)
+select lives_ok($$insert into public.groups (name) select 'g' || i from generate_series(1, 4) i$$, 'E9: four more groups (5 in total this hour)');
+select throws_ok($$insert into public.groups (name) values ('sixth')$$, 'PT429', null, 'E9: the 6th group in an hour returns 429');
+-- E9: invite rotation 10 per hour
+select tests.act_as(tests.u(1));
+select throws_ok($q$do $$ begin for i in 1..15 loop perform public.rotate_invite_code(tests.g()); end loop; end $$$q$, 'PT429', null, 'E9: rotate_invite_code is limited to 10 per hour');
+
+-- RPC return shapes the mobile client relies on
+select tests.act_as(tests.u(4));
+select is((select count(*) from public.get_invite_code('00000000-0000-0000-0000-0000000000b4')), 1::bigint, 'get_invite_code returns a one-row table');
+select columns_are('public', 'groups', array['id','name','owner_id','invite_code','invite_expires_at','created_at'], 'groups columns');
+select is((select count(*) from public.rotate_invite_code('00000000-0000-0000-0000-0000000000b4')), 1::bigint, 'rotate_invite_code returns a one-row table');
+select is(pg_typeof((select invite_expires_at from public.get_invite_code('00000000-0000-0000-0000-0000000000b4')))::text, 'timestamp with time zone', 'invite_expires_at is a timestamptz');
+select is(pg_typeof(public.join_group('AAAAAAAA'))::text, 'uuid', 'join_group returns uuid (NULL for a bad code)');
 
 select * from finish();
 rollback;

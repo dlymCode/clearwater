@@ -46,8 +46,8 @@ enabled = false
 
 [auth]
 enabled = true
-site_url = "clearwater://auth-callback"
-additional_redirect_urls = ["clearwater://auth-callback"]
+site_url = "soundmaps://auth-callback"
+additional_redirect_urls = ["soundmaps://auth-callback"]
 # Access token lifetime in seconds (1 hour). A revoked account's JWT therefore stays valid for
 # at most this long for the tile worker; RLS and the edge functions re-check revocation per request.
 jwt_expiry = 3600

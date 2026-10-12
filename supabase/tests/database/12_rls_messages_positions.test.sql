@@ -58,14 +58,15 @@ insert into public.profiles (id, handle, vessel_name) values
   ('00000000-0000-0000-0000-0000000000a1', 'owner_one', 'F/V One'),
   ('00000000-0000-0000-0000-0000000000a2', 'member_two', 'F/V Two'),
   ('00000000-0000-0000-0000-0000000000a3', 'outsider_three', 'F/V Three'),
-  ('00000000-0000-0000-0000-0000000000a4', 'bystander_four', 'F/V Four');
+  ('00000000-0000-0000-0000-0000000000a4', 'bystander_four', 'F/V Four')
+on conflict (id) do update set handle = excluded.handle, vessel_name = excluded.vessel_name;  -- (a trigger already created placeholder rows)
 -- Group G owned by u1 (the groups trigger makes u1 the owner member), u2 joins as member.
 insert into public.groups (id, name, owner_id) values
   ('00000000-0000-0000-0000-0000000000b1', 'Skagit Crew', '00000000-0000-0000-0000-0000000000a1');
 insert into public.group_members (group_id, user_id, role) values
   ('00000000-0000-0000-0000-0000000000b1', '00000000-0000-0000-0000-0000000000a2', 'member');
 
-select plan(60);
+select plan(72);
 
 select tests.act_admin();
 insert into public.messages (id, group_id, author_id, body) values
@@ -130,6 +131,19 @@ select is(tests.dml($$delete from public.messages where id = tests.c(5)$$), 1::b
 select tests.act_as(tests.u(1));
 select is(tests.dml($$delete from public.messages where id = tests.c(4)$$), 1::bigint, 'messages delete: group owner moderates a member''s message');
 
+-- =============================== messages_feed ===================================================
+select tests.act_as(tests.u(1));
+select is((select author_handle from public.messages_feed where id = tests.c(1)), 'owner_one', 'messages_feed: carries the author handle');
+select is((select count(*) from public.messages_feed), (select count(*) from public.messages), 'messages_feed: same rows as the table for a member');
+select has_column('public', 'messages_feed', 'received_at', 'messages_feed exposes received_at (the cursor column)');
+select has_column('public', 'messages_feed', 'id', 'messages_feed exposes id (keyset pagination tie-break)');
+select is((select count(distinct id) from public.messages_feed), (select count(*) from public.messages_feed), 'messages_feed.id is unique');
+select tests.act_as(tests.u(3));
+select is((select count(*) from public.messages_feed), 0::bigint, 'messages_feed: non-member sees nothing (group-member semantics preserved)');
+select is((select count(*) from public.messages_feed where group_id = tests.g()), 0::bigint, 'messages_feed: filtering by group does not leak');
+select tests.act_anon();
+select throws_ok($$select * from public.messages_feed$$, '42501', null, 'messages_feed: anon denied');
+
 -- =============================== last_positions =================================================
 -- Writes go through report_position(lat, lon) only; the table has no client insert/update grant.
 select tests.act_as(tests.u(1));
@@ -177,6 +191,35 @@ select throws_ok($$insert into public.last_positions (user_id, geom) values (tes
 select throws_ok($$update public.last_positions set geom = st_setsrid(st_makepoint(-122.6, 48.4), 4326)$$,
                  '42501', null, 'last_positions update: anon denied');
 
+-- E3: positions on the very edge of the box: a clean PT400 or success, never a raw 23514 from the table CHECK
+select tests.act_admin();
+create temp table _edge as select 0::int as raw_errors, 0::int as ok_calls, 0::int as pt400;
+do $q$
+declare
+  i integer;
+  lat double precision;
+  n_ok integer := 0; n_400 integer := 0; n_raw integer := 0;
+begin
+  perform set_config('request.jwt.claims', json_build_object('sub', tests.u(4), 'role', 'authenticated')::text, true);
+  for i in 0..40 loop
+    lat := 49.0980 + i * 0.0001;      -- crosses the 49.1 north edge
+    delete from public.rate_events where user_id = tests.u(4) and bucket = 'position';
+    delete from public.last_positions where user_id = tests.u(4);
+    begin
+      perform public.report_position(lat, -122.5);
+      n_ok := n_ok + 1;
+    exception
+      when sqlstate 'PT400' then n_400 := n_400 + 1;
+      when others then n_raw := n_raw + 1;
+    end;
+  end loop;
+  update _edge set raw_errors = n_raw, ok_calls = n_ok, pt400 = n_400;
+end $q$;
+select is((select raw_errors from _edge), 0, 'E3: edge coordinates never surface a raw table-CHECK error');
+select ok((select ok_calls > 0 and pt400 > 0 from _edge), 'E3: both sides of the north edge were exercised (inside = ok, outside = PT400 position_out_of_range)');
+select tests.act_admin();
+delete from public.last_positions where user_id = tests.u(4);
+
 -- table-level Salish Sea CHECK (defence in depth behind the RPC)
 select tests.act_admin();
 select throws_ok($$insert into public.last_positions (user_id, geom) values (tests.u(4), st_setsrid(st_makepoint(-110.0, 40.0), 4326))$$,
@@ -221,6 +264,10 @@ update public.profiles set revoked_at = now() where id = tests.u(1);
 select tests.act_as(tests.u(1));
 select throws_ok($$insert into public.messages (group_id, body) values (tests.g(), 'revoked owner')$$, '42501', null, 'revoked: a member cannot post messages');
 select throws_ok($$insert into public.pings (type, geom) values ('log', st_setsrid(st_makepoint(-122.4, 48.2), 4326))$$, '42501', null, 'revoked: cannot post pings');
+
+-- B4: a revoked owner cannot delete or edit anything of theirs
+select is(tests.dml($$delete from public.messages where author_id = tests.u(1)$$), 0::bigint, 'B4: revoked account cannot delete its messages');
+select is(tests.dml($$update public.profiles set vessel_name = 'x' where id = tests.u(1)$$), 0::bigint, 'B4: revoked account cannot rename its profile');
 
 select * from finish();
 rollback;

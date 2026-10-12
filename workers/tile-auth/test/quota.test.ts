@@ -53,3 +53,42 @@ test("a corrupt stored value is treated as zero rather than locking the user out
   kv.store.set(quotaKey("u1", T), "not-a-number");
   assert.equal((await consumeQuota(kv, "u1", T, 5, 10)).allowed, true);
 });
+
+test("B5: 50 parallel requests on one isolate cannot overshoot the limit (per-user lock + read-back)", async () => {
+  const kv = new FakeKv(2); // every KV call takes 2 ms, so the requests genuinely interleave
+  const results = await Promise.all(Array.from({ length: 50 }, () => consumeQuota(kv, "racer", T, 100, 1000)));
+  assert.equal(results.filter((r) => r.allowed).length, 10, "exactly limit / cost requests pass");
+  assert.equal(kv.store.get(quotaKey("racer", T)), "1000");
+});
+
+test("B5: the lock is per account: one user's burst does not serialise another's", async () => {
+  const kv = new FakeKv(2);
+  const [a, b] = await Promise.all([
+    Promise.all(Array.from({ length: 20 }, () => consumeQuota(kv, "aaa", T, 100, 500))),
+    Promise.all(Array.from({ length: 20 }, () => consumeQuota(kv, "bbb", T, 100, 500))),
+  ]);
+  assert.equal(a.filter((r) => r.allowed).length, 5);
+  assert.equal(b.filter((r) => r.allowed).length, 5);
+});
+
+test("B5: write-then-check - if a write from elsewhere landed in between, the overshoot is detected and undone", async () => {
+  const kv = new FakeKv();
+  // another isolate bumps the counter between our write and our read-back
+  const realGet = kv.get.bind(kv);
+  let reads = 0;
+  kv.get = async (k: string) => {
+    reads++;
+    if (reads === 2) kv.store.set(k, "1050"); // concurrent writers pushed it past the limit
+    return realGet(k);
+  };
+  const r = await consumeQuota(kv, "u9", T, 100, 1000);
+  assert.equal(r.allowed, false, "refused");
+  assert.equal(kv.store.get(quotaKey("u9", T)), "950", "our own 100 MB charge was rolled back");
+});
+
+test("a non-finite cost is refused rather than poisoning the counter", async () => {
+  const kv = new FakeKv();
+  assert.equal((await consumeQuota(kv, "u1", T, Number.NaN, 1000)).allowed, false);
+  assert.equal((await consumeQuota(kv, "u1", T, Number.POSITIVE_INFINITY, 1000)).allowed, false);
+  assert.equal(kv.puts.length, 0);
+});

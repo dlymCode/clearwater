@@ -60,7 +60,7 @@ language sql stable security definer
 set search_path = public
 as $$
   select coalesce(
-    (select pr.reputation >= 0.3 and pr.revoked_at is null from public.profiles pr where pr.id = p_author),
+    (select round(pr.reputation::numeric, 4) >= 0.3 and pr.revoked_at is null from public.profiles pr where pr.id = p_author),
     false);
 $$;
 
@@ -89,13 +89,28 @@ as $$
   select case when p_anonymous then (round((p_rep * 4)::numeric) / 4)::double precision else p_rep end;
 $$;
 
+-- w(d): THE distance weight (docs/AGENT-PLAN.md). NULL distance -> 0; <= 200 m -> 1.0; <= 500 m -> 0.5; else 0.
+-- Used by ping_vote_stats (score and feed), cast_vote eligibility and the reputation batch.
+create or replace function public.vote_weight(p_dist_m double precision)
+returns double precision
+language sql immutable parallel safe
+as $$
+  select case
+    when p_dist_m is null then 0.0
+    when p_dist_m <= 200 then 1.0
+    when p_dist_m <= 500 then 0.5
+    else 0.0
+  end::double precision;
+$$;
+
 -- ======================================================================================
 -- Rate limits. One source of truth used by (a) BEFORE INSERT triggers, so limits hold even for
 -- direct PostgREST inserts, (b) RPCs (join_group, report_position) and (c) the edge-function
 -- middleware (_shared/rate-limit.ts).
 --
 --   ping 30/h, vote 60/h, message 10/min, depth_batch 1/15 min      (docs/AGENT-PLAN.md)
---   join_group 10/15 min (invite-code guessing), position 1/5 min   (added)
+--   join_group 10/15 min (invite-code guessing), position 1/5 min,
+--   group_create 5/h, promote_ping 30/h, rotate_invite_code 10/h     (added)
 --
 -- The ledger is public.rate_events (append-only, no client access). Counting events instead of
 -- surviving rows means delete-and-repost cannot reset a limit. rate_limit_consume() serialises per
@@ -114,6 +129,9 @@ begin
     when 'depth_batch' then max_allowed := 1;  window_s := 900;
     when 'join_group'  then max_allowed := 10; window_s := 900;
     when 'position'    then max_allowed := 1;  window_s := 300;
+    when 'group_create' then max_allowed := 5; window_s := 3600;
+    when 'promote'     then max_allowed := 30; window_s := 3600;
+    when 'rotate_invite' then max_allowed := 10; window_s := 3600;
     else raise exception 'unknown rate-limit bucket: %', p_bucket using errcode = '22023';
   end case;
 end
@@ -168,6 +186,19 @@ begin
     insert into public.rate_events (user_id, bucket) values (p_user, p_bucket);
   end if;
 end
+$$;
+
+-- Give back the most recent event (used when an operation fails after consuming its slot, so a transient
+-- error does not burn a 15-minute depth-batch window). Service role only.
+create or replace function public.rate_limit_refund(p_user uuid, p_bucket text)
+returns void
+language sql volatile security definer
+set search_path = public
+as $$
+  delete from public.rate_events
+   where id = (select e.id from public.rate_events e
+                where e.user_id = p_user and e.bucket = p_bucket
+                order by e.id desc limit 1);
 $$;
 
 -- BEFORE INSERT trigger for pings / messages (author_id) and ping_votes (voter_id).
@@ -292,7 +323,16 @@ language plpgsql
 security definer
 set search_path = public
 as $$
+declare
+  v_status record;
 begin
+  if auth.uid() is not null and not exists (select 1 from public.groups where id = new.id) then
+    select * into v_status from public.rate_limit_consume(auth.uid(), 'group_create');
+    if not v_status.allowed then
+      raise exception 'rate_limit_exceeded:group_create'
+        using errcode = 'PT429', hint = v_status.retry_after_s::text;
+    end if;
+  end if;
   new.invite_code := public.generate_invite_code();
   new.invite_expires_at := now() + interval '7 days';
   return new;
@@ -374,31 +414,92 @@ create trigger audit_log_no_truncate
   for each statement execute function public.tg_audit_log_immutable();
 
 -- ======================================================================================
--- score_ping: THE ping score. Must match packages/shared + apps/mobile to within 1e-12.
+-- Vote aggregates. Per-vote data (voter, distance, exact reputation) NEVER leaves the server: joining
+-- an exact voter_reputation back to profiles would de-anonymise the voter. Clients get only these four
+-- numbers per ping (through ping_feed) and compute decay locally.
 --
---   S = R_a * (1 + SUM_i R_i * v_i * w(d_i)) * exp(-lambda * dt)
+--   vote_sum        = quantize( SUM_i R_i * v_i * w(d_i) , 0.25 )  with quantize(x) = floor(x * 4 + 0.5) / 4
+--                     (round half up; the sum is accumulated in (created_at, voter_id) order)
+--   last_confirmed_at = created_at of the latest confirm (+1) vote
+--   confirm_count / dispute_count = votes of that sign with w(d) > 0 (the votes that actually count)
+--   Votes with created_at > p_at are ignored by all four (so p_at can be a historical instant).
+-- SECURITY DEFINER with the same visibility rule as RLS: null for pings the caller cannot see.
+-- ======================================================================================
+create or replace function public.ping_vote_stats(
+  p_ping_id uuid,
+  p_at timestamptz default now(),
+  out vote_sum double precision,
+  out last_confirmed_at timestamptz,
+  out confirm_count integer,
+  out dispute_count integer
+)
+language plpgsql
+stable
+security definer
+set search_path = public
+as $$
+declare
+  v_group uuid;
+  v_author uuid;
+  v_sum double precision := 0.0;
+  v_w double precision;
+  rec record;
+begin
+  select p.group_id, p.author_id into v_group, v_author from public.pings p where p.id = p_ping_id;
+  if not found or (auth.uid() is not null and not public.ping_visible(v_group, v_author)) then
+    vote_sum := null; last_confirmed_at := null; confirm_count := null; dispute_count := null;
+    return;
+  end if;
+
+  confirm_count := 0;
+  dispute_count := 0;
+  for rec in
+    select v.vote, v.voter_dist_m, v.created_at, pr.reputation
+      from public.ping_votes v
+      join public.profiles pr on pr.id = v.voter_id
+     where v.ping_id = p_ping_id
+       and v.created_at <= p_at
+     order by v.created_at, v.voter_id
+  loop
+    v_w := public.vote_weight(rec.voter_dist_m);
+    v_sum := v_sum + (rec.reputation * rec.vote::double precision) * v_w;
+    if rec.vote = 1 then
+      if last_confirmed_at is null or rec.created_at > last_confirmed_at then
+        last_confirmed_at := rec.created_at;
+      end if;
+      if v_w > 0 then confirm_count := confirm_count + 1; end if;
+    elsif v_w > 0 then
+      dispute_count := dispute_count + 1;
+    end if;
+  end loop;
+  vote_sum := floor(v_sum * 4 + 0.5) / 4;
+end
+$$;
+
+-- ======================================================================================
+-- score_ping: THE ping score. Clients compute it offline from ping_feed columns and must match this to
+-- within 1e-12 (they use the SAME quantised vote_sum, so only the exponential can differ by an ulp).
 --
---   R_a      author reputation (profiles.reputation, current value); for ANONYMOUS pings it is
---            quantised to the nearest 0.25 (the feed's author_reputation is the same number)
---   R_i      voter reputation (profiles.reputation, current value)
---   v_i      +1 confirm, -1 dispute
---   w(d)     voter_dist_m: NULL -> 0;  <= 200 -> 1.0;  <= 500 -> 0.5;  else 0
---   t0       least(created_at, received_at): a device clock that runs ahead cannot make a ping
---            look fresher than the server saw it
---   t_last   max(t0, created_at of the latest confirm (+1) vote at or before `at`)
---   lambda   ln(2) / 86400  per second  (half-life 24 h)
---   dt       max(0, seconds between at and t_last) as a float
---   Votes with created_at > at are ignored (so `at` can be a historical instant).
+--   S = R_a * (1 + vote_sum) * exp(-lambda * dt)
 --
--- Reference TypeScript (identical operation order, IEEE-754 doubles):
+--   R_a       author reputation (profiles.reputation, current value); for ANONYMOUS pings quantised to
+--             the nearest 0.25 (ping_feed.author_reputation is the same number)
+--   vote_sum  quantize(SUM_i R_i * v_i * w(d_i), 0.25)  -- see ping_vote_stats; ping_feed.vote_sum
+--   t0        least(created_at, received_at): a device clock running ahead cannot make a ping look fresh
+--   t_last    max(t0, last_confirmed_at)                 -- ping_feed.last_confirmed_at
+--   lambda    ln(2) / 86400 per second (half-life 24 h)
+--   dt        max(0, seconds between at and t_last) as a float
+--
+-- Reference TypeScript (IEEE-754 doubles):
 --   const lambda = Math.LN2 / 86400.0;
---   let sum = 0;                       // votes sorted by (created_at, voter_id) ascending
---   for (const v of votes) sum += (v.rep * v.vote) * w(v.distM);
---   return Ra * (1.0 + sum) * Math.exp(-lambda * dt);
+--   const t0 = Math.min(createdAt, receivedAt);
+--   const tLast = lastConfirmedAt === null ? t0 : Math.max(t0, lastConfirmedAt);   // ms
+--   const dt = Math.max(0, (nowMs - tLast) / 1000);
+--   return authorReputation * (1.0 + voteSum) * Math.exp(-lambda * dt);
 --
--- Render thresholds (client): S < 0.25 hidden; 0.25-0.5 faded; 0.5-1.5 normal; > 1.5 solid.
--- SECURITY DEFINER because clients cannot read pings.author_id; it applies the same visibility rule
--- as RLS (null for pings the caller cannot see). With no JWT subject (service/batch) it is unrestricted.
+-- Render thresholds (client): S < 0.25 hidden; 0.25-0.5 faded; 0.5-1.5 normal; > 1.5 solid + count.
+-- SECURITY DEFINER because clients cannot read pings.author_id; null for pings the caller cannot see.
+-- With no JWT subject (service/batch) it is unrestricted.
 -- ======================================================================================
 create or replace function public.score_ping(p_ping_id uuid, p_at timestamptz default now())
 returns double precision
@@ -410,12 +511,9 @@ as $$
 declare
   c_lambda constant double precision := ln(2::double precision) / 86400.0;
   v_ping record;
-  v_ra double precision;
+  v_stats record;
   v_tlast timestamptz;
-  v_sum double precision := 0.0;
   v_dt double precision;
-  v_w double precision;
-  rec record;
 begin
   select p.created_at, p.received_at, p.group_id, p.author_id, p.anonymous, pr.reputation
     into v_ping
@@ -429,30 +527,14 @@ begin
     return null;
   end if;
 
-  v_ra := public.ping_author_rep(v_ping.anonymous, v_ping.reputation);
+  select * into v_stats from public.ping_vote_stats(p_ping_id, p_at);
   v_tlast := least(v_ping.created_at, coalesce(v_ping.received_at, v_ping.created_at));
-  for rec in
-    select v.vote, v.voter_dist_m, v.created_at, pr.reputation
-      from public.ping_votes v
-      join public.profiles pr on pr.id = v.voter_id
-     where v.ping_id = p_ping_id
-       and v.created_at <= p_at
-     order by v.created_at, v.voter_id
-  loop
-    v_w := case
-      when rec.voter_dist_m is null then 0.0
-      when rec.voter_dist_m <= 200 then 1.0
-      when rec.voter_dist_m <= 500 then 0.5
-      else 0.0
-    end;
-    v_sum := v_sum + (rec.reputation * rec.vote::double precision) * v_w;
-    if rec.vote = 1 and rec.created_at > v_tlast then
-      v_tlast := rec.created_at;
-    end if;
-  end loop;
-
+  if v_stats.last_confirmed_at is not null and v_stats.last_confirmed_at > v_tlast then
+    v_tlast := v_stats.last_confirmed_at;
+  end if;
   v_dt := greatest(extract(epoch from (p_at - v_tlast))::double precision, 0.0);
-  return v_ra * (1.0 + v_sum) * exp(-c_lambda * v_dt);
+  return public.ping_author_rep(v_ping.anonymous, v_ping.reputation)
+         * (1.0 + v_stats.vote_sum) * exp(-c_lambda * v_dt);
 end
 $$;
 
@@ -508,7 +590,7 @@ begin
     v_dist := extensions.ST_Distance(v_lp.geom::extensions.geography, v_ping.geom::extensions.geography);
   end if;
 
-  if p_vote = 1 and (v_dist is null or v_dist > 500) then
+  if p_vote = 1 and public.vote_weight(v_dist) = 0 then
     raise exception 'confirm_ineligible'
       using errcode = 'PT403',
             hint = case
@@ -544,12 +626,17 @@ set search_path = public
 as $$
 declare
   v_uid uuid := auth.uid();
+  v_status record;
 begin
   if v_uid is null then
     raise exception 'not_authenticated' using errcode = 'PT401';
   end if;
   if not public.auth_is_active() then
     raise exception 'account_revoked' using errcode = 'PT403';
+  end if;
+  select * into v_status from public.rate_limit_consume(v_uid, 'promote');
+  if not v_status.allowed then
+    raise exception 'rate_limit_exceeded:promote' using errcode = 'PT429', hint = v_status.retry_after_s::text;
   end if;
   update public.pings
      set group_id = null, updated_at = now()
@@ -611,9 +698,14 @@ as $$
 declare
   v_code text := public.generate_invite_code();
   v_exp timestamptz := now() + interval '7 days';
+  v_status record;
 begin
   if auth.uid() is null then
     raise exception 'not_authenticated' using errcode = 'PT401';
+  end if;
+  select * into v_status from public.rate_limit_consume(auth.uid(), 'rotate_invite');
+  if not v_status.allowed then
+    raise exception 'rate_limit_exceeded:rotate_invite' using errcode = 'PT429', hint = v_status.retry_after_s::text;
   end if;
   update public.groups g
      set invite_code = v_code, invite_expires_at = v_exp
@@ -669,7 +761,12 @@ begin
      or not (p_lat between -90 and 90 and p_lon between -180 and 180) then
     raise exception 'invalid_position' using errcode = 'PT400';
   end if;
-  v_pt := extensions.ST_SetSRID(extensions.ST_MakePoint(p_lon, p_lat), 4326);
+  -- Snap to the 100 m grid FIRST and range-check the snapped point, the one that is stored: a coordinate
+  -- on the very edge of the box would otherwise pass here and then fail the table CHECK (raw 23514).
+  v_pt := extensions.ST_Transform(
+            extensions.ST_SnapToGrid(
+              extensions.ST_Transform(extensions.ST_SetSRID(extensions.ST_MakePoint(p_lon, p_lat), 4326), 32610), 100),
+            4326);
   if not public.in_salish_sea(v_pt) then
     raise exception 'position_out_of_range' using errcode = 'PT400';
   end if;
@@ -699,35 +796,30 @@ select
   coalesce(public.ping_author_rep(p.anonymous, pr.reputation), 1.0)                                 as author_reputation,
   (p.author_id = auth.uid())                                                                       as mine,
   p.group_id, p.type, p.geom, p.note, p.created_at, p.received_at, p.expires_at,
-  p.score, p.tide_ft, p.anonymous, p.updated_at
+  p.score, p.tide_ft, p.anonymous, p.updated_at,
+  coalesce(vs.vote_sum, 0.0)          as vote_sum,
+  vs.last_confirmed_at                as last_confirmed_at,
+  coalesce(vs.confirm_count, 0)       as confirm_count,
+  coalesce(vs.dispute_count, 0)       as dispute_count
 from public.pings p
 join public.profiles pr on pr.id = p.author_id
+cross join lateral public.ping_vote_stats(p.id, now()) vs
 where public.ping_visible(p.group_id, p.author_id);
 
 comment on view public.ping_feed is
-  'Client read model for pings. Hides author_id/handle on anonymous pings (except to the author); author_reputation is quantised to 0.25 for anonymous pings.';
+  'Client read model for pings. Hides author_id/handle on anonymous pings (except to the author); author_reputation is quantised to 0.25 for anonymous pings. vote_sum (quantised to 0.25), last_confirmed_at, confirm_count and dispute_count replace per-vote data: clients compute S = author_reputation * (1 + vote_sum) * exp(-lambda * (now - max(least(created_at, received_at), last_confirmed_at))).';
 
-create view public.ping_votes_feed
+-- messages_feed: messages with the author's handle (group members only, same rule as the table policy).
+create view public.messages_feed
 with (security_barrier = true)
 as
-select
-  v.ping_id,
-  v.vote,
-  v.created_at,
-  pr.reputation as voter_reputation,
-  (case
-     when v.voter_dist_m is null then 0.0
-     when v.voter_dist_m <= 200 then 1.0
-     when v.voter_dist_m <= 500 then 0.5
-     else 0.0
-   end)::double precision as weight
-from public.ping_votes v
-join public.pings p on p.id = v.ping_id
-join public.profiles pr on pr.id = v.voter_id
-where public.ping_visible(p.group_id, p.author_id);
+select m.id, m.group_id, m.author_id, pr.handle as author_handle, m.body, m.ping_id, m.created_at, m.received_at
+from public.messages m
+join public.profiles pr on pr.id = m.author_id
+where public.is_group_member(m.group_id);
 
-comment on view public.ping_votes_feed is
-  'Client read model for votes: enough to compute score_ping (vote, time, voter reputation, precomputed distance weight) with no voter identity and no distance.';
+comment on view public.messages_feed is
+  'Client read model for the group channel: messages joined to the author handle. Cursor column: received_at.';
 
 -- ======================================================================================
 -- Execute privileges. Default is deny; each function lists who may call it.
@@ -742,7 +834,8 @@ begin
       join pg_namespace n on n.oid = p.pronamespace
      where n.nspname = 'public'
        and p.proname in ('auth_is_active','is_group_member','is_group_owner','shares_group_with',
-                         'author_publicly_visible','ping_visible','ping_author_rep',
+                         'author_publicly_visible','ping_visible','ping_author_rep','vote_weight','ping_vote_stats',
+                         'rate_limit_refund','tg_auth_users_after_insert',
                          'rate_limit_params','rate_limit_status','rate_limit_consume','tg_enforce_rate_limit',
                          'tg_pings_before_insert','tg_messages_before_insert','generate_invite_code',
                          'tg_groups_before_insert','tg_groups_after_insert','tg_group_members_after_delete',
@@ -760,8 +853,10 @@ grant execute on function public.auth_is_active()                      to authen
 grant execute on function public.is_group_member(uuid)                 to authenticated;
 grant execute on function public.is_group_owner(uuid)                  to authenticated;
 grant execute on function public.shares_group_with(uuid)               to authenticated;
-grant execute on function public.author_publicly_visible(uuid)        to authenticated;
+-- (author_publicly_visible is deliberately NOT granted: calling it would reveal who is revoked or
+--  below the visibility threshold; ping_visible is SECURITY DEFINER and does not need the grant)
 grant execute on function public.ping_visible(uuid, uuid)             to authenticated;
+grant execute on function public.ping_vote_stats(uuid, timestamptz)    to authenticated;
 -- (functions called inside a view are permission-checked against the caller, not the view owner)
 grant execute on function public.ping_author_rep(boolean, double precision) to authenticated;
 grant execute on function public.score_ping(uuid, timestamptz)         to authenticated;
@@ -771,3 +866,27 @@ grant execute on function public.join_group(text)                      to authen
 grant execute on function public.rotate_invite_code(uuid)              to authenticated;
 grant execute on function public.get_invite_code(uuid)                 to authenticated;
 grant execute on function public.report_position(double precision, double precision) to authenticated;
+
+-- ======================================================================================
+-- A new auth user gets a minimal profile row immediately, so their first write never dies on the
+-- profiles foreign key. The onboarding screen then sets the real handle / vessel name (UPDATE).
+-- ======================================================================================
+create or replace function public.tg_auth_users_after_insert()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  insert into public.profiles (id, handle)
+  values (new.id, 'user_' || right(replace(new.id::text, '-', ''), 19))   -- 24 chars, the handle maximum
+  on conflict (id) do nothing;
+  return new;
+end
+$$;
+revoke all on function public.tg_auth_users_after_insert() from public, anon, authenticated;
+grant execute on function public.tg_auth_users_after_insert() to service_role;
+
+create trigger on_auth_user_created
+  after insert on auth.users
+  for each row execute function public.tg_auth_users_after_insert();

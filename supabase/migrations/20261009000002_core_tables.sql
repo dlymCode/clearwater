@@ -28,13 +28,12 @@ comment on column public.profiles.revoked_at is 'Set by the admin edge function;
 create table public.groups (
   id                 uuid primary key default gen_random_uuid(),
   name               text not null,
-  owner_id           uuid not null references public.profiles (id) on delete restrict,
+  owner_id           uuid not null default auth.uid() references public.profiles (id) on delete restrict,
   invite_code        text not null,
-  invite_expires_at  timestamptz not null default (now() + interval '7 days'),
+  invite_expires_at  timestamptz not null,         -- set by trigger: issue time + 7 days
   created_at         timestamptz not null default now(),
   constraint groups_name_len     check (char_length(name) between 1 and 60),
-  constraint groups_invite_len   check (char_length(invite_code) = 8),
-  constraint groups_invite_chars check (invite_code ~ '^[A-Z2-9]{8}$')
+  constraint groups_invite_chars check (invite_code ~ '^[A-Z2-9]{8}$')   -- exactly 8 characters
 );
 create unique index groups_invite_code_key on public.groups (invite_code);
 create index groups_owner_idx on public.groups (owner_id);
@@ -79,9 +78,8 @@ create table public.pings (
   constraint pings_anon_public   check (not anonymous or group_id is null)
 );
 create index pings_geom_gix       on public.pings using gist (geom);
-create index pings_created_at_idx on public.pings (created_at desc);
-create index pings_group_idx      on public.pings (group_id, created_at desc) where group_id is not null;
-create index pings_author_idx     on public.pings (author_id, received_at desc);
+create index pings_group_idx      on public.pings (group_id) where group_id is not null;
+create index pings_author_idx     on public.pings (author_id);
 create index pings_updated_at_idx on public.pings (updated_at);
 create index pings_rep_pending_idx on public.pings (received_at) where rep_processed_at is null;
 
@@ -116,8 +114,8 @@ create table public.messages (
                                           and created_at <= received_at + interval '168 hours')
 );
 create index messages_group_created_idx on public.messages (group_id, created_at desc);
-create index messages_author_idx        on public.messages (author_id, received_at desc);
-create index messages_created_idx       on public.messages (created_at);
+create index messages_author_idx        on public.messages (author_id);
+create index messages_received_idx      on public.messages (received_at);   -- cursor sync and retention
 
 -- last_positions (rounded to 100 m by trigger; deleted after 24 h) ------------------
 create table public.last_positions (
@@ -158,7 +156,11 @@ create table public.app_config (
   value       jsonb not null,
   updated_at  timestamptz not null default now()
 );
-insert into public.app_config (key, value) values ('hmac_salt_epoch', '0'::jsonb);
+-- hmac_salt_epoch: current salt epoch. hmac_salt_epochs: activation day (UTC) of every epoch, so the
+-- depth-upload function only recomputes self-hashes for epochs that overlap a batch's window.
+insert into public.app_config (key, value) values
+  ('hmac_salt_epoch', '0'::jsonb),
+  ('hmac_salt_epochs', '[{"epoch": 0, "from": "1970-01-01"}]'::jsonb);
 
 -- Supabase Realtime for the group channel only (additive to cursor sync). pings and ping_votes are
 -- deliberately NOT published: Realtime streams whole rows (author_id, voter_id, voter_dist_m), which

@@ -5,7 +5,7 @@ import { HttpError } from "./http.ts";
 const NOW = new Date("2026-10-09T12:00:00Z");
 const BATCH = "11111111-2222-4333-8444-555555555555";
 const row = (over: Record<string, unknown> = {}) => ({
-  h3_cell: "8c2a1072b59ffff",
+  h3_cell: "8c28d1c1da823ff",
   day: "2026-10-08",
   median_ft: -12.5,
   p10_ft: -14,
@@ -87,6 +87,23 @@ Deno.test("field validation", () => {
   assertEquals(bad({ n: 0 }), "invalid_value");
   assertEquals(bad({ n: 1.5 }), "invalid_value");
   assertEquals(bad({ n: 86401 }), "invalid_value");
+});
+
+Deno.test("E6: h3_cell is decoded: it must be a real res-12 cell inside the Salish Sea", () => {
+  const bad = (cell: string) =>
+    code(() => parseDepthBatch({ batch_id: BATCH, rows: [row({ h3_cell: cell })] }, null, NOW));
+  assertEquals(bad("8c2a1072b59ffff"), "invalid_cell"); // matches the format, is not a cell
+  assertEquals(bad("8c28f46e19315ff"), "invalid_cell"); // valid cell centred near 45.0 N (outside the box)
+  assertEquals(bad("8c28cd355262bff"), "invalid_cell"); // valid cell centred near -130 E (outside the box)
+});
+
+Deno.test("B3: p10_ft must not be deeper than median_ft", () => {
+  const bad = (over: Record<string, unknown>) =>
+    code(() => parseDepthBatch({ batch_id: BATCH, rows: [row(over)] }, null, NOW));
+  assertEquals(bad({ median_ft: -12.5, p10_ft: -12.4 }), "invalid_value");
+  assertEquals(bad({ median_ft: 12, p10_ft: 14 }), "invalid_value");
+  parseDepthBatch({ batch_id: BATCH, rows: [row({ median_ft: 12, p10_ft: 12 })] }, null, NOW); // equal is fine
+  parseDepthBatch({ batch_id: BATCH, rows: [row({ median_ft: 12, p10_ft: -1500 })] }, null, NOW); // validated in SQL (hold rule), not here
 });
 
 Deno.test("rows: required, bounded, one per cell and day", () => {
