@@ -3,4 +3,4 @@
 numpy>=1.26,<3
 pytest>=8
 jsonschema>=4.20
-ruff>=0.5
+ruff>=0.16.10
