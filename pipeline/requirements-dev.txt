@@ -2,5 +2,5 @@
 # optional cross-check in tests) and ruff (lint) are the extras. No GDAL stack required.
 numpy>=1.26,<3
 pytest>=8
-jsonschema>=4.20
+jsonschema>=4.26.0
 ruff>=0.5
