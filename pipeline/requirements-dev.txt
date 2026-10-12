@@ -1,6 +1,6 @@
 # Test/CI deps. The unit tests need only numpy + pytest; jsonschema (CI schema check and an
 # optional cross-check in tests) and ruff (lint) are the extras. No GDAL stack required.
 numpy>=1.26,<3
-pytest>=8
+pytest>=9.1.1
 jsonschema>=4.20
 ruff>=0.5
