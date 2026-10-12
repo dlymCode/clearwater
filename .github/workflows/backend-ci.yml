@@ -35,7 +35,7 @@ jobs:
       SUPABASE_AUTH_EXTERNAL_APPLE_CLIENT_ID: dummy-apple-client-id
       SUPABASE_AUTH_EXTERNAL_APPLE_SECRET: dummy-apple-secret
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # TODO: pin to a verified CLI version once one is confirmed; latest is used until then.
       - name: Install Supabase CLI
@@ -57,7 +57,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up Deno
         if: hashFiles('supabase/functions/**/*.test.ts') != ''
@@ -77,7 +77,7 @@ jobs:
       run:
         working-directory: workers/tile-auth
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up Node 22
         uses: actions/setup-node@v4
