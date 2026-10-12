@@ -37,11 +37,9 @@ pytest tests -q
 
 **Mobile (Expo / TypeScript)**
 
-`npm ci` requires a committed `package-lock.json`. Until lockfiles land, use `npm install`.
-
 ```sh
 cd apps/mobile
-npm ci        # or: npm install, until package-lock.json is committed
+npm ci
 npx tsc --noEmit
 npx jest --ci
 ```
@@ -60,7 +58,7 @@ supabase test db
 
 ```sh
 cd workers/tile-auth
-npm install
+npm ci
 npm test
 ```
 

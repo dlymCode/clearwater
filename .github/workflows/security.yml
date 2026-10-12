@@ -2,6 +2,7 @@ name: security
 
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -50,6 +51,16 @@ jobs:
             npm audit --audit-level=high || echo "::warning::npm audit reported issues in apps/mobile"
           else
             echo "::notice::No package-lock.json in apps/mobile; skipping audit"
+          fi
+
+      - name: Audit packages/shared
+        if: always()
+        working-directory: packages/shared
+        run: |
+          if [ -f package-lock.json ]; then
+            npm audit --audit-level=high || echo "::warning::npm audit reported issues in packages/shared"
+          else
+            echo "::notice::No package-lock.json in packages/shared; skipping audit"
           fi
 
       - name: Audit workers/tile-auth

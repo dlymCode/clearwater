@@ -27,12 +27,14 @@ Tiles live on R2 under `tiles/<aoi>/<version>/`. `tiles/index.json` lists the li
 
 **Rollback**
 
-1. Restore the previous version's entry as the newest entry in `tiles/index.json`.
+`tiles/index.json` holds exactly one entry per AOI. The app picks the highest version string for each AOI, so appending an older entry does nothing.
+
+1. Replace the AOI's single entry in `tiles/index.json` with the previous version's entry (its version and file paths).
 2. Do not delete the bad version immediately; keep it for investigation.
 
 **Retention**
 
-- Old versions are kept for 30 days, then removed. TODO: schedule the cleanup job and record it here.
+- Old versions are kept for 30 days after they are superseded, then removed by `publish --prune`.
 
 ## 3. HMAC salt rotation
 
@@ -40,7 +42,7 @@ The `uploader_hash` is HMAC(uid, daily server salt). The salt rotates daily.
 
 Manual rotation (incident or scheduled):
 
-1. Run the admin rotation Edge Function (TODO: name). It writes an `audit_log` row.
+1. Call the `admin` Edge Function with action `rotate_salt`. It bumps the HMAC salt epoch and writes an `audit_log` row.
 2. Confirm new uploads carry the new salt-derived hash.
 3. Record the time and reason in the incident log.
 
@@ -51,7 +53,7 @@ If the salt or service key leaks: rotate the salt, rotate the service key, inval
 Use this for a bad actor or a compromised account. Admin actions run through Edge Functions that check the admin uid list and write to `audit_log`.
 
 1. Identify the account (`profiles.id`, handle). Do not record the email address in tickets.
-2. Revoke the account through the admin Edge Function (TODO: name). This invalidates its sessions.
+2. Call the `admin` Edge Function with action `revoke_account` and the target `user_id` (optional `reason`). It blocks writes, hides public pings, and bans sign-in, which invalidates its sessions.
 3. Hide its pings from the public tier if needed (reputation under 0.3 already hides them).
 4. Confirm that a removed group member loses access on the next request (RLS evaluates per query).
 5. Record the action and reason in `audit_log` and the incident log.

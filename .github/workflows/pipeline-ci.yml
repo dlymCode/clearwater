@@ -2,6 +2,7 @@ name: pipeline-ci
 
 on:
   push:
+    branches: [main]
     paths:
       - "pipeline/**"
       - ".github/workflows/pipeline-ci.yml"
@@ -50,7 +51,6 @@ jobs:
         run: pytest tests -q
 
       # Validates the tiles index shape against the JSON Schema.
-      # Stays skipped until the pipeline owner commits the fixture.
       - name: Validate tiles index schema
         if: hashFiles('pipeline/tests/fixtures/tiles_index.example.json') != ''
         run: python -m jsonschema -i tests/fixtures/tiles_index.example.json schemas/tiles_index.schema.json
