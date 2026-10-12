@@ -2,25 +2,29 @@
  * MapLibre style builder (pure JSON; no @maplibre imports so it can be unit-tested in node).
  * The screen passes the result to <Map mapStyle=...> (typed there with one documented cast).
  *
- * Tile contract ASSUMPTIONS (flagged as open questions for the pipeline owner):
- *  - base.pmtiles   vector. source-layers: land, DEPARE, DEPCNT, SOUNDG, COALNE, BOYLAT, LIGHTS,
- *                   OBSTRN, WRECKS, CBLSUB, boundaries (props: region_id, kind).
- *  - depth.pmtiles  raster Terrain-RGB, standard Mapbox formula but values are FEET MLLW (pipeline/tiles.py),
- *                   z8-z16, tileSize 256. MapLibre treats decoded values as metres, so colour-ramp stops are
- *                   raw feet and hillshade exaggeration is scaled by 0.3048.
- *  - depth_meta.pmtiles  per-cell source/date/uncertainty (RGBA), NOT in index.json; sampled by the inspect
- *                   popup, never drawn.
- *  - waterline.pmtiles raster Terrain-RGB for elevation. TODO(pipeline): hatching needs a per-cell scene
- *                   count; the pipeline currently masks cells with < 5 scenes entirely, so there is nothing to
- *                   hatch yet. The rule below keys on a vector companion layer `waterline_scenes` with an
- *                   `n` property (n < 5) and starts working once the pipeline ships counts.
- *  - fleet.pmtiles  vector, source-layer `fleet` (H3 cell polygons) with properties median_ft, n, boats.
+ * Tile contract (a PMTiles archive holds ONE tile type, so each product is its own file):
+ *  - base.pmtiles   vector. source-layers: DEPARE, DEPCNT, SOUNDG, COALNE, BOYLAT, LIGHTS, OBSTRN, WRECKS, CBLSUB and
+ *                   `boundaries` (props: region_id, kind), all inside the one file.
+ *  - land.pmtiles   vector (OSM land, ODbL kept separate), by path convention tiles/<aoi>/<version>/land.pmtiles, source-
+ *                   layer `land`. OPTIONAL: absent => no land fill, the map still works.
+ *  - depth.pmtiles  raster Terrain-RGB, standard Mapbox formula but values are FEET MLLW (pipeline/tiles.py), z8-z16,
+ *                   tileSize 256. MapLibre treats decoded values as metres, so colour-ramp stops are raw feet and
+ *                   hillshade exaggeration is scaled by 0.3048.
+ *  - depth_meta.pmtiles  per-cell source/date/uncertainty (RGBA), NOT in index.json; sampled by the inspect popup,
+ *                   never drawn.
+ *  - waterline.pmtiles raster Terrain-RGB for elevation. OPTIONAL. TODO(pipeline): scene-count hatching (MAP-4, n < 5)
+ *                   returns when the pipeline ships per-cell counts as a separate archive; today it masks cells with
+ *                   fewer than 5 scenes entirely, so there is nothing to hatch.
+ *  - fleet.pmtiles  vector, source-layer `fleet` (H3 cell polygons) with properties median_ft, n, boats. OPTIONAL.
+ *
+ * Optional products are included only when their URL is passed; the builder never references a source it did not
+ * declare, so a missing land / waterline / fleet file cannot break the map.
  */
 import {
   DEPTH_COLOR_RAMP_FT,
   FLEET_MIN_BOATS,
+  METERS_PER_FOOT,
   TILE_ZOOM,
-  WATERLINE_MIN_SCENES,
 } from '@clearwater/shared';
 
 export interface LayerToggles {
@@ -41,13 +45,15 @@ export const DEFAULT_TOGGLES: LayerToggles = {
 
 /** `pmtiles://file:///.../depth.pmtiles` or `pmtiles://https://signed-url`. Optional layers may be absent. */
 /** MapLibre assumes metres; our values are feet, so shrink hillshade exaggeration by 0.3048. */
-export const HILLSHADE_EXAGGERATION_SCALE = 0.3048;
+export const HILLSHADE_EXAGGERATION_SCALE = METERS_PER_FOOT;
 
 export interface TileUrls {
   base: string;
   depth: string;
   /** depth_meta.pmtiles (inspect only; not drawn). */
   depthMeta?: string;
+  /** land.pmtiles (optional). */
+  land?: string;
   waterline?: string;
   fleet?: string;
 }
@@ -202,8 +208,8 @@ export function buildMapStyle(urls: TileUrls, toggles: LayerToggles = DEFAULT_TO
       minzoom: TILE_ZOOM.waterline.min,
       maxzoom: TILE_ZOOM.waterline.max,
     };
-    sources.waterline_meta = { type: 'vector', url: urls.waterline, minzoom: TILE_ZOOM.waterline.min, maxzoom: TILE_ZOOM.waterline.max };
   }
+  if (urls.land) sources.land = { type: 'vector', url: urls.land, minzoom: TILE_ZOOM.base.min, maxzoom: TILE_ZOOM.base.max };
   if (urls.fleet) {
     sources.fleet = { type: 'vector', url: urls.fleet, minzoom: TILE_ZOOM.fleet.min, maxzoom: TILE_ZOOM.fleet.max };
   }
@@ -214,7 +220,7 @@ export function buildMapStyle(urls: TileUrls, toggles: LayerToggles = DEFAULT_TO
     { id: 'background', type: 'background', paint: { 'background-color': bg } },
     { id: 'depth-relief', type: 'color-relief', source: 'depth', layout: vis(toggles.depth), paint: { 'color-relief-color': colorReliefExpression(), 'color-relief-opacity': 0.9 } },
     { id: 'depth-hillshade', type: 'hillshade', source: 'depth', layout: vis(toggles.hillshade), paint: { 'hillshade-exaggeration': 0.4 * HILLSHADE_EXAGGERATION_SCALE } },
-    { id: 'land', type: 'fill', source: 'base', 'source-layer': 'land', paint: { 'fill-color': land } },
+    ...(urls.land ? [{ id: 'land', type: 'fill', source: 'land', 'source-layer': 'land', paint: { 'fill-color': land } } satisfies StyleLayer] : []),
     { id: 'depcnt', type: 'line', source: 'base', 'source-layer': 'DEPCNT', paint: { 'line-color': '#4a6d8c', 'line-width': 0.6 } },
     { id: 'coalne', type: 'line', source: 'base', 'source-layer': 'COALNE', paint: { 'line-color': '#222', 'line-width': 1 } },
     { id: 'cblsub', type: 'line', source: 'base', 'source-layer': 'CBLSUB', paint: { 'line-color': '#8a2be2', 'line-width': 0.8, 'line-dasharray': [4, 2] } },
@@ -225,18 +231,7 @@ export function buildMapStyle(urls: TileUrls, toggles: LayerToggles = DEFAULT_TO
   ];
 
   if (urls.waterline) {
-    layers.push(
-      { id: 'waterline-relief', type: 'color-relief', source: 'waterline', layout: vis(toggles.waterline), paint: { 'color-relief-color': colorReliefExpression(), 'color-relief-opacity': 0.85 } },
-      {
-        id: 'waterline-hatch',
-        type: 'fill',
-        source: 'waterline_meta',
-        'source-layer': 'waterline_scenes',
-        filter: ['<', ['get', 'n'], WATERLINE_MIN_SCENES],
-        layout: vis(toggles.waterline),
-        paint: { 'fill-pattern': hatch, 'fill-opacity': 0.8 },
-      },
-    );
+    layers.push({ id: 'waterline-relief', type: 'color-relief', source: 'waterline', layout: vis(toggles.waterline), paint: { 'color-relief-color': colorReliefExpression(), 'color-relief-opacity': 0.85 } });
   }
   if (urls.fleet) {
     layers.push(

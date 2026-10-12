@@ -2,7 +2,7 @@ import { Camera, Images, Map, Marker, type MapRef, type StyleSpecification } fro
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { NativeSyntheticEvent } from 'react-native';
 import { Pressable, Text, View } from 'react-native';
-import type { TileLayer } from '@clearwater/shared';
+import { AOI_LABELS, type AoiSlug, type TileLayer } from '@clearwater/shared';
 import { Banner, NotForNavigationLine } from '../components/Banner';
 import { Button } from '../components/Button';
 import { DepthLegend } from '../components/DepthLegend';
@@ -12,13 +12,14 @@ import { s, useColors } from '../components/theme';
 import { haversineM, isGpsStale, shouldRender } from '../lib/geo';
 import { readoutFromPixels, type InspectReadout } from '../lib/inspect';
 import { buildMapStyle, type LayerToggles } from '../lib/mapStyle';
-import { normalizePingRow, normalizeVoteRow, optimisticVote, visiblePings, buildVotePayload, voteAvailability, type ScoredPing } from '../lib/pingModel';
-import { regionReadout, type BoundaryCollection } from '../lib/region';
+import { normalizePingRow, optimisticVote, visiblePings, buildVotePayload, voteAvailability, type ScoredPing } from '../lib/pingModel';
+import { canWrite } from '../lib/profile';
+import { safeRegionReadout, type BoundaryCollection } from '../lib/region';
 import { offsetsNeeded } from '../lib/settings';
 import { aoiBanner } from '../lib/syncCursor';
 import { type InstalledAoi } from '../lib/tilesIndex';
 import { getInstalled, localFileUri } from '../services/downloads';
-import { loadLocalPings, loadLocalVotes, loadMyVotedPingIds, saveLocalVote } from '../services/localWrites';
+import { loadLocalPings, loadMyVotedPingIds, saveLocalVote } from '../services/localWrites';
 import { loadRegions } from '../services/regions';
 import { saveSettings } from '../services/settingsRepo';
 import { outbox } from '../services/syncService';
@@ -29,7 +30,7 @@ import { PingSheet } from './PingSheet';
 
 // TODO(item 19, not implemented): group ping creation (PingSheet takes a groupId; the map always posts public), a
 // remove-member UI, an "Inspect unavailable" message while tileSampler is a stub, and MAP-4 scene-count display.
-const AOI = 'skagit'; // TODO: persist the user's selected AOI; Skagit is the beta area
+const AOI: AoiSlug = 'skagit'; // TODO: persist the user's selected AOI; Skagit is the beta area
 const PMTILES = 'pmtiles://';
 
 const TOGGLE_LABELS: Array<[keyof LayerToggles, string]> = [
@@ -87,14 +88,9 @@ export function MapScreen() {
   useEffect(() => {
     void (async () => {
       const pings = (await loadLocalPings()).map(normalizePingRow).flatMap((p) => (p ? [p] : []));
-      const votes = new globalThis.Map<string, NonNullable<ReturnType<typeof normalizeVoteRow>>[]>();
-      for (const raw of await loadLocalVotes()) {
-        const pv = normalizeVoteRow(raw);
-        if (pv) votes.set(pv.ping_id, [...(votes.get(pv.ping_id) ?? []), pv]);
-      }
       setMyVotes(await loadMyVotedPingIds());
       // Unsynced = queued OR rejected-and-not-retried: both keep the "pending sync" mark.
-      setScored(visiblePings(pings, votes, Date.now(), await outbox.unsyncedIds('ping')));
+      setScored(visiblePings(pings, Date.now(), await outbox.unsyncedIds('ping')));
     })();
   }, [rev, minute, userId]); // refresh on data change and once a minute (decay)
 
@@ -106,7 +102,9 @@ export function MapScreen() {
       {
         base: f('base.pmtiles'),
         depth: f('depth.pmtiles'),
-        depthMeta: f('depth_meta.pmtiles'),
+        ...(installed.companions?.includes('depth_meta') ? { depthMeta: f('depth_meta.pmtiles') } : {}),
+        // Optional products appear only when their file is on disk: a missing land / waterline / fleet never breaks the map.
+        ...(installed.companions?.includes('land') ? { land: f('land.pmtiles') } : {}),
         ...(has('waterline') ? { waterline: f('waterline.pmtiles') } : {}),
         ...(has('fleet') ? { fleet: f('fleet.pmtiles') } : {}),
       },
@@ -124,7 +122,7 @@ export function MapScreen() {
         stubTileSampler.sample('depth_meta', lon, lat, zoom),
       ]);
       setReadout(readoutFromPixels(terrain, meta, Date.now()));
-      setRegionText(regions ? regionReadout({ lat, lon }, regions).text : null);
+      setRegionText(safeRegionReadout({ lat, lon }, regions)?.text ?? null);
     },
     [regions],
   );
@@ -137,10 +135,13 @@ export function MapScreen() {
     bump();
   }
 
+  const profileReady = useAppStore((st) => st.profileReady);
+  const accountRevoked = useAppStore((st) => st.accountRevoked);
+  const gate = canWrite({ profileReady, accountRevoked });
   const stale = isGpsStale(shownGps?.tMs, now);
   const here = shownGps ? { lat: shownGps.lat, lon: shownGps.lon } : null;
-  const banner = installed ? aoiBanner('Skagit Bay and flats', installed.downloadedAt, now) : null;
-  const liveRegion = here && regions ? regionReadout(here, regions).text : null;
+  const banner = installed ? aoiBanner(AOI_LABELS[AOI as AoiSlug], installed.downloadedAt, now) : null;
+  const liveRegion = here ? (safeRegionReadout(here, regions)?.text ?? null) : null;
 
   return (
     <View style={{ flex: 1, backgroundColor: c.bg }}>
@@ -174,6 +175,7 @@ export function MapScreen() {
 
       {/* Overlays */}
       <View pointerEvents="box-none" style={{ position: 'absolute', top: 8, left: 8, right: 8, gap: 6 }}>
+        {accountRevoked ? <Banner level="red" text="This account has been blocked by the server. Pings and votes are paused." /> : null}
         {banner ? <Banner level={banner.level} text={banner.message} /> : null}
         <DepthNumeral depth={depth} nowMs={now} offsetsMissing={offsetsNeeded(settings)} />
         <Text style={[s.h2, { color: c.text, textAlign: 'center', backgroundColor: c.card + 'cc' }]}>{liveRegion ?? ''}</Text>
@@ -205,12 +207,12 @@ export function MapScreen() {
       />
       <PingDetail
         scored={detail}
-        availability={detail ? voteAvailability({
+        availability={detail && gate.ok ? voteAvailability({
           isOwn: !!userId && detail.ping.author_id === userId,
           pendingSync: detail.pendingSync,
           alreadyVoted: myVotes.has(detail.ping.id),
           distanceToPingM: here ? haversineM(here, { lat: detail.ping.lat, lon: detail.ping.lon }) : null,
-        }) : { confirm: false, dispute: false, reason: null }}
+        }) : { confirm: false, dispute: false, reason: gate.ok ? null : gate.reason }}
         onVote={(id, v) => void vote(id, v)} onClose={() => setDetail(null)} />
     </View>
   );

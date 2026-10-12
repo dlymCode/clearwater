@@ -111,3 +111,28 @@ describe('nearestStation', () => {
     expect(nearestStation([], { lat: 48, lon: -122 })).toBeNull();
   });
 });
+
+describe('E: explicit UTC markers and curve guards', () => {
+  const mk = (t: string): TidePredictions => ({ ...preds, predictions: [{ t, v: 1 }, { t: '2026-10-09T09:00:00Z', v: 2 }] });
+  it('accepts Z and +00:00 / +0000 markers', () => {
+    expect(toSeries(mk('2026-10-09T08:00:00Z')).tMs).toHaveLength(2);
+    expect(toSeries(mk('2026-10-09T08:00:00+00:00')).tMs).toHaveLength(2);
+    expect(toSeries(mk('2026-10-09T08:00:00+0000')).tMs).toHaveLength(2);
+    expect(toSeries(mk('2026-10-09T08:00:00.000Z')).tMs).toHaveLength(2);
+  });
+  it('rejects ambiguous local-time strings and non-UTC offsets (they would shift the whole curve)', () => {
+    expect(toSeries(mk('2026-10-09T08:00:00')).tMs).toHaveLength(1);
+    expect(toSeries(mk('2026-10-09 08:00:00')).tMs).toHaveLength(1);
+    expect(toSeries(mk('2026-10-09T08:00:00-07:00')).tMs).toHaveLength(1);
+    expect(toSeries(mk('2026-10-09')).tMs).toHaveLength(1);
+  });
+  it('tideCurve refuses a non-positive step or non-finite bounds instead of looping forever', () => {
+    const s = toSeries(preds);
+    expect(() => tideCurve(s, 0, 1000, 0)).toThrow(RangeError);
+    expect(() => tideCurve(s, 0, 1000, -5)).toThrow(RangeError);
+    expect(() => tideCurve(s, 0, 1000, Number.NaN)).toThrow(RangeError);
+    expect(() => tideCurve(s, 0, Infinity, 10)).toThrow(RangeError);
+    expect(() => tideCurve(s, Number.NaN, 1000, 10)).toThrow(RangeError);
+    expect(tideCurve(s, 0, 0, 10)).toHaveLength(1);
+  });
+});

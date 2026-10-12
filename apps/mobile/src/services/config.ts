@@ -7,7 +7,6 @@ export const CONFIG = {
   supabaseUrl: process.env.EXPO_PUBLIC_SUPABASE_URL ?? '',
   supabaseAnonKey: process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY ?? '',
   tileAuthUrl: extra.tileAuthUrl ?? '',
-  tilesIndexUrl: process.env.EXPO_PUBLIC_TILES_INDEX_URL ?? '',
 } as const;
 
 export function isBackendConfigured(): boolean {

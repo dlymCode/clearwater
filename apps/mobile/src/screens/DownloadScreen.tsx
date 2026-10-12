@@ -44,7 +44,7 @@ export function DownloadScreen() {
   return (
     <ScrollView style={{ backgroundColor: c.bg }} contentContainerStyle={[s.pad, s.gap]}>
       <Text style={[s.h1, { color: c.text }]}>Offline areas</Text>
-      <Button label="Check for updates" kind="secondary" onPress={() => void pullTilesIndex().then(load)} />
+      <Button label="Check for updates" kind="secondary" onPress={() => { pullTilesIndex().then(load).catch((e: unknown) => setStatus(e instanceof Error ? e.message : 'Could not reach the server.')); }} />
       {!index ? <Banner level="info" text="No area list yet. Connect to WiFi and tap Check for updates." /> : null}
       {[...latest.values()].map((e) => {
         const inst = installed[e.aoi];

@@ -8,8 +8,9 @@
  * Values are CHARTED DEPTH in ft below MLLW (positive down); p10_ft is the 10th percentile of depth,
  * i.e. the shoal-biased value (linear-interpolation percentile, "type 7").
  */
-import { isValidCell, latLngToCell } from 'h3-js';
-import { H3_RESOLUTION, type DepthUploadRow } from '@clearwater/shared';
+import { getResolution, isValidCell, latLngToCell } from 'h3-js';
+import { DEPTH_VALUE_LIMIT_FT, H3_RESOLUTION, type DepthUploadRow } from '@clearwater/shared';
+import { round2 } from './num';
 
 export interface CorrectedSounding {
   tMs: number;
@@ -39,15 +40,26 @@ export function percentile(sortedAsc: readonly number[], p: number): number {
   return a + (b - a) * (idx - lo);
 }
 
-/** Round to 0.01 ft: removes float noise and avoids encoding more precision than the sounder has. */
-const r2 = (x: number): number => Math.round(x * 100) / 100;
+/** Accepted sounding times: 2020-01-01 .. 2100-01-01 UTC (the server rejects older; beyond is a clock bug). */
+const MIN_T_MS = Date.UTC(2020, 0, 1);
+const MAX_T_MS = Date.UTC(2100, 0, 1);
+
+const validLatLon = (lat: number, lon: number): boolean =>
+  Number.isFinite(lat) && Number.isFinite(lon) && lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180;
+
+/** True for an acceptable raw sounding. Checked BEFORE H3: out-of-range coordinates still map to valid cells. */
+export function validSounding(s: CorrectedSounding): boolean {
+  return (
+    Number.isFinite(s.tMs) && s.tMs >= MIN_T_MS && s.tMs < MAX_T_MS &&
+    validLatLon(s.lat, s.lon) &&
+    Number.isFinite(s.mllwDepthFt) && Math.abs(s.mllwDepthFt) <= DEPTH_VALUE_LIMIT_FT
+  );
+}
 
 export function aggregateSoundings(soundings: readonly CorrectedSounding[]): DepthUploadRow[] {
   const groups = new Map<string, { h3_cell: string; day: string; depths: number[] }>();
   for (const s of soundings) {
-    if (!Number.isFinite(s.lat) || !Number.isFinite(s.lon) || !Number.isFinite(s.mllwDepthFt) || !Number.isFinite(s.tMs)) {
-      continue;
-    }
+    if (!validSounding(s)) continue;
     const h3_cell = latLngToCell(s.lat, s.lon, H3_RESOLUTION);
     const day = utcDay(s.tMs);
     const key = `${day}|${h3_cell}`;
@@ -64,63 +76,51 @@ export function aggregateSoundings(soundings: readonly CorrectedSounding[]): Dep
     rows.push({
       h3_cell: g.h3_cell,
       day: g.day,
-      median_ft: r2(percentile(g.depths, 0.5)),
-      p10_ft: r2(percentile(g.depths, 0.1)),
+      median_ft: round2(percentile(g.depths, 0.5)),
+      p10_ft: round2(percentile(g.depths, 0.1)),
       n: g.depths.length,
     });
   }
   // Deterministic order that reveals no track order: by day then cell id.
-  rows.sort((a, b) => (a.day === b.day ? (a.h3_cell < b.h3_cell ? -1 : 1) : a.day < b.day ? -1 : 1));
+  rows.sort(byDayThenCell);
   return rows;
 }
 
-/** n-weighted median of values (ties resolved to the lower value). */
-function weightedMedian(items: ReadonlyArray<{ v: number; w: number }>): number {
-  const sorted = [...items].sort((a, b) => a.v - b.v);
-  const total = sorted.reduce((s, x) => s + x.w, 0);
-  let acc = 0;
-  for (const it of sorted) {
-    acc += it.w;
-    if (acc >= total / 2) return it.v;
-  }
-  return (sorted[sorted.length - 1] as { v: number }).v;
+const byDayThenCell = (a: DepthUploadRow, b: DepthUploadRow): number =>
+  a.day === b.day ? (a.h3_cell < b.h3_cell ? -1 : a.h3_cell > b.h3_cell ? 1 : 0) : a.day < b.day ? -1 : 1;
+
+/**
+ * Collapse rows that share (h3_cell, day). Every upload is the COMPLETE UTC-day aggregate of its cell (see
+ * reaggregateTouched) and the server upserts-replace, so for the same (cell, day) the LATER row supersedes the
+ * earlier one; they must never be summed. Input is in send order (oldest first). p10 is clamped to <= median.
+ */
+export function mergeUploadRows(rows: readonly DepthUploadRow[]): DepthUploadRow[] {
+  const latest = new Map<string, DepthUploadRow>();
+  for (const r of rows) latest.set(`${r.day}|${r.h3_cell}`, r);
+  return [...latest.values()]
+    .map((r) => ({ ...r, p10_ft: Math.min(r.p10_ft, r.median_ft) }))
+    .sort(byDayThenCell);
 }
 
 /**
- * Merge rows that share (h3_cell, day) — used when the outbox squeezes old depth batches.
- * Approximation (the raw soundings are gone): median = n-weighted median of the medians,
- * p10 = n-weighted mean of the p10s, n = sum.
+ * B1: each upload must carry the COMPLETE UTC-day aggregate for every cell touched since the last batch, because the
+ * server replaces (cell, day). `fresh` are the soundings not yet uploaded; `dayRows` are ALL stored soundings of the
+ * UTC days those touch. A cell logged at 10:00 and again at 14:00 therefore uploads the combined n / median / p10.
  */
-export function mergeUploadRows(rows: readonly DepthUploadRow[]): DepthUploadRow[] {
-  const groups = new Map<string, DepthUploadRow[]>();
-  for (const r of rows) {
-    const k = `${r.day}|${r.h3_cell}`;
-    const g = groups.get(k);
-    if (g) g.push(r);
-    else groups.set(k, [r]);
-  }
-  const out: DepthUploadRow[] = [];
-  for (const g of groups.values()) {
-    const first = g[0] as DepthUploadRow;
-    if (g.length === 1) {
-      out.push(first);
-      continue;
-    }
-    const n = g.reduce((s, r) => s + r.n, 0);
-    out.push({
-      h3_cell: first.h3_cell,
-      day: first.day,
-      median_ft: r2(weightedMedian(g.map((r) => ({ v: r.median_ft, w: r.n })))),
-      p10_ft: r2(g.reduce((s, r) => s + r.p10_ft * r.n, 0) / n),
-      n,
-    });
-  }
-  out.sort((a, b) => (a.day === b.day ? (a.h3_cell < b.h3_cell ? -1 : 1) : a.day < b.day ? -1 : 1));
-  return out;
+export function reaggregateTouched(fresh: readonly CorrectedSounding[], dayRows: readonly CorrectedSounding[]): DepthUploadRow[] {
+  const touched = new Set(aggregateSoundings(fresh).map((r) => `${r.day}|${r.h3_cell}`));
+  return aggregateSoundings(dayRows).filter((r) => touched.has(`${r.day}|${r.h3_cell}`));
 }
 
 /** Type-level guard: resolves to `never` for any row type carrying keys beyond the five allowed ones. */
 export type NoExtraKeys<T> = Exclude<keyof T, keyof DepthUploadRow> extends never ? unknown : never;
+
+/** YYYY-MM-DD that is a real calendar day (rejects 2026-02-31, 2026-13-01, ...). */
+export function isRealCalendarDay(day: string): boolean {
+  if (!DAY_RE.test(day)) return false;
+  const t = Date.parse(`${day}T00:00:00Z`);
+  return Number.isFinite(t) && new Date(t).toISOString().slice(0, 10) === day;
+}
 
 function isRowShape(x: unknown): x is Record<string, unknown> {
   return typeof x === 'object' && x !== null && !Array.isArray(x);
@@ -128,10 +128,10 @@ function isRowShape(x: unknown): x is Record<string, unknown> {
 
 function validRow(o: Record<string, unknown>): DepthUploadRow | null {
   const { h3_cell, day, median_ft, p10_ft, n } = o;
-  if (typeof h3_cell !== 'string' || !isValidCell(h3_cell)) return null;
-  if (typeof day !== 'string' || !DAY_RE.test(day) || Number.isNaN(Date.parse(`${day}T00:00:00Z`))) return null;
-  if (typeof median_ft !== 'number' || !Number.isFinite(median_ft)) return null;
-  if (typeof p10_ft !== 'number' || !Number.isFinite(p10_ft)) return null;
+  if (typeof h3_cell !== 'string' || !isValidCell(h3_cell) || getResolution(h3_cell) !== H3_RESOLUTION) return null;
+  if (typeof day !== 'string' || !isRealCalendarDay(day)) return null;
+  if (typeof median_ft !== 'number' || !Number.isFinite(median_ft) || Math.abs(median_ft) > DEPTH_VALUE_LIMIT_FT) return null;
+  if (typeof p10_ft !== 'number' || !Number.isFinite(p10_ft) || Math.abs(p10_ft) > DEPTH_VALUE_LIMIT_FT) return null;
   if (typeof n !== 'number' || !Number.isInteger(n) || n < 1) return null;
   return { h3_cell, day, median_ft, p10_ft, n };
 }

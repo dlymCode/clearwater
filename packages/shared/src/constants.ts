@@ -39,6 +39,16 @@ export const DEPTH_COLOR_RAMP_FT = [0, 3, 6, 10, 20, 40] as const;
 /** H3 resolution for depth aggregation (~8 m edge). */
 export const H3_RESOLUTION = 12;
 
+/** Time units: the one home for these (do not restate 86_400_000 / 3_600_000 elsewhere). */
+export const MS_PER_HOUR = 3_600_000;
+export const MS_PER_DAY = 86_400_000;
+
+/** Sanity bound for any depth/elevation value in an upload (ft). */
+export const DEPTH_VALUE_LIMIT_FT = 2000;
+
+/** Salish Sea box [west, south, east, north] used by the server CHECKs and report_position (supabase in_salish_sea). */
+export const SALISH_SEA_BBOX = [-124.0, 46.9, -121.9, 49.1] as const;
+
 export const WORKING_EPSG = 32610;
 export const TILE_EPSG = 3857;
 
@@ -139,6 +149,8 @@ export const RATE_LIMITS = {
 export const PING_NOTE_MAX = 140;
 export const MESSAGE_BODY_MAX = 500;
 export const INVITE_CODE_LENGTH = 8;
+/** Server alphabet (public.generate_invite_code): 32 symbols, no 0/O/1/I. Regex form: [A-HJ-NP-Z2-9]. */
+export const INVITE_CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 export const INVITE_TTL_DAYS = 7;
 export const MESSAGE_RETENTION_DAYS = 90;
 /** Pings visible 48 h (decay hides sooner via score). */
@@ -169,20 +181,25 @@ export const OUTBOX_KINDS = ['ping', 'vote', 'message', 'depth_batch'] as const;
 export type OutboxKind = (typeof OUTBOX_KINDS)[number];
 
 /** Server tables pulled by the inbound cursor sync. */
-export const SYNC_TABLES = ['pings', 'ping_votes', 'messages'] as const;
+export const SYNC_TABLES = ['pings', 'messages'] as const;
 export type SyncTable = (typeof SYNC_TABLES)[number];
 
 /**
- * Where each inbound table is read from and which column is its sync cursor. Not every table has
- * `updated_at`: votes are immutable (server created_at), messages use the server clock (received_at).
- * Pings and votes are read through the feed views, which expose reputations for client-side scoring and
- * hide the author of anonymous pings.
+ * Where each inbound table is read from and which column is its sync cursor. Messages have no `updated_at`; they use
+ * the server clock (received_at). Pings are read through `ping_feed`, which hides the author of anonymous pings and
+ * carries the precomputed vote aggregates (vote_sum, last_confirmed_at, confirm_count, dispute_count): per-vote rows
+ * never leave the server (a per-vote feed de-anonymizes voters). Any vote bumps pings.updated_at, so the ping
+ * cursor picks vote changes up. `tieColumn` is the keyset-pagination tie-breaker (updated_at/received_at can be
+ * shared by thousands of rows written in one transaction).
  */
 export const SYNC_SOURCES = {
-  pings: { relation: 'ping_feed', cursorColumn: 'updated_at' },
-  ping_votes: { relation: 'ping_votes_feed', cursorColumn: 'created_at' },
-  messages: { relation: 'messages', cursorColumn: 'received_at' },
-} as const satisfies Record<SyncTable, { relation: string; cursorColumn: string }>;
+  pings: { relation: 'ping_feed', cursorColumn: 'updated_at', tieColumn: 'id' },
+  // messages_feed = messages joined with the author's handle.
+  messages: { relation: 'messages_feed', cursorColumn: 'received_at', tieColumn: 'id' },
+} as const satisfies Record<SyncTable, { relation: string; cursorColumn: string; tieColumn: string }>;
+
+/** The user's own votes (ping_votes where voter_id = auth.uid()); one row per ping, so ping_id breaks ties. */
+export const OWN_VOTES_SOURCE = { relation: 'ping_votes', cursorColumn: 'created_at', tieColumn: 'ping_id' } as const;
 
 /** Server accepts at most this many rows per depth upload batch. */
 export const DEPTH_BATCH_MAX_ROWS = 5000;

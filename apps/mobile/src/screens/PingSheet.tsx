@@ -4,6 +4,7 @@ import { PING_TYPES, PING_TYPE_LABELS, PING_NOTE_MAX, type PingType } from '@cle
 import { Button } from '../components/Button';
 import { s, useColors } from '../components/theme';
 import { buildPingPayload, canSubmitPing, validateNote, type PingDraft } from '../lib/pingModel';
+import { canWrite } from '../lib/profile';
 import { uuidv4 } from '../lib/uuid';
 import { saveLocalPing } from '../services/localWrites';
 import { outbox } from '../services/syncService';
@@ -32,10 +33,14 @@ export function PingSheet({
   const [note, setNote] = useState('');
   const [error, setError] = useState<string | null>(null);
   const bump = useAppStore((st) => st.bumpData);
+  const profileReady = useAppStore((st) => st.profileReady);
+  const accountRevoked = useAppStore((st) => st.accountRevoked);
+  const gate = canWrite({ profileReady, accountRevoked });
 
   const reset = () => { setType(null); setNote(''); setError(null); };
 
   async function confirm() {
+    if (!gate.ok) return setError(gate.reason);
     if (!position) return setError('No position yet.');
     const draft: PingDraft = { type, lat: position.lat, lon: position.lon, note, groupId };
     const ok = canSubmitPing(draft);
@@ -75,10 +80,11 @@ export function PingSheet({
               />
               <Text style={[s.small, { color: c.sub }]}>{`${Array.from(note).length}/${PING_NOTE_MAX}. Long-press the map first to move the pin.`}</Text>
               {!noteCheck.ok ? <Text style={{ color: c.danger }}>{noteCheck.error}</Text> : null}
-              <Button label="Drop ping" onPress={() => void confirm()} />
+              <Button label="Drop ping" disabled={!gate.ok} onPress={() => void confirm()} />
               <Button label="Back" kind="secondary" onPress={() => setType(null)} />
             </>
           )}
+          {!gate.ok ? <Text style={{ color: c.warn }}>{gate.reason}</Text> : null}
           {error ? <Text style={{ color: c.danger }}>{error}</Text> : null}
           <Button label="Cancel" kind="secondary" onPress={() => { reset(); onClose(); }} />
         </View>

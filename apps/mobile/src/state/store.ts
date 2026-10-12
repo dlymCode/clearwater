@@ -28,6 +28,10 @@ interface AppState {
   userId: string | null;
   /** A 401 paused syncing: show sign-in again. */
   authRequired: boolean;
+  /** The server refused the account (account_revoked). */
+  accountRevoked: boolean;
+  /** The profiles row exists. Pings / votes / joins are blocked (FK) until it does. */
+  profileReady: boolean;
   setSettings: (patch: Partial<AppSettings>) => void;
   hydrateSettings: (stored: unknown) => void;
   setGps: (fix: GpsFix) => void;
@@ -36,6 +40,8 @@ interface AppState {
   bumpData: () => void;
   setUserId: (id: string | null) => void;
   setAuthRequired: (v: boolean) => void;
+  setAccountRevoked: (v: boolean) => void;
+  setProfileReady: (v: boolean) => void;
 }
 
 export const useAppStore = create<AppState>((set) => ({
@@ -48,6 +54,8 @@ export const useAppStore = create<AppState>((set) => ({
   dataRev: 0,
   userId: null,
   authRequired: false,
+  accountRevoked: false,
+  profileReady: false,
   setSettings: (patch) => set((s) => ({ settings: { ...s.settings, ...patch } })),
   hydrateSettings: (stored) => set({ settings: mergeSettings(stored), settingsLoaded: true }),
   setGps: (gps) => set({ gps }),
@@ -56,4 +64,6 @@ export const useAppStore = create<AppState>((set) => ({
   bumpData: () => set((s) => ({ dataRev: s.dataRev + 1 })),
   setUserId: (userId) => set({ userId }),
   setAuthRequired: (authRequired) => set({ authRequired }),
+  setAccountRevoked: (accountRevoked) => set({ accountRevoked }),
+  setProfileReady: (profileReady) => set({ profileReady }),
 }));

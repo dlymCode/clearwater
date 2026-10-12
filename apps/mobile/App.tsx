@@ -10,10 +10,12 @@ import { requestForegroundPermission, watchGps } from './src/services/location';
 import { NmeaClient } from './src/services/nmeaClient';
 import { maybeReportPosition } from './src/services/positionReporter';
 import { loadSettings, saveSettings } from './src/services/settingsRepo';
+import { loadProfileState } from './src/services/profile';
 import { getSupabase } from './src/services/supabase';
 import { outbox, startSyncTriggers } from './src/services/syncService';
 import { useAppStore } from './src/state/store';
 import { AuthScreen } from './src/screens/AuthScreen';
+import { ProfileScreen } from './src/screens/ProfileScreen';
 import { ChannelScreen } from './src/screens/ChannelScreen';
 import { DownloadScreen } from './src/screens/DownloadScreen';
 import { GroupsScreen } from './src/screens/GroupsScreen';
@@ -29,6 +31,7 @@ export default function App() {
   const c = useColors();
   const loaded = useAppStore((st) => st.settingsLoaded);
   const authRequired = useAppStore((st) => st.authRequired);
+  const profileReady = useAppStore((st) => st.profileReady);
   const settings = useAppStore((st) => st.settings);
   const [tab, setTab] = useState<Tab>('map');
   const [channel, setChannel] = useState<Group | null>(null);
@@ -44,6 +47,7 @@ export default function App() {
       if (isBackendConfigured()) {
         const { data } = await getSupabase().auth.getSession();
         useAppStore.getState().setUserId(data.session?.user.id ?? null);
+        if (data.session) await loadProfileState().catch(() => false);
         setSignedIn(!!data.session);
       } else {
         setSignedIn(true); // offline-only mode: map, tides, boundaries work without a backend
@@ -81,12 +85,12 @@ export default function App() {
   useEffect(() => {
     if (!accepted || !settings.nmeaEnabled) {
       nmea.current?.stop();
-      void logger.current.stop();
+      logger.current.stop().catch(() => undefined);
       return;
     }
     logger.current.start();
     nmea.current = new NmeaClient({
-      onSnapshot: (snap) => void logger.current.onSnapshot(snap),
+      onSnapshot: (snap) => { logger.current.onSnapshot(snap).catch((e: unknown) => console.warn(`[depth] ${e instanceof Error ? e.message : String(e)}`)); },
       onStatus: (status) => useAppStore.getState().setNmea(status),
       onStats: (stats) => useAppStore.getState().setNmea(useAppStore.getState().nmeaStatus, stats),
     });
@@ -96,7 +100,10 @@ export default function App() {
 
   if (!loaded || signedIn === null) return <View style={{ flex: 1, backgroundColor: c.bg }} />;
   if (!accepted) return <SafeAreaView style={{ flex: 1, backgroundColor: c.bg }}><OnboardingScreen onAccept={(t, share) => void saveSettings({ acceptedDisclaimerAt: t, sharePosition: share })} /></SafeAreaView>;
-  if (!signedIn || authRequired) return <SafeAreaView style={{ flex: 1, backgroundColor: c.bg }}><AuthScreen onSignedIn={() => { setSignedIn(true); useAppStore.getState().setAuthRequired(false); void getSupabase().auth.getSession().then(({ data }) => useAppStore.getState().setUserId(data.session?.user.id ?? null)); }} /></SafeAreaView>;
+  if (!signedIn || authRequired) return <SafeAreaView style={{ flex: 1, backgroundColor: c.bg }}><AuthScreen onSignedIn={() => { setSignedIn(true); useAppStore.getState().setAuthRequired(false); void getSupabase().auth.getSession().then(({ data }) => useAppStore.getState().setUserId(data.session?.user.id ?? null)).then(() => loadProfileState()).catch(() => false); }} /></SafeAreaView>;
+
+  // Everything that writes needs the profiles row (foreign keys); capture a handle first.
+  if (isBackendConfigured() && !profileReady) return <SafeAreaView style={{ flex: 1, backgroundColor: c.bg }}><ProfileScreen onDone={() => undefined} /></SafeAreaView>;
 
   return (
     <SafeAreaView style={{ flex: 1, backgroundColor: c.bg }}>

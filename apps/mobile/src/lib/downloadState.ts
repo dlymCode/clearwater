@@ -5,12 +5,17 @@
  */
 import type { TileLayer } from '@clearwater/shared';
 import type { TilesIndexAoi } from '@clearwater/shared';
-import { depthMetaPath, layersToDownload, type InstalledAoi } from './tilesIndex';
+import { depthMetaPath, landPath, layersToDownload, type InstalledAoi } from './tilesIndex';
 
-/** `depth_meta` is a companion file of `depth` (path convention; size unknown, listed with 0 bytes). */
-export type DownloadLayer = TileLayer | 'depth_meta';
+/**
+ * Companion files by path convention (not in index.json; sizes unknown, listed with 0 bytes): `depth_meta` goes with
+ * `depth`, `land` (OSM) with `base`. They are OPTIONAL: a 400/404 means the pipeline has not built them, and the map
+ * simply runs without them.
+ */
+export type DownloadLayer = TileLayer | 'depth_meta' | 'land';
+export const COMPANION_LAYERS: readonly DownloadLayer[] = ['depth_meta', 'land'];
 
-export type FileStatus = 'pending' | 'partial' | 'done' | 'failed';
+export type FileStatus = 'pending' | 'partial' | 'done' | 'failed' | 'absent';
 
 export interface DownloadFile {
   layer: DownloadLayer;
@@ -44,6 +49,10 @@ export function createJob(
   if (meta && files.some((f) => f.layer === 'depth')) {
     files.push({ layer: 'depth_meta', path: meta, bytes: 0, status: 'pending', bytesDone: 0 });
   }
+  const land = landPath(entry);
+  if (land && files.some((f) => f.layer === 'base')) {
+    files.push({ layer: 'land', path: land, bytes: 0, status: 'pending', bytesDone: 0 });
+  }
   return { aoi: entry.aoi, version: entry.version, startedAt: new Date(nowMs).toISOString(), files };
 }
 
@@ -52,12 +61,12 @@ export function nextFile(job: DownloadJob): DownloadFile | null {
 }
 
 export function isComplete(job: DownloadJob): boolean {
-  return job.files.length > 0 && job.files.every((f) => f.status === 'done');
+  return job.files.length > 0 && job.files.every((f) => f.status === 'done' || f.status === 'absent');
 }
 
 export function totals(job: DownloadJob): { doneBytes: number; totalBytes: number; fraction: number } {
   const totalBytes = job.files.reduce((s, f) => s + f.bytes, 0);
-  const doneBytes = job.files.reduce((s, f) => s + (f.status === 'done' ? f.bytes : Math.min(f.bytesDone, f.bytes)), 0);
+  const doneBytes = job.files.reduce((s, f) => s + (f.status === 'done' || f.status === 'absent' ? f.bytes : Math.min(f.bytesDone, f.bytes)), 0);
   return { doneBytes, totalBytes, fraction: totalBytes === 0 ? 1 : doneBytes / totalBytes };
 }
 
@@ -74,6 +83,10 @@ export function markProgress(job: DownloadJob, layer: DownloadLayer, bytesDone: 
 
 export function markDone(job: DownloadJob, layer: DownloadLayer): DownloadJob {
   return { ...job, files: job.files.map((f) => (f.layer === layer ? { ...f, status: 'done', bytesDone: f.bytes } : f)) };
+}
+
+export function markAbsent(job: DownloadJob, layer: DownloadLayer): DownloadJob {
+  return { ...job, files: job.files.map((f) => (f.layer === layer ? { ...f, status: 'absent', resumeData: undefined } : f)) };
 }
 
 export function markFailed(job: DownloadJob, layer: DownloadLayer): DownloadJob {

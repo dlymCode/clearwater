@@ -21,6 +21,7 @@
  */
 import { DEPTH_BATCH_MAX_ROWS, OUTBOX_CAP_BYTES, OUTBOX_KINDS, type DepthUploadRow, type OutboxKind } from '@clearwater/shared';
 import { assertAnonymousUploadPayload, mergeUploadRows, sanitizeUploadRows } from './aggregate';
+import { retryableStatus } from './http';
 import { uuidv4, type IdGenerator } from './uuid';
 
 export type OutboxStatus = 'pending' | 'sent' | 'failed';
@@ -76,8 +77,24 @@ export interface SendResult {
   code?: string;
 }
 
-/** 403s on votes that are expected user situations, not failures: dropped silently. */
-export const SILENT_VOTE_CODES: readonly string[] = ['confirm_ineligible', 'cannot_vote_own_ping', 'ping_not_found'];
+/**
+ * Vote failures that are expected user situations, not errors: dropped silently. cast_vote raises
+ * confirm_ineligible / cannot_vote_own_ping as PT403 and ping_not_found as PT404 (status AND code must match).
+ */
+export const SILENT_VOTE_FAILURES: ReadonlyArray<{ status: number; code: string }> = [
+  { status: 403, code: 'confirm_ineligible' },
+  { status: 403, code: 'cannot_vote_own_ping' },
+  { status: 404, code: 'ping_not_found' },
+];
+
+export function isSilentVoteFailure(status: number, code: string | undefined): boolean {
+  return !!code && SILENT_VOTE_FAILURES.some((f) => f.status === status && f.code === code);
+}
+
+/** 403 account_revoked: not retryable and not the row's fault; the account itself is blocked. */
+export function isAccountRevoked(status: number, code: string | undefined): boolean {
+  return status === 403 && code === 'account_revoked';
+}
 export type OutboxSender = (batch: OutboxBatch) => Promise<SendResult>;
 
 export interface OutboxOptions {
@@ -97,6 +114,8 @@ export interface FlushResult {
   swallowed: number;
   /** A 401 paused sending; refresh the session / sign in, then flush again. Rows stay pending. */
   authRequired: boolean;
+  /** The server refused the account (account_revoked). Rows stay pending; show a blocking notice. */
+  accountRevoked: boolean;
   /** A retryable error stopped some or all sending; rows remain pending. */
   stopped: boolean;
   perKind: Record<OutboxKind, { sent: number; failed: number }>;
@@ -170,6 +189,8 @@ function isDepthPayload(p: unknown): p is DepthBatchPayload {
   return typeof p === 'object' && p !== null && Array.isArray((p as { rows?: unknown }).rows);
 }
 
+type Outcome = 'ok' | 'retry' | 'network' | 'auth' | 'revoked';
+
 export class Outbox {
   private readonly cap: number;
   private readonly idGen: IdGenerator;
@@ -185,7 +206,7 @@ export class Outbox {
     this.idGen = opts.idGen ?? uuidv4;
     this.now = opts.now ?? Date.now;
     this.batchSize = { ...DEFAULT_BATCH, ...(opts.batchSize ?? {}) };
-    this.maxDepthRows = opts.maxDepthRowsPerBatch ?? 5000;
+    this.maxDepthRows = opts.maxDepthRowsPerBatch ?? DEPTH_BATCH_MAX_ROWS;
   }
 
   /**
@@ -197,7 +218,14 @@ export class Outbox {
     if (kind === 'depth_batch') assertAnonymousUploadPayload(payload);
     if (opts.id) {
       const existing = await this.store.get(opts.id);
-      if (existing) return existing; // idempotent: a retry after a crash does not duplicate
+      if (existing) {
+        // Idempotent for a true replay only. The same id with a different kind or payload is a caller bug (or a
+        // collision) and silently returning the old row would drop the new data.
+        if (existing.kind !== kind || JSON.stringify(existing.payload) !== JSON.stringify(payload)) {
+          throw new Error(`outbox id ${opts.id} already exists with a different ${existing.kind !== kind ? 'kind' : 'payload'}`);
+        }
+        return existing;
+      }
     }
     const row: OutboxRow = {
       id: opts.id ?? this.idGen(),
@@ -311,6 +339,7 @@ export class Outbox {
       failed: 0,
       swallowed: 0,
       authRequired: false,
+      accountRevoked: false,
       stopped: false,
       perKind: {
         ping: { sent: 0, failed: 0 },
@@ -327,9 +356,10 @@ export class Outbox {
       const rows = (await this.pending(kind)).slice(0, this.batchSize[kind]);
       if (rows.length === 0) continue;
       const outcome = await this.sendRows(kind, rows, send, result);
-      if (outcome === 'network' || outcome === 'auth') {
+      if (outcome === 'network' || outcome === 'auth' || outcome === 'revoked') {
         result.stopped = true;
         if (outcome === 'auth') result.authRequired = true;
+        if (outcome === 'revoked') result.accountRevoked = true;
         break; // offline / signed out: nothing else will succeed either
       }
       if (outcome === 'retry') {
@@ -345,7 +375,7 @@ export class Outbox {
     rows: OutboxRow[],
     send: OutboxSender,
     result: FlushResult,
-  ): Promise<'ok' | 'retry' | 'network' | 'auth'> {
+  ): Promise<Outcome> {
     if (kind === 'depth_batch') return this.sendDepth(rows, send, result);
     const batch: OutboxBatch = {
       kind,
@@ -378,7 +408,7 @@ export class Outbox {
     res: SendResult,
     send: OutboxSender,
     result: FlushResult,
-  ): Promise<'ok' | 'retry' | 'network' | 'auth'> {
+  ): Promise<Outcome> {
     const status = res.status;
     if (status >= 200 && status < 300) {
       await this.markSent(rows, kind, result);
@@ -386,8 +416,8 @@ export class Outbox {
     }
     // 401: the session expired. Not the row's fault: leave everything pending (no attempt counted) and pause.
     if (status === 401) return 'auth';
-    const retryable = status === 408 || status === 429 || status >= 500;
-    if (retryable) {
+    if (isAccountRevoked(status, res.code)) return 'revoked';
+    if (retryableStatus(status)) {
       await this.noteAttempt(rows, `HTTP ${status}`);
       return 'retry';
     }
@@ -406,7 +436,7 @@ export class Outbox {
       return 'ok';
     }
     const only = rows[0] as OutboxRow;
-    if (kind === 'vote' && status === 403 && res.code && SILENT_VOTE_CODES.includes(res.code)) {
+    if (kind === 'vote' && isSilentVoteFailure(status, res.code)) {
       // Expected: not near the ping, own ping, ping gone. Nothing to show or retry.
       await this.store.update(only.id, { status: 'sent', payload: null, bytes: 0, lastError: null });
       result.swallowed++;
@@ -427,7 +457,7 @@ export class Outbox {
    * stable id (chunkId), sent in order. The row is marked sent only after every chunk is accepted; a retry
    * resends the same chunk ids, which the server dedupes.
    */
-  private async sendDepth(rows: OutboxRow[], send: OutboxSender, result: FlushResult): Promise<'ok' | 'retry' | 'network' | 'auth'> {
+  private async sendDepth(rows: OutboxRow[], send: OutboxSender, result: FlushResult): Promise<Outcome> {
     for (const r of rows) {
       assertAnonymousUploadPayload(r.payload);
       const chunks = chunkRows((r.payload as DepthBatchPayload).rows);
@@ -444,13 +474,13 @@ export class Outbox {
         const status = out.result.status;
         if (status >= 200 && status < 300) continue;
         if (i > 0 || chunks.length > 1) {
-          // Partial progress: never mark failed mid-way; chunk ids are stable so a retry is safe.
+          // Partial progress: earlier chunks are ALREADY committed on the server under their ids. Whatever happens
+          // next, this row must become non-mergeable (attempts > 0) BEFORE we return, or enforceCap/coalesce could
+          // re-id it and the replay would double count. Chunk ids are stable, so retrying is safe.
+          if (i > 0 || status !== 401) await this.noteAttempt([r], `HTTP ${status} (chunk ${i + 1}/${chunks.length})`);
           if (status === 401) return 'auth';
-          const retryable = status === 408 || status === 429 || status >= 500;
-          if (retryable) {
-            await this.noteAttempt([r], `HTTP ${status} (chunk ${i + 1}/${chunks.length})`);
-            return 'retry';
-          }
+          if (isAccountRevoked(status, out.result.code)) return 'revoked';
+          if (retryableStatus(status)) return 'retry';
           await this.store.update(r.id, { status: 'failed', attempts: r.attempts + 1, lastError: `HTTP ${status} (chunk ${i + 1}/${chunks.length})` });
           result.failed++;
           result.perKind.depth_batch.failed++;

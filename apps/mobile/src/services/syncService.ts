@@ -1,17 +1,18 @@
 /**
  * Sync worker: flush the outbox and pull inbound rows. Runs on app foreground, on network change and every
  * 15 min while foregrounded (TODO: register an OS background task, see README). Inbound pulls read ping_feed /
- * ping_votes_feed / messages with each table's own cursor column (lib/pullSync.ts) and SURFACE their errors.
+ * messages_feed with keyset pagination (lib/pullSync.ts) and SURFACE their errors.
  */
 import NetInfo from '@react-native-community/netinfo';
 import { AppState } from 'react-native';
 import { Outbox } from '../lib/outbox';
 import { pullAll, type LocalSink, type RemoteReader, type Row } from '../lib/pullSync';
-import { planSync, type CursorKey, type SyncCursors } from '../lib/syncCursor';
-import { voteRowKey } from '../lib/pingModel';
+import { planSync, type CursorKey, type SyncCursors, type TieKeys } from '../lib/syncCursor';
 import { parseTilesIndex, type ParseResult } from '../lib/tilesIndex';
 import { useAppStore } from '../state/store';
+import { SYNC_BACKGROUND_INTERVAL_MIN } from '@clearwater/shared';
 import { CONFIG, isBackendConfigured } from './config';
+import { applyRetention } from './retention';
 import { kvGet, kvSet, runTx } from './db';
 import { SqliteOutboxStore } from './outboxSqlite';
 import { getSupabase, sendOutboxBatch, signTileUrl } from './supabase';
@@ -20,16 +21,32 @@ import { refreshTides, stationRegistry, tideFetchedAt } from './tideService';
 export const outbox = new Outbox(new SqliteOutboxStore());
 
 const CURSOR_KEY = 'sync.cursors';
+const KEYS_KEY = 'sync.keys';
 
-/** PostgREST reader over supabase-js. */
+/** PostgREST reader over supabase-js, with keyset pagination on (cursor column, tie column). */
 const reader: RemoteReader = {
   async select(relation, q) {
-    let query = getSupabase().from(relation).select('*').gte(q.column, q.gte);
+    let query = getSupabase().from(relation).select(READ_COLUMNS[relation] ?? '*');
+    const { column: c, gte } = q;
+    const tie = q.tiebreak;
+    if (tie.after === null) query = query.gte(c, gte);
+    else query = query.or(`${c}.gt.${gte},and(${c}.eq.${gte},${tie.column}.gt.${tie.after})`);
     if (q.eq) query = query.eq(q.eq.column, q.eq.value);
-    const { data, error, status } = await query.order(q.column, { ascending: true }).limit(q.limit);
+    const { data, error, status } = await query.order(c, { ascending: true }).order(tie.column, { ascending: true }).limit(q.limit);
     if (error) return { rows: [], error: `${status} ${error.message}` };
-    return { rows: (data ?? []) as Row[], error: null };
+    return { rows: (data ?? []) as unknown as Row[], error: null };
   },
+};
+
+/**
+ * Explicit column lists (column grants: `select *` on a restricted relation is a 42501). ping_feed and messages_feed are
+ * views that expose everything the app needs; ping_votes (own votes) is limited to what is readable.
+ */
+const READ_COLUMNS: Record<string, string> = {
+  ping_feed:
+    'id,author_id,author_handle,author_reputation,group_id,type,geom,note,created_at,received_at,expires_at,score,tide_ft,anonymous,updated_at,vote_sum,last_confirmed_at,confirm_count,dispute_count',
+  messages_feed: 'id,group_id,author_id,author_handle,body,ping_id,created_at,received_at',
+  ping_votes: 'ping_id,vote,created_at',
 };
 
 /** SQLite sink: upsert by primary key inside one serialized transaction. */
@@ -42,11 +59,6 @@ const sink: LocalSink = {
           await db.runAsync(
             'INSERT INTO pings (id, json, created_at, updated_at) VALUES (?,?,?,?) ON CONFLICT(id) DO UPDATE SET json=excluded.json, updated_at=excluded.updated_at',
             String(r.id), json, String(r.created_at), (r.updated_at as string | undefined) ?? null,
-          );
-        } else if (table === 'ping_votes') {
-          await db.runAsync(
-            'INSERT INTO votes_feed (k, ping_id, json) VALUES (?,?,?) ON CONFLICT(k) DO UPDATE SET json=excluded.json',
-            voteRowKey(r), String(r.ping_id), json,
           );
         } else if (table === 'my_votes') {
           await db.runAsync(
@@ -85,13 +97,17 @@ export async function syncNow(): Promise<SyncReport | null> {
   if (!net.isConnected) return null;
   running = true;
   const errors: string[] = [];
-  const report: SyncReport = { flushed: 0, swallowedVotes: 0, failedRows: 0, pulled: { pings: 0, ping_votes: 0, messages: 0, my_votes: 0 }, errors, authRequired: false };
+  const report: SyncReport = { flushed: 0, swallowedVotes: 0, failedRows: 0, pulled: { pings: 0, messages: 0, my_votes: 0 }, errors, authRequired: false };
   try {
     await outbox.enforceCap();
     const flush = await outbox.flush(sendOutboxBatch);
     report.flushed = flush.sent;
     report.swallowedVotes = flush.swallowed;
     report.failedRows = flush.failed;
+    if (flush.accountRevoked) {
+      useAppStore.getState().setAccountRevoked(true);
+      errors.push('account blocked by the server');
+    }
     if (flush.authRequired) {
       // Try a silent token refresh once; if that fails the user must sign in again.
       const { error } = await getSupabase().auth.refreshSession();
@@ -110,8 +126,10 @@ export async function syncNow(): Promise<SyncReport | null> {
     useAppStore.getState().bumpData();
 
     const cursors = (await kvGet<SyncCursors>(CURSOR_KEY)) ?? {};
-    const pull = await pullAll(reader, sink, cursors, { nowMs: Date.now(), userId: useAppStore.getState().userId });
+    const keys = (await kvGet<TieKeys>(KEYS_KEY)) ?? {};
+    const pull = await pullAll(reader, sink, cursors, { nowMs: Date.now(), userId: useAppStore.getState().userId, keys });
     await kvSet(CURSOR_KEY, pull.cursors);
+    await kvSet(KEYS_KEY, pull.keys);
     report.pulled = pull.pulled;
     errors.push(...pull.errors);
     if (pull.errors.some((e) => /\b401\b|JWT/i.test(e))) {
@@ -128,6 +146,7 @@ export async function syncNow(): Promise<SyncReport | null> {
     }
 
     await pullTilesIndex().then((r) => { if (r.ok) errors.push(...r.issues); else errors.push(...r.errors); }).catch((e: unknown) => errors.push(`tiles index: ${e instanceof Error ? e.message : String(e)}`));
+    await applyRetention(outbox).catch((e: unknown) => errors.push(`retention: ${e instanceof Error ? e.message : String(e)}`));
     lastReport = report;
     return report;
   } finally {
@@ -146,24 +165,29 @@ export async function pullTilesIndex(): Promise<ParseResult> {
   return parsed;
 }
 
+/** Fire-and-forget sync that can never produce an unhandled rejection. */
+export function runSync(): void {
+  syncNow().catch((e: unknown) => console.warn(`[sync] ${e instanceof Error ? e.message : String(e)}`));
+}
+
 /** Wire foreground + connectivity + auth triggers. Returns an unsubscribe function. */
 export function startSyncTriggers(): () => void {
   const app = AppState.addEventListener('change', (s) => {
-    if (s === 'active') void syncNow();
+    if (s === 'active') runSync();
   });
   const net = NetInfo.addEventListener((state) => {
-    if (state.isConnected) void syncNow();
+    if (state.isConnected) runSync();
   });
   const { data: authSub } = getSupabase().auth.onAuthStateChange((event, session) => {
     if (session && (event === 'SIGNED_IN' || event === 'TOKEN_REFRESHED')) {
       useAppStore.getState().setAuthRequired(false);
       useAppStore.getState().setUserId(session.user.id);
-      void syncNow();
+      runSync();
     }
     if (event === 'SIGNED_OUT') useAppStore.getState().setUserId(null);
   });
-  const interval = setInterval(() => void syncNow(), 15 * 60 * 1000); // foreground cadence; background task is a TODO
-  void syncNow();
+  const interval = setInterval(runSync, SYNC_BACKGROUND_INTERVAL_MIN * 60 * 1000); // foreground cadence; background task is a TODO
+  runSync();
   return () => {
     app.remove();
     net();

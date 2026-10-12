@@ -4,8 +4,10 @@ import {
   aggregateSoundings,
   assertAnonymousUploadPayload,
   buildUploadPayload,
+  isRealCalendarDay,
   mergeUploadRows,
   percentile,
+  reaggregateTouched,
   sanitizeUploadRows,
   utcDay,
 } from '../src/lib/aggregate';
@@ -124,17 +126,85 @@ describe('payload anonymity', () => {
   });
 });
 
-describe('mergeUploadRows', () => {
+describe('mergeUploadRows: later complete-day aggregates supersede earlier ones', () => {
   const base: DepthUploadRow = { h3_cell: CELL, day: '2026-10-09', median_ft: 10, p10_ft: 8, n: 3 };
-  it('merges same cell+day: n summed, weighted median, weighted p10', () => {
-    const [m] = mergeUploadRows([base, { ...base, median_ft: 14, p10_ft: 12, n: 1 }]);
-    expect(m).toEqual({ h3_cell: CELL, day: '2026-10-09', median_ft: 10, p10_ft: 9, n: 4 });
+  it('same cell+day: the LATER row replaces the earlier one (never summed)', () => {
+    const later = { ...base, median_ft: 14, p10_ft: 12, n: 7 };
+    expect(mergeUploadRows([base, later])).toEqual([later]);
+    expect(mergeUploadRows([later, base])).toEqual([base]); // order is send order, oldest first
   });
-  it('leaves distinct cells/days alone', () => {
-    const out = mergeUploadRows([base, { ...base, day: '2026-10-10' }]);
-    expect(out).toHaveLength(2);
+  it('leaves distinct cells/days alone, sorted by day then cell', () => {
+    const out = mergeUploadRows([{ ...base, day: '2026-10-10' }, base]);
+    expect(out.map((r) => r.day)).toEqual(['2026-10-09', '2026-10-10']);
+  });
+  it('clamps p10 to at most the median', () => {
+    expect(mergeUploadRows([{ ...base, median_ft: 5, p10_ft: 9 }])[0]!.p10_ft).toBe(5);
   });
   it('idempotent on already-unique rows', () => {
     expect(mergeUploadRows([base])).toEqual([base]);
+  });
+});
+
+describe('B1: reaggregateTouched uploads the COMPLETE day for touched cells', () => {
+  const morning = Date.parse('2026-10-09T10:00:00Z');
+  const afternoon = Date.parse('2026-10-09T14:00:00Z');
+  const other = 48.4;
+  it('a cell logged at 10:00 and again at 14:00 ends with the combined n / median', () => {
+    const am = [s(10, { tMs: morning }), s(12, { tMs: morning + 1000 })];
+    const pm = [s(20, { tMs: afternoon }), s(22, { tMs: afternoon + 1000 })];
+    const untouched = [s(30, { tMs: morning, lat: other })];
+    // first batch: only the morning soundings are fresh
+    const first = reaggregateTouched(am.concat(untouched), am.concat(untouched));
+    expect(first.find((r) => r.h3_cell === CELL)).toMatchObject({ n: 2, median_ft: 11 });
+    // second batch: only the afternoon ones are fresh, but the day's rows for that cell are ALL re-aggregated
+    const second = reaggregateTouched(pm, am.concat(pm).concat(untouched));
+    expect(second).toHaveLength(1); // the untouched cell is not re-sent
+    expect(second[0]).toMatchObject({ h3_cell: CELL, day: '2026-10-09', n: 4, median_ft: 16 });
+  });
+  it('days are independent: yesterday\'s rows are not pulled into today\'s batch', () => {
+    const y = s(50, { tMs: morning - 86_400_000 });
+    const out = reaggregateTouched([s(10, { tMs: morning })], [y, s(10, { tMs: morning })]);
+    expect(out.map((r) => [r.day, r.n])).toEqual([['2026-10-09', 1]]);
+  });
+  it('replaying the same fresh set is a no-op in content (idempotent)', () => {
+    const rows = [s(10, { tMs: morning }), s(12, { tMs: afternoon })];
+    expect(reaggregateTouched(rows, rows)).toEqual(reaggregateTouched(rows, rows));
+  });
+});
+
+describe('E: input guards', () => {
+  const T = Date.parse('2026-10-09T10:00:00Z');
+  it('bogus coordinates are rejected BEFORE H3 (they would otherwise map to valid cells)', () => {
+    expect(aggregateSoundings([s(10, { lat: 91 }), s(10, { lat: -91 }), s(10, { lon: 181 }), s(10, { lon: -181 }), s(10, { lat: Number.NaN })])).toEqual([]);
+    expect(aggregateSoundings([s(10, { lat: 90, lon: 180 })])).toHaveLength(1);
+  });
+  it('bogus times (non-finite, before 2020, far future, beyond Date range) are rejected without throwing', () => {
+    expect(aggregateSoundings([s(10, { tMs: Number.NaN }), s(10, { tMs: 8.64e15 + 1 }), s(10, { tMs: 0 }), s(10, { tMs: Date.UTC(2200, 0, 1) }), s(10, { tMs: Infinity })])).toEqual([]);
+    expect(aggregateSoundings([s(10, { tMs: T })])).toHaveLength(1);
+  });
+  it('absurd depths are rejected', () => {
+    expect(aggregateSoundings([s(5000), s(-5000)])).toEqual([]);
+  });
+  it('upload rows: only H3 resolution 12, |values| <= 2000 ft, real calendar days', () => {
+    const good: DepthUploadRow = { h3_cell: CELL, day: '2026-10-09', median_ft: 11, p10_ft: 10, n: 3 };
+    const res10 = latLngToCell(LAT, LON, 10);
+    const res13 = latLngToCell(LAT, LON, 13);
+    const r = sanitizeUploadRows([
+      good,
+      { ...good, h3_cell: res10 },
+      { ...good, h3_cell: res13 },
+      { ...good, median_ft: 2000.5 },
+      { ...good, p10_ft: -2001 },
+      { ...good, day: '2026-02-31' },
+      { ...good, day: '2026-13-01' },
+      { ...good, day: '2026-00-10' },
+    ]);
+    expect(r.rows).toEqual([good]);
+    expect(r.dropped).toBe(7);
+    expect(isRealCalendarDay('2024-02-29')).toBe(true);
+    expect(isRealCalendarDay('2026-02-29')).toBe(false);
+  });
+  it('the guard throws for out-of-bounds rows too', () => {
+    expect(() => assertAnonymousUploadPayload({ rows: [{ h3_cell: CELL, day: '2026-10-09', median_ft: 99999, p10_ft: 1, n: 1 }] })).toThrow(/invalid/);
   });
 });

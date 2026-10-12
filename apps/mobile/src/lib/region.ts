@@ -62,15 +62,25 @@ export function polygonContains(rings: ReadonlyArray<Ring>, lon: number, lat: nu
   return true;
 }
 
+let warnedMalformed = false;
+
+/** Render-safe: a malformed geometry (bad rings, non-numeric coordinates, ...) counts as "not inside" and is logged once. */
 export function geometryContains(g: BoundaryFeature['geometry'], p: LatLon): boolean {
   if (!g) return false;
-  if (g.type === 'Polygon') return polygonContains((g as PolygonGeometry).coordinates, p.lon, p.lat);
-  if (g.type === 'MultiPolygon') return (g as MultiPolygonGeometry).coordinates.some((poly) => polygonContains(poly, p.lon, p.lat));
+  try {
+    if (g.type === 'Polygon') return polygonContains((g as PolygonGeometry).coordinates, p.lon, p.lat);
+    if (g.type === 'MultiPolygon') return (g as MultiPolygonGeometry).coordinates.some((poly) => polygonContains(poly, p.lon, p.lat));
+  } catch (e) {
+    if (!warnedMalformed) {
+      warnedMalformed = true;
+      console.warn(`[region] malformed boundary geometry skipped: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
   return false;
 }
 
 export function featuresOf(input: BoundaryCollection | BoundaryFeature | AreaGeometry): BoundaryFeature[] {
-  if (input.type === 'FeatureCollection') return [...input.features];
+  if (input.type === 'FeatureCollection') return Array.isArray(input.features) ? [...input.features] : [];
   if (input.type === 'Feature') return [input];
   return [{ type: 'Feature', geometry: input, properties: {} }];
 }
@@ -138,4 +148,21 @@ export function distanceToBoundaryM(p: LatLon, g: AreaGeometry): number {
     }
   }
   return best;
+}
+
+/**
+ * regionReadout for the live map: NEVER throws. Malformed regions.geojson (wrong shapes, nulls) yields null (the caller
+ * shows nothing) and is logged once, so a bad data file cannot crash MapScreen.
+ */
+export function safeRegionReadout(p: LatLon, input: BoundaryCollection | BoundaryFeature | AreaGeometry | null | undefined): RegionReadout | null {
+  if (!input || typeof input !== 'object') return null;
+  try {
+    return regionReadout(p, input);
+  } catch (e) {
+    if (!warnedMalformed) {
+      warnedMalformed = true;
+      console.warn(`[region] readout failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    return null;
+  }
 }

@@ -2,6 +2,7 @@
  * tiles/index.json: parse/validate (lenient to unknown fields), size estimates, version diffs.
  * Shape per docs/AGENT-PLAN.md; JSON Schema lives in pipeline/schemas/tiles_index.schema.json.
  */
+import { isSafeAoiSlug, isSafeSegment, isSafeTilePath } from './downloadVerify';
 import { DEPTH_META_FILENAME, TILE_LAYERS, type TileLayer, type TilesIndex, type TilesIndexAoi, type TilesIndexFile } from '@clearwater/shared';
 
 /** Layers needed for the map to be usable offline; waterline and fleet are optional extras. */
@@ -21,7 +22,7 @@ const isDateStr = (x: unknown): x is string => typeof x === 'string' && !Number.
  */
 function parseFile(x: unknown): TilesIndexFile | null {
   if (!isObj(x)) return null;
-  if (typeof x.path !== 'string' || x.path.length === 0) return null;
+  if (!isSafeTilePath(x.path)) return null; // hostile or malformed index: never let it near the filesystem
   if (typeof x.bytes !== 'number' || !Number.isFinite(x.bytes) || x.bytes <= 0) return null;
   return { path: x.path, bytes: x.bytes };
 }
@@ -44,12 +45,12 @@ export function parseTilesIndex(json: unknown): ParseResult {
       issues.push(`aois[${i}] is not an object; skipped`);
       return;
     }
-    if (typeof raw.aoi !== 'string' || raw.aoi.length === 0) {
-      issues.push(`aois[${i}].aoi missing; skipped`);
+    if (!isSafeAoiSlug(raw.aoi)) {
+      issues.push(`aois[${i}].aoi missing or unsafe; skipped`);
       return;
     }
-    if (typeof raw.version !== 'string' || raw.version.length === 0) {
-      issues.push(`aois[${i}] (${raw.aoi}) version missing; skipped`);
+    if (!isSafeSegment(raw.version)) {
+      issues.push(`aois[${i}] (${raw.aoi}) version missing or unsafe; skipped`);
       return;
     }
     if (!isObj(raw.files)) {
@@ -127,6 +128,8 @@ export function formatBytes(bytes: number): string {
 
 export interface InstalledAoi {
   version: string;
+  /** Optional companion files present on disk (depth_meta.pmtiles, land.pmtiles). */
+  companions?: readonly string[];
   /** Layers present on disk at that version. Default: all that the version had. */
   layers?: readonly TileLayer[];
   downloadedAt?: string;
@@ -193,4 +196,14 @@ export function depthMetaPath(entry: TilesIndexAoi): string | null {
   if (!d) return null;
   const slash = d.lastIndexOf('/');
   return `${slash >= 0 ? d.slice(0, slash + 1) : ''}${DEPTH_META_FILENAME}`;
+}
+
+/** Land (OSM, ODbL) ships as its own PMTiles by path convention, tiles/<aoi>/<version>/land.pmtiles (not in index.json). */
+export const LAND_FILENAME = 'land.pmtiles';
+
+export function landPath(entry: TilesIndexAoi): string | null {
+  const base = entry.files.base?.path ?? entry.files.depth?.path;
+  if (!base) return null;
+  const slash = base.lastIndexOf('/');
+  return `${slash >= 0 ? base.slice(0, slash + 1) : ''}${LAND_FILENAME}`;
 }

@@ -4,7 +4,7 @@
  *
  * Pure TS: no native imports. Bad checksum => null + counter (spoofing/corruption defence).
  */
-import { FEET_PER_FATHOM, FEET_PER_METER, KMH_PER_KNOT } from '@clearwater/shared';
+import { FEET_PER_FATHOM, FEET_PER_METER, GPS_STALE_MS, KMH_PER_KNOT } from '@clearwater/shared';
 
 export type NmeaType = 'DPT' | 'DBT' | 'GGA' | 'RMC' | 'VHW';
 
@@ -156,7 +156,10 @@ export function parseNmeaLine(
   const requireChecksum = opts.requireChecksum ?? true;
   if (stats) stats.lines++;
   const line = rawLine.trim();
-  const start = line.indexOf('$');
+  // Resync: when a truncated sentence is glued to a good one ("$SDDPT,12.3,0.5,1$SDDPT,12.3,0.5,100*7F") the sentence
+  // that owns the checksum is the LAST '$' before the '*'.
+  const lastStar = line.lastIndexOf('*');
+  const start = line.lastIndexOf('$', lastStar >= 0 ? lastStar : undefined);
   if (start < 0) {
     if (stats && line.length > 0) stats.malformed++;
     return null;
@@ -363,7 +366,7 @@ interface Stamped<T> {
 }
 
 export interface TrackerOptions {
-  /** Max age of a non-depth field before it is considered stale (null in the snapshot). Default 5000. */
+  /** Max age of a non-depth field before it is considered stale (null in the snapshot). Default GPS_STALE_MS (5 s). */
   maxFieldAgeMs?: number;
   /** Emit at most one snapshot per this many ms (DPT+DBT duplicates, >1 Hz sounders). Default 900. */
   minIntervalMs?: number;
@@ -381,7 +384,7 @@ export class NmeaFixTracker {
   private readonly minInterval: number;
 
   constructor(opts: TrackerOptions = {}) {
-    this.maxAge = opts.maxFieldAgeMs ?? 5000;
+    this.maxAge = opts.maxFieldAgeMs ?? GPS_STALE_MS;
     this.minInterval = opts.minIntervalMs ?? 900;
   }
 
@@ -407,7 +410,7 @@ export class NmeaFixTracker {
         return null;
       case 'DPT':
       case 'DBT': {
-        if (s.depthFt === null) return null;
+        if (s.depthFt === null || !Number.isFinite(s.depthFt)) return null; // never hand NaN/Infinity to the UI
         if (nowMs - this.lastEmit < this.minInterval) return null;
         this.lastEmit = nowMs;
         const pos = this.fresh(this.pos, nowMs);

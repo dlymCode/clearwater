@@ -254,3 +254,42 @@ describe('NmeaFixTracker', () => {
     expect(snap.lat).toBeNull();
   });
 });
+
+describe('B3: resync on glued / truncated sentences', () => {
+  const good = buildNmea('SDDPT,12.3,0.5,100');
+  it('a truncated sentence glued in front of a good one parses the good one', () => {
+    expect(parseNmeaLine(`$SDDPT,12.3,0.5,1${good}`)?.type).toBe('DPT');
+  });
+  it('a doubled "$" parses', () => {
+    expect(parseNmeaLine(`$${good}`)?.type).toBe('DPT');
+  });
+  it('a truncated sentence WITHOUT its own "$" in front of a good one still resyncs', () => {
+    expect(parseNmeaLine(`SDDPT,12.3*7F${good}`)?.type).toBe('DPT');
+  });
+  it('a good sentence followed by garbage without "*" keeps its own checksum scope', () => {
+    expect(parseNmeaLine(good)?.type).toBe('DPT');
+  });
+  it('two full sentences on one line: the last one wins, nothing throws', () => {
+    expect(parseNmeaLine(good + good)?.type).toBe('DPT');
+  });
+  it('a stale partial line cannot eat the first sentence after a reconnect (fresh stream per connection)', () => {
+    const old = new NmeaStream();
+    old.feed('$SDDPT,12.3,0.5,'); // connection dropped mid-sentence
+    expect(old.feed(`${good}\r\n`)).toHaveLength(1); // resync saves even the stale stream...
+    const fresh = new NmeaStream(); // ...and the client uses a fresh one anyway
+    expect(fresh.feed(`${good}\r\n`)).toHaveLength(1);
+  });
+});
+
+describe('E: tracker never emits non-finite depth', () => {
+  it('Infinity / NaN depth is treated as no sounder', () => {
+    const t = new NmeaFixTracker({ minIntervalMs: 0 });
+    expect(t.update({ type: 'DPT', talker: 'SD', depthM: Infinity, depthFt: Infinity, offsetM: 0, maxRangeM: null }, 1000)).toBeNull();
+    expect(t.update({ type: 'DBT', talker: 'SD', depthM: Number.NaN, depthFt: Number.NaN }, 2000)).toBeNull();
+    expect(t.update({ type: 'DBT', talker: 'SD', depthM: 3, depthFt: 10 }, 3000)?.rawDepthFt).toBe(10);
+  });
+  it('the parser itself never produces Infinity from a literal "1e999" or hex garbage', () => {
+    const s = parseNmeaLine(buildNmea('SDDPT,1e999,0'));
+    expect(s === null || (s.type === 'DPT' && (s.depthFt === null || Number.isFinite(s.depthFt)))).toBe(true);
+  });
+});

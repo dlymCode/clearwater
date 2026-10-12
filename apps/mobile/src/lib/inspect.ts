@@ -6,6 +6,7 @@
  */
 import {
   META_DATE_EPOCH_SHIFT_DAYS,
+  MS_PER_DAY,
   SOURCE_LABELS_BY_CODE,
   UNC_LEVELS_FT,
   UNC_OPEN_ENDED_INDEX,
@@ -13,7 +14,7 @@ import {
 } from '@clearwater/shared';
 import { decodeTerrainRgb } from './terrainRgb';
 
-const DAY_MS = 86_400_000;
+const DAY_MS = MS_PER_DAY;
 
 export interface RgbaPixel {
   r: number;

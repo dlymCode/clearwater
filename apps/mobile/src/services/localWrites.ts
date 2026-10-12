@@ -26,13 +26,6 @@ export async function loadLocalPings(): Promise<unknown[]> {
   return rows.map((r) => JSON.parse(r.json) as unknown);
 }
 
-/** Feed votes (no voter ids). */
-export async function loadLocalVotes(): Promise<Array<Record<string, unknown>>> {
-  const db = await getDb();
-  const rows = await db.getAllAsync<{ json: string }>('SELECT json FROM votes_feed');
-  return rows.map((r) => JSON.parse(r.json) as Record<string, unknown>);
-}
-
 /** ping ids the signed-in user already voted on (queued or synced). */
 export async function loadMyVotedPingIds(): Promise<Set<string>> {
   const db = await getDb();

@@ -39,6 +39,12 @@ function statusOf(error: PgError | null, httpStatus?: number): number {
   return 500;
 }
 
+/** status + the SQL error identifier (error.message) so the outbox can tell silent vote failures from real ones. */
+function result(error: PgError | null, httpStatus?: number): SendResult {
+  const status = statusOf(error, httpStatus);
+  return status >= 300 && error?.message ? { status, code: error.message } : { status };
+}
+
 const ewkt = (lat: number, lon: number): string => `SRID=4326;POINT(${lon} ${lat})`;
 
 /**
@@ -58,21 +64,22 @@ export const sendOutboxBatch: OutboxSender = async (batch: OutboxBatch): Promise
       // Minimal response on purpose: NEVER chain .select() / RETURNING * here. pings.author_id is column-revoked for
       // clients, so a RETURNING * would fail with 42501. supabase-js sends `Prefer: return=minimal` when no select().
       const { error, status } = await sb.from('pings').upsert(rows, { onConflict: 'id', ignoreDuplicates: true });
-      return { status: statusOf(error, status) };
+      return result(error, status);
     }
     case 'message': {
       const rows = batch.items.map((i) => i.payload as Record<string, unknown>);
       const { error, status } = await sb.from('messages').upsert(rows, { onConflict: 'id', ignoreDuplicates: true });
-      return { status: statusOf(error, status) };
+      return result(error, status);
     }
     case 'vote': {
       // cast_vote is one-vote-per-call; stop at the first non-2xx so order is preserved.
       for (const i of batch.items) {
         const v = i.payload as { ping_id: string; vote: 1 | -1 };
         const { error, status } = await sb.rpc('cast_vote', { p_ping_id: v.ping_id, p_vote: v.vote });
-        const s = statusOf(error, status);
-        // error.message carries the SQL identifier ('confirm_ineligible', 'cannot_vote_own_ping', ...)
-        if (s >= 300) return { status: s, ...(error?.message ? { code: error.message } : {}) };
+        const r = result(error, status);
+        // error.message carries the SQL identifier: 'confirm_ineligible' / 'cannot_vote_own_ping' (PT403),
+        // 'ping_not_found' (PT404), 'account_revoked' (PT403).
+        if (r.status >= 300) return r;
       }
       return { status: 200 };
     }
@@ -89,14 +96,21 @@ export const sendOutboxBatch: OutboxSender = async (batch: OutboxBatch): Promise
   }
 };
 
+/** tile-auth refused or failed. `status` lets callers treat 400/404 as "that product does not exist (yet)". */
+export class TileAuthError extends Error {
+  constructor(readonly status: number, message: string) {
+    super(message);
+  }
+}
+
 /** Exchanges the Supabase JWT for a signed R2 URL via the tile-auth worker (TILE_AUTH_URL). */
 export async function signTileUrl(path: string): Promise<string> {
   const { data } = await getSupabase().auth.getSession();
   const token = data.session?.access_token;
-  if (!token) throw new Error('Sign in to download tiles.');
+  if (!token) throw new TileAuthError(401, 'Sign in to download tiles.');
   const res = await fetch(`${CONFIG.tileAuthUrl}?path=${encodeURIComponent(path)}`, { headers: { Authorization: `Bearer ${token}` } });
-  if (!res.ok) throw new Error(`tile-auth ${res.status}`);
+  if (!res.ok) throw new TileAuthError(res.status, `tile-auth ${res.status} for ${path}`);
   const json = (await res.json()) as { url?: string };
-  if (!json.url) throw new Error('tile-auth returned no url');
+  if (!json.url) throw new TileAuthError(502, 'tile-auth returned no url');
   return json.url;
 }

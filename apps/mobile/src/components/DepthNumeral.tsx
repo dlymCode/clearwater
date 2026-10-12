@@ -1,11 +1,12 @@
 import { Text, View } from 'react-native';
+import { GPS_STALE_MS } from '@clearwater/shared';
 import type { DepthReading } from '../state/store';
 import { s, useColors } from './theme';
 
 /** MAP-6: large depth-under-keel numeral; "no sounder" when the feed is absent or stale (> 5 s). */
 export function DepthNumeral({ depth, nowMs, offsetsMissing }: { depth: DepthReading | null; nowMs: number; offsetsMissing: boolean }) {
   const c = useColors();
-  const live = depth !== null && nowMs - depth.tMs <= 5000;
+  const live = depth !== null && nowMs - depth.tMs <= GPS_STALE_MS;
   const value = live ? (depth.underKeelFt ?? depth.rawFt) : null;
   return (
     <View style={[s.card, { backgroundColor: c.card, borderColor: c.border, alignItems: 'center' }]}>

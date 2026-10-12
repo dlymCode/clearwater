@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { ScrollView, Text, View } from 'react-native';
-import { TIDE_CURVE_WINDOW_HOURS } from '@clearwater/shared';
+import { MS_PER_HOUR, TIDE_CURVE_WINDOW_HOURS } from '@clearwater/shared';
 import { Banner } from '../components/Banner';
 import { s, useColors } from '../components/theme';
 import { REFERENCE_TIDE_STATIONS } from '../lib/stations';
@@ -37,7 +37,7 @@ export function TideScreen() {
     void tideFetchedAt(stationId).then(setFetchedAt);
   }, [stationId]);
 
-  const half = (TIDE_CURVE_WINDOW_HOURS / 2) * 3_600_000;
+  const half = (TIDE_CURVE_WINDOW_HOURS / 2) * MS_PER_HOUR;
   const curve = useMemo(() => (series ? tideCurve(series, now - half, now + half, 30) : []), [series, now, half]);
   const heights = curve.map((p) => p.v).filter((v): v is number => v !== null);
   const min = Math.min(0, ...heights);

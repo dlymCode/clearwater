@@ -36,9 +36,6 @@ CREATE TABLE IF NOT EXISTS soundings (
 );
 CREATE INDEX IF NOT EXISTS soundings_pending ON soundings (aggregated, t_ms);
 CREATE TABLE IF NOT EXISTS pings (id TEXT PRIMARY KEY, json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT);
--- ping_votes_feed hides voter_id, so feed rows are keyed by a content key (lib/pingModel voteRowKey).
-CREATE TABLE IF NOT EXISTS votes_feed (k TEXT PRIMARY KEY, ping_id TEXT NOT NULL, json TEXT NOT NULL);
-CREATE INDEX IF NOT EXISTS votes_feed_ping ON votes_feed (ping_id);
 -- The signed-in user's own votes (queued locally, reconciled from ping_votes where voter_id = me).
 CREATE TABLE IF NOT EXISTS my_votes (ping_id TEXT PRIMARY KEY, vote INTEGER NOT NULL, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS messages (id TEXT PRIMARY KEY, group_id TEXT NOT NULL, json TEXT NOT NULL, created_at TEXT NOT NULL);

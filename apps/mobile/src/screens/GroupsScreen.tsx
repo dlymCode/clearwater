@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useState } from 'react';
 import { ScrollView, Text, TextInput, View } from 'react-native';
-import type { Group } from '@clearwater/shared';
+import { INVITE_CODE_LENGTH, type Group } from '@clearwater/shared';
 import { Button } from '../components/Button';
 import { s, useColors } from '../components/theme';
-import { inviteStatusText, isValidInviteCode } from '../lib/groups';
-import { createGroup, joinGroup, leaveGroup, listMyGroups, rotateInviteCode } from '../services/groups';
+import { checkInviteCode, inviteStatusText } from '../lib/groups';
+import { canWrite } from '../lib/profile';
+import { createGroup, getInviteCode, joinGroup, leaveGroup, listMyGroups, rotateInviteCode } from '../services/groups';
+import { useAppStore } from '../state/store';
 import { getSupabase } from '../services/supabase';
 
 // TODO(item 19, not implemented): remove-member UI for owners (services/groups.removeMember exists) and group-tier ping
@@ -17,11 +19,26 @@ export function GroupsScreen({ onOpen }: { onOpen: (g: Group) => void }) {
   const [name, setName] = useState('');
   const [code, setCode] = useState('');
   const [msg, setMsg] = useState<string | null>(null);
+  // Owners read the invite code through get_invite_code (it is not a selectable column); rotation returns the new one.
+  const [codes, setCodes] = useState<Record<string, { code: string; expiresAt: string | null }>>({});
+  const profileReady = useAppStore((st) => st.profileReady);
+  const accountRevoked = useAppStore((st) => st.accountRevoked);
+  const gate = canWrite({ profileReady, accountRevoked });
 
   const refresh = useCallback(async () => {
     try {
-      setGroups(await listMyGroups());
-      setMe((await getSupabase().auth.getUser()).data.user?.id ?? null);
+      const list = await listMyGroups();
+      setGroups(list);
+      const uid = (await getSupabase().auth.getSession()).data.session?.user.id ?? null;
+      setMe(uid);
+      const next: Record<string, { code: string; expiresAt: string | null }> = {};
+      for (const g of list) {
+        if (g.owner_id === uid) {
+          const c = await getInviteCode(g.id).catch(() => null);
+          if (c) next[g.id] = c;
+        }
+      }
+      setCodes(next);
     } catch (e) {
       setMsg(e instanceof Error ? e.message : 'Offline: groups need a connection.');
     }
@@ -37,20 +54,22 @@ export function GroupsScreen({ onOpen }: { onOpen: (g: Group) => void }) {
       {groups.map((g) => (
         <View key={g.id} style={[s.card, s.gap, { backgroundColor: c.card, borderColor: c.border }]}>
           <Text style={[s.h2, { color: c.text }]}>{g.name}</Text>
-          {g.owner_id === me && g.invite_code ? (
-            <Text style={[s.body, { color: c.text }]}>{`Invite code ${g.invite_code}. ${inviteStatusText(g.invite_expires_at, Date.now())}`}</Text>
+          {g.owner_id === me && codes[g.id] ? (
+            <Text style={[s.body, { color: c.text }]}>{`Invite code ${codes[g.id]!.code}. ${inviteStatusText(codes[g.id]!.expiresAt, Date.now())}`}</Text>
           ) : null}
           <Button label="Open channel" onPress={() => onOpen(g)} />
-          {g.owner_id === me ? <Button label="New invite code" kind="secondary" onPress={run(() => rotateInviteCode(g.id))} /> : null}
+          {g.owner_id === me ? <Button label="New invite code" kind="secondary" onPress={run(async () => { const n = await rotateInviteCode(g.id); setCodes((p) => ({ ...p, [g.id]: n })); })} /> : null}
           {me ? <Button label="Leave group" kind="danger" onPress={run(() => leaveGroup(g.id, me))} /> : null}
         </View>
       ))}
       <Text style={[s.h2, { color: c.text }]}>Create a group</Text>
       <TextInput value={name} onChangeText={setName} placeholder="Group name" placeholderTextColor={c.sub} style={[s.input, { color: c.text, borderColor: c.border }]} />
-      <Button label="Create" disabled={name.trim().length === 0} onPress={run(async () => { await createGroup(name); setName(''); })} />
+      {!gate.ok ? <Text style={{ color: c.warn }}>{gate.reason}</Text> : null}
+      <Button label="Create" disabled={!gate.ok || name.trim().length === 0} onPress={run(async () => { await createGroup(name); setName(''); })} />
       <Text style={[s.h2, { color: c.text }]}>Join with a code</Text>
-      <TextInput value={code} onChangeText={setCode} autoCapitalize="characters" autoCorrect={false} placeholder="8-character code" placeholderTextColor={c.sub} style={[s.input, { color: c.text, borderColor: c.border }]} />
-      <Button label="Join" disabled={!isValidInviteCode(code)} onPress={run(async () => { await joinGroup(code); setCode(''); })} />
+      <TextInput value={code} onChangeText={setCode} autoCapitalize="characters" autoCorrect={false} placeholder={`${INVITE_CODE_LENGTH}-character code`} placeholderTextColor={c.sub} style={[s.input, { color: c.text, borderColor: c.border }]} />
+      {code.length > 0 && !checkInviteCode(code).ok ? <Text style={{ color: c.warn }}>{(checkInviteCode(code) as { error: string }).error}</Text> : null}
+      <Button label="Join" disabled={!gate.ok || !checkInviteCode(code).ok} onPress={run(async () => { await joinGroup(code); setCode(''); })} />
     </ScrollView>
   );
 }

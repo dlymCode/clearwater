@@ -12,12 +12,16 @@ export interface Profile {
   created_at: string;
 }
 
+/**
+ * Row of `groups` as clients can read it. The invite code is NOT a selectable column; owners read it through the
+ * get_invite_code(p_group) RPC and rotate_invite_code returns the new one.
+ */
 export interface Group {
   id: string;
   name: string;
   owner_id: string;
-  invite_code: string | null;
   invite_expires_at: string | null;
+  created_at?: string;
 }
 
 export type GroupRole = 'owner' | 'member';
@@ -47,27 +51,20 @@ export interface Ping {
   score: number | null;
   /** Tide height (ft MLLW) at post time, when known. */
   tide_ft: number | null;
-  /** Author reputation at read time (R_a). Server includes it on pull. */
+  /** Author reputation at read time (R_a), from ping_feed. */
   author_reputation?: number;
+  /** ping_feed: server-computed sum of R_i * v_i * w_i over all votes, quantized to 0.25. */
+  vote_sum?: number;
+  /** ping_feed: time of the latest confirm (null when none). */
+  last_confirmed_at?: string | null;
+  confirm_count?: number;
+  dispute_count?: number;
   /** Handle shown to viewers; null/absent for anonymous public pings. */
   author_handle?: string | null;
   updated_at?: string;
 }
 
 export type VoteValue = 1 | -1;
-
-/**
- * Row of the `ping_votes_feed` view: (ping_id, vote, created_at, voter_reputation, weight). voter_id and the voter's
- * distance are deliberately NOT exposed (trilateration risk); `weight` is the server-precomputed w(d) in {1.0, 0.5, 0}.
- */
-export interface PingVote {
-  ping_id: string;
-  vote: VoteValue;
-  created_at: string;
-  voter_reputation?: number;
-  /** Server-precomputed distance weight w(d); the client never recomputes it from a distance. */
-  weight?: number;
-}
 
 /** The signed-in user's own vote (read from ping_votes where voter_id = auth.uid(), or queued locally). */
 export interface MyVote {

@@ -72,6 +72,10 @@ export class NmeaClient {
     const ep = this.endpoint;
     if (!ep || !this.running) return;
     this.handlers.onStatus?.('connecting');
+    // Fresh line buffer per (re)connect: a half line left over from the dropped connection must not be glued onto the
+    // first sentence of the new one (it would eat that sentence).
+    this.stream = new NmeaStream();
+    this.pending = [];
     if (ep.protocol === 'tcp') {
       const socket = TcpSocket.createConnection({ host: ep.host, port: ep.port }, () => this.handlers.onStatus?.('connected'));
       this.tcp = socket;

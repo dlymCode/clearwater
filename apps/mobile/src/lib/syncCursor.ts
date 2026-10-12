@@ -11,43 +11,21 @@
 import {
   AOI_STALE_RED_DAYS,
   AOI_STALE_YELLOW_DAYS,
+  MS_PER_DAY,
+  MS_PER_HOUR,
   SYNC_SOURCES,
   SYNC_TABLES,
   TIDE_STALE_HOURS,
   type SyncTable,
 } from '@clearwater/shared';
 
-/** Cursor keys: the three feed tables plus the user's own votes (ping_votes where voter_id = me). */
+/** Cursor keys: the feed sources plus the user's own votes (ping_votes where voter_id = me). */
 export type CursorKey = SyncTable | 'my_votes';
 export type SyncCursors = Partial<Record<CursorKey, string>>;
-
-const DAY_MS = 86_400_000;
-const HOUR_MS = 3_600_000;
+/** Keyset tie-break value of the last row pulled, per source. */
+export type TieKeys = Partial<Record<CursorKey, string>>;
 
 const ms = (iso: string | undefined | null): number => (iso ? Date.parse(iso) : Number.NaN);
-
-/**
- * New cursor = max(previous, newest `column` value in `rows`). Never moves backwards; ignores bad stamps.
- * `column` is the table's cursor column (SYNC_SOURCES): updated_at for pings, created_at for votes,
- * received_at for messages.
- */
-export function advanceCursor(
-  previous: string | undefined,
-  rows: ReadonlyArray<Record<string, unknown>>,
-  column = 'updated_at',
-): string | undefined {
-  let best = previous;
-  let bestMs = ms(previous);
-  for (const r of rows) {
-    const v = r[column];
-    const t = typeof v === 'string' ? Date.parse(v) : Number.NaN;
-    if (Number.isFinite(t) && (!Number.isFinite(bestMs) || t > bestMs)) {
-      best = v as string;
-      bestMs = t;
-    }
-  }
-  return best;
-}
 
 export interface PullSpec {
   table: CursorKey;
@@ -57,6 +35,8 @@ export interface PullSpec {
   relation: string;
   /** Column used as this table's cursor and ordering. */
   cursorColumn: string;
+  /** Keyset tie-breaker column. */
+  tieColumn: string;
   /** Inclusive lower bound; null = first sync (the caller applies its window). */
   gte: string | null;
 }
@@ -66,23 +46,9 @@ export function pullSpecs(cursors: SyncCursors): PullSpec[] {
     table,
     relation: SYNC_SOURCES[table].relation,
     cursorColumn: SYNC_SOURCES[table].cursorColumn,
+    tieColumn: SYNC_SOURCES[table].tieColumn,
     gte: cursors[table] ?? null,
   }));
-}
-
-/** Keep the latest version of each id (rows from an inclusive pull overlap by design). */
-export function dedupeById<T extends { id?: string; updated_at?: string | null }>(rows: readonly T[]): T[] {
-  const m = new Map<string, T>();
-  const noId: T[] = [];
-  for (const r of rows) {
-    if (!r.id) {
-      noId.push(r);
-      continue;
-    }
-    const prev = m.get(r.id);
-    if (!prev || !(ms(prev.updated_at) > ms(r.updated_at))) m.set(r.id, r);
-  }
-  return [...m.values(), ...noId];
 }
 
 // --- Staleness ---------------------------------------------------------------------------------
@@ -91,7 +57,7 @@ export function dedupeById<T extends { id?: string; updated_at?: string | null }
 export function isTideStale(fetchedAt: string | null | undefined, nowMs: number): boolean {
   const t = ms(fetchedAt);
   if (!Number.isFinite(t)) return true;
-  return nowMs - t > TIDE_STALE_HOURS * HOUR_MS;
+  return nowMs - t > TIDE_STALE_HOURS * MS_PER_HOUR;
 }
 
 export type Staleness = 'fresh' | 'yellow' | 'red';
@@ -100,7 +66,7 @@ export type Staleness = 'fresh' | 'yellow' | 'red';
 export function aoiStaleness(downloadedAt: string | null | undefined, nowMs: number): Staleness {
   const t = ms(downloadedAt);
   if (!Number.isFinite(t)) return 'red';
-  const ageDays = (nowMs - t) / DAY_MS;
+  const ageDays = (nowMs - t) / MS_PER_DAY;
   if (ageDays > AOI_STALE_RED_DAYS) return 'red';
   if (ageDays > AOI_STALE_YELLOW_DAYS) return 'yellow';
   return 'fresh';
@@ -119,7 +85,7 @@ export function aoiBanner(aoiLabel: string, downloadedAt: string | null | undefi
   if (!Number.isFinite(t)) {
     return { level, ageDays: null, message: `${aoiLabel}: download date unknown. Re-download on WiFi before your run.` };
   }
-  const ageDays = Math.floor((nowMs - t) / DAY_MS);
+  const ageDays = Math.floor((nowMs - t) / MS_PER_DAY);
   return {
     level,
     ageDays,

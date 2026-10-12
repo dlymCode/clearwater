@@ -1,5 +1,6 @@
 /** App settings model + validation. Persisted on-device only (private tier; never uploaded). */
 import { DEFAULT_TOGGLES, type LayerToggles } from './mapStyle';
+import { round2 } from './num';
 
 export type NmeaProtocol = 'tcp' | 'udp';
 
@@ -40,7 +41,7 @@ export function parseOffsetFt(input: string | number, label: string): Check<numb
   const n = typeof input === 'number' ? input : Number(input.trim().replace(',', '.'));
   if (input === '' || !Number.isFinite(n)) return { ok: false, error: `${label} must be a number of feet.` };
   if (n < 0 || n > MAX_OFFSET_FT) return { ok: false, error: `${label} must be between 0 and ${MAX_OFFSET_FT} ft.` };
-  return { ok: true, value: Math.round(n * 100) / 100 };
+  return { ok: true, value: round2(n) };
 }
 
 export function validateNmea(host: string, port: string | number): Check<{ host: string; port: number }> {

@@ -1,5 +1,5 @@
 import { haversineM, roundPosition } from '../src/lib/geo';
-import { inviteStatusText, isInviteExpired, isValidInviteCode, normalizeInviteCode, inviteExpiryFrom } from '../src/lib/groups';
+import { checkInviteCode, inviteStatusText, isInviteExpired, isValidInviteCode, normalizeInviteCode } from '../src/lib/groups';
 import { buildMapStyle, colorReliefExpression, depthLegend, DEFAULT_TOGGLES, layersForToggle, rampColorAtDepth } from '../src/lib/mapStyle';
 import {
   buildMessagePayload,
@@ -10,7 +10,7 @@ import {
   validateNote,
   visiblePings,
 } from '../src/lib/pingModel';
-import type { Ping, PingVote } from '@clearwater/shared';
+import type { Ping } from '@clearwater/shared';
 import { UUID_RE, uuidv4 } from '../src/lib/uuid';
 
 describe('geo', () => {
@@ -43,16 +43,27 @@ describe('uuid', () => {
 
 describe('groups', () => {
   const NOW = Date.parse('2026-10-09T00:00:00Z');
-  it('normalizes and validates 8-char codes', () => {
-    expect(normalizeInviteCode(' abcd-1234 ')).toBe('ABCD1234');
-    expect(isValidInviteCode('abcd-1234')).toBe(true);
-    expect(isValidInviteCode('ABC123')).toBe(false);
-    expect(isValidInviteCode('ABCD12345')).toBe(false);
-    expect(isValidInviteCode('ABCD123!')).toBe(false);
+  const exp = '2026-10-16T00:00:00.000Z';
+  it('normalizes and validates 8-char codes from the server alphabet [A-HJ-NP-Z2-9]', () => {
+    expect(normalizeInviteCode(' abcd-2345 ')).toBe('ABCD2345');
+    expect(isValidInviteCode('abcd-2345')).toBe(true);
+    expect(isValidInviteCode('ABC234')).toBe(false);
+    expect(isValidInviteCode('ABCD23456')).toBe(false);
+    expect(isValidInviteCode('ABCD234!')).toBe(false);
   });
-  it('expires 7 days after creation', () => {
-    const exp = inviteExpiryFrom(NOW);
-    expect(exp).toBe('2026-10-16T00:00:00.000Z');
+  it.each(['0', '1', 'O', 'I'])('rejects the ambiguous symbol %s with a message that names it', (c) => {
+    const r = checkInviteCode(`ABCD234${c}`);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toContain(c);
+    expect(isValidInviteCode(`ABCD234${c}`)).toBe(false);
+  });
+  it('every alphabet symbol is accepted', () => {
+    expect(checkInviteCode('ABCDEFGH')).toEqual({ ok: true, code: 'ABCDEFGH' });
+    expect(checkInviteCode('JKLMNPQR').ok).toBe(true);
+    expect(checkInviteCode('STUVWXYZ').ok).toBe(true);
+    expect(checkInviteCode('23456789').ok).toBe(true);
+  });
+  it('expiry text', () => {
     expect(isInviteExpired(exp, NOW + 6 * 86_400_000)).toBe(false);
     expect(isInviteExpired(exp, NOW + 7 * 86_400_000)).toBe(true);
     expect(isInviteExpired(null, NOW)).toBe(true);
@@ -117,10 +128,11 @@ describe('ping model', () => {
     author_reputation: rep,
   });
   it('visiblePings: fades at 24 h, hides at 48 h+, reconfirmation revives, pending always shown', () => {
-    const vote: PingVote = { ping_id: 'old', vote: 1, created_at: new Date(NOW - 2 * 3_600_000).toISOString(), voter_reputation: 1, weight: 1 };
+    const withAgg = (p: Ping, over: Partial<Ping> = {}): Ping => ({ ...p, vote_sum: 0, confirm_count: 0, dispute_count: 0, ...over });
+    // 'old' is 60 h old but was confirmed 2 h ago by a rep-1 voter at weight 1 (vote_sum 1)
+    const old = withAgg(ping('old', 60), { vote_sum: 1, confirm_count: 1, last_confirmed_at: new Date(NOW - 2 * 3_600_000).toISOString() });
     const out = visiblePings(
-      [ping('fresh', 1), ping('day', 30), ping('gone', 60), ping('old', 60), ping('mine', 60)],
-      new Map([['old', [vote]]]),
+      [withAgg(ping('fresh', 1)), withAgg(ping('day', 30)), withAgg(ping('gone', 60)), old, withAgg(ping('mine', 60))],
       NOW,
       new Set(['mine']),
     );
@@ -129,6 +141,7 @@ describe('ping model', () => {
     expect(byId.day!.summary.state).toBe('faded');
     expect(byId.gone).toBeUndefined();
     expect(byId.old!.summary.state).not.toBe('hidden');
+    expect(byId.old!.summary.confirms).toBe(1);
     expect(byId.mine!.pendingSync).toBe(true);
   });
 });
@@ -147,9 +160,9 @@ describe('mapStyle', () => {
     expect(stops).toContain(-40);
     expect(stops).toContain(0);
   });
-  it('waterline hatch is for <5 scenes and fleet hatch for <3 boats', () => {
+  it('fleet hatch is for <3 boats; no waterline hatch until the pipeline ships counts (TODO)', () => {
     const s = buildMapStyle(urls);
-    expect(s.layers.find((l) => l.id === 'waterline-hatch')!.filter).toEqual(['<', ['get', 'n'], 5]);
+    expect(s.layers.find((l) => l.id === 'waterline-hatch')).toBeUndefined();
     expect(s.layers.find((l) => l.id === 'fleet-hatch')!.filter).toEqual(['<', ['get', 'boats'], 3]);
     expect(s.layers.find((l) => l.id === 'fleet-solid')!.filter).toEqual(['>=', ['get', 'boats'], 3]);
   });
@@ -161,6 +174,7 @@ describe('mapStyle', () => {
     for (const l of layersForToggle(on, 'fleet')) expect(l.layout!.visibility).toBe('visible');
     const minimal = buildMapStyle({ base: 'pmtiles://b', depth: 'pmtiles://d' });
     expect(Object.keys(minimal.sources)).toEqual(['base', 'depth']);
+    expect(minimal.layers.some((l) => l.id === 'land')).toBe(false);
     expect(minimal.layers.some((l) => l.id.startsWith('fleet'))).toBe(false);
   });
   it('the map draws what the legend says: every legend band mid-point renders in the legend colour', () => {
@@ -176,6 +190,27 @@ describe('mapStyle', () => {
     // breakpoints are hard: just either side of 10 ft changes colour, not a gradient
     expect(rampColorAtDepth(9.9)).not.toBe(rampColorAtDepth(10.1));
     expect(rampColorAtDepth(200)).toBe(legend[legend.length - 1]!.color);
+  });
+  it('a PMTiles archive holds one tile type: no source reuses another source\'s URL with a different type', () => {
+    const style = buildMapStyle({ ...urls, land: 'pmtiles://land' });
+    const byUrl = new Map<string, string>();
+    for (const [id, src] of Object.entries(style.sources)) {
+      const prev = byUrl.get(src.url);
+      expect(prev === undefined || prev === src.type).toBe(true);
+      byUrl.set(src.url, src.type);
+      void id;
+    }
+    expect(style.sources.waterline_meta).toBeUndefined();
+  });
+  it('land is its own archive and every layer references only declared sources', () => {
+    for (const u of [{ base: 'b', depth: 'd' }, { ...urls }, { ...urls, land: 'l' }, { base: 'b', depth: 'd', land: 'l' }]) {
+      const style = buildMapStyle(u);
+      for (const l of style.layers) if (l.source) expect(Object.keys(style.sources)).toContain(l.source);
+    }
+    const withLand = buildMapStyle({ ...urls, land: 'pmtiles://land' });
+    expect(withLand.sources.land).toMatchObject({ type: 'vector', url: 'pmtiles://land' });
+    expect(withLand.layers.find((l) => l.id === 'land')!.source).toBe('land');
+    expect(buildMapStyle(urls).layers.some((l) => l.id === 'land')).toBe(false);
   });
   it('hillshade exaggeration is scaled by 0.3048 because the tiles are feet', () => {
     const s = buildMapStyle(urls);
@@ -204,6 +239,12 @@ describe('ping row normalization', () => {
     expect(normalizePingRow({ ...base, type: 'nope', lat: 1, lon: 2 })).toBeNull();
     expect(normalizePingRow(null)).toBeNull();
     expect(pointOf({ geom: { coordinates: ['x', 1] } })).toBeNull();
+  });
+  it('reads the ping_feed vote aggregates and rejects unparsable timestamps', () => {
+    const p = normalizePingRow({ ...base, lat: 48, lon: -122, author_reputation: 1.2, vote_sum: 1.25, last_confirmed_at: '2026-10-09T01:00:00Z', confirm_count: 2, dispute_count: 1, received_at: '2026-10-09T00:00:05Z' })!;
+    expect(p).toMatchObject({ author_reputation: 1.2, vote_sum: 1.25, confirm_count: 2, dispute_count: 1, last_confirmed_at: '2026-10-09T01:00:00Z', received_at: '2026-10-09T00:00:05Z' });
+    expect(normalizePingRow({ ...base, created_at: 'not a date', lat: 1, lon: 2 })).toBeNull();
+    expect(normalizePingRow({ ...base, author_id: null, lat: 1, lon: 2 })!.author_id).toBeNull(); // anonymous
   });
   it('queued payload becomes a local ping', () => {
     const payload = buildPingPayload({ type: 'log', lat: 48.3, lon: -122.5, groupId: null }, { id: 'p9', nowMs: 0, tideFt: null });

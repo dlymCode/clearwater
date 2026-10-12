@@ -19,8 +19,7 @@ const config: ExpoConfig = {
         'Sound Maps shows your boat on the map and rounds your last position to 100 m so other boats can confirm hazards near you.',
       NSLocalNetworkUsageDescription:
         'Sound Maps connects to your boat\'s WiFi NMEA gateway to read the depth sounder.',
-      // No 'location' background mode: location is foreground-only for now (App Store review + privacy). Add it with S7-1.
-      UIBackgroundModes: ['fetch'],
+      // No UIBackgroundModes: location is foreground-only and no background task is registered yet (README TODOs).
     },
   },
   plugins: [
@@ -28,7 +27,7 @@ const config: ExpoConfig = {
     ['expo-sqlite', { useSQLCipher: true }],
     ['expo-location', { isIosBackgroundLocationEnabled: false }],
     '@maplibre/maplibre-react-native',
-    'expo-build-properties',
+    // TODO: expo-build-properties (certificate pinning / NSPinnedDomains) once the API host is fixed; see README.
   ],
   extra: {
     tileAuthUrl: process.env.TILE_AUTH_URL ?? '',

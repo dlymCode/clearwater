@@ -37,7 +37,7 @@ export const SOURCE_LABELS_BY_CODE: Readonly<Record<number, string>> = {
  * Vertical-uncertainty buckets (ft); the meta tile stores the index and always rounds UP.
  * Per the pipeline review outcome: index 15 means UNKNOWN exclusively; real values >= 45 ft clamp to index 14,
  * which is OPEN-ENDED (">= 45 ft"). Indices 0..13 are the finite levels below.
- * TODO: re-verify against pipeline/common.py once the pipeline fix pass lands.
+ * Verified against pipeline/common.py and pipeline/tiles.py (levels, open-ended index 14, unknown index 15).
  */
 export const UNC_LEVELS_FT = [0.0, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 7.5, 10.0, 15.0, 20.0, 45.0] as const;
 export const UNC_OPEN_ENDED_INDEX = 14;

@@ -8,7 +8,7 @@
  *   bottom elevation (MLLW, positive up) = h - d_s         (a bar at +3 ft dries at a 3 ft tide)
  *   depth under keel = d_s - keel depth below the waterline  (live clearance; independent of tide)
  */
-import type { TidePredictions, TideStation } from '@clearwater/shared';
+import { MS_PER_DAY, MS_PER_HOUR, type TidePredictions, type TideStation } from '@clearwater/shared';
 import { haversineM, type LatLon } from './geo';
 
 export interface TideSeries {
@@ -20,11 +20,15 @@ export interface TideSeries {
   v: number[];
 }
 
+const UTC_MARKER = /(Z|[+-]00(:?00)?)$/i;
+
 /** Parse cached predictions JSON into a sorted numeric series (invalid points dropped, last dup wins). */
 export function toSeries(p: TidePredictions): TideSeries {
   const pts: Array<[number, number]> = [];
   for (const row of p.predictions) {
-    const t = Date.parse(row.t);
+    // Timestamps must carry an explicit UTC marker. A bare "2026-10-09T08:00:00" parses as DEVICE-LOCAL time and
+    // would silently shift the whole curve by the UTC offset.
+    const t = typeof row.t === 'string' && UTC_MARKER.test(row.t) ? Date.parse(row.t) : Number.NaN;
     if (Number.isFinite(t) && Number.isFinite(row.v)) pts.push([t, row.v]);
   }
   pts.sort((a, b) => a[0] - b[0]);
@@ -65,7 +69,7 @@ export function interpolateTide(series: TideSeries, tMs: number, opts: Interpola
   if (t0 === tMs || lo === n - 1) return v0;
   const t1 = series.tMs[lo + 1] as number;
   const v1 = series.v[lo + 1] as number;
-  if (t1 - t0 > (opts.maxGapMs ?? 7 * 3_600_000)) return null;
+  if (t1 - t0 > (opts.maxGapMs ?? 7 * MS_PER_HOUR)) return null;
   return v0 + ((v1 - v0) * (tMs - t0)) / (t1 - t0);
 }
 
@@ -77,6 +81,8 @@ export interface TidePoint {
 
 /** Sample the curve for the 48 h tide screen. */
 export function tideCurve(series: TideSeries, startMs: number, endMs: number, stepMin = 10): TidePoint[] {
+  if (!(stepMin > 0) || !Number.isFinite(stepMin)) throw new RangeError('tideCurve: stepMin must be > 0');
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) throw new RangeError('tideCurve: start/end must be finite');
   const out: TidePoint[] = [];
   const step = stepMin * 60_000;
   for (let t = startMs; t <= endMs; t += step) out.push({ tMs: t, v: interpolateTide(series, t) });
@@ -91,7 +97,7 @@ export function coverageEndMs(series: TideSeries): number | null {
 /** Days of predictions cached ahead of `nowMs` (>= 0). */
 export function daysCachedAhead(series: TideSeries, nowMs: number): number {
   const end = coverageEndMs(series);
-  return end === null ? 0 : Math.max(0, (end - nowMs) / 86_400_000);
+  return end === null ? 0 : Math.max(0, (end - nowMs) / MS_PER_DAY);
 }
 
 export interface SoundingCorrectionInput {

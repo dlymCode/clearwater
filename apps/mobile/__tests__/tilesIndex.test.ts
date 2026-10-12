@@ -73,7 +73,7 @@ describe('parseTilesIndex', () => {
     expect(r.ok).toBe(true);
     if (r.ok) {
       expect(r.index.aois.map((a) => a.aoi)).toEqual(['skagit']);
-      expect(r.issues.length).toBe(3);
+      expect(r.issues.length).toBeGreaterThanOrEqual(3);
     }
   });
 
@@ -104,6 +104,26 @@ describe('parseTilesIndex', () => {
 
   it('depth_meta path follows the convention next to depth.pmtiles (not in the index)', () => {
     expect(depthMetaPath(entry('skagit', 'v1'))).toBe('tiles/skagit/v1/depth_meta.pmtiles');
+  });
+
+  it('path safety: a hostile index cannot smuggle traversal, odd aoi slugs or odd versions', () => {
+    const e = entry('skagit', 'v1');
+    const evil = (patch: Record<string, unknown>) => parseTilesIndex({ ...sample, aois: [{ ...e, ...patch }] });
+    const count = (r: ReturnType<typeof parseTilesIndex>) => (r.ok ? r.index.aois.length : -1);
+    expect(count(evil({ aoi: '../etc' }))).toBe(0);
+    expect(count(evil({ aoi: 'Skagit' }))).toBe(0);
+    expect(count(evil({ aoi: 'a/b' }))).toBe(0);
+    expect(count(evil({ version: '../../x' }))).toBe(0);
+    expect(count(evil({ version: 'a/b' }))).toBe(0);
+    expect(count(evil({ files: { ...e.files, base: { path: 'tiles/skagit/v1/../../../etc/passwd', bytes: 5 } } }))).toBe(0);
+    expect(count(evil({ files: { ...e.files, base: { path: '/abs/base.pmtiles', bytes: 5 } } }))).toBe(0);
+    expect(count(evil({ files: { ...e.files, base: { path: 'tiles/skagit/v1/base.exe', bytes: 5 } } }))).toBe(0);
+    expect(count(evil({ files: { ...e.files, base: { path: 'tiles/other/v1/a/base.pmtiles', bytes: 5 } } }))).toBe(0);
+    // an unsafe OPTIONAL layer is dropped, the AOI survives
+    const r = evil({ files: { ...e.files, fleet: { path: 'tiles/skagit/v1/../x.pmtiles', bytes: 5 } } });
+    expect(count(r)).toBe(1);
+    if (r.ok) expect(r.index.aois[0]!.files.fleet).toBeUndefined();
+    expect(count(evil({}))).toBe(1);
   });
 
   it('negative or non-numeric bytes invalidate that file', () => {

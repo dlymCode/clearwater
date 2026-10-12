@@ -1,8 +1,6 @@
 import {
-  advanceCursor,
   aoiBanner,
   aoiStaleness,
-  dedupeById,
   isTideStale,
   planSync,
   pullSpecs,
@@ -12,40 +10,16 @@ const NOW = Date.parse('2026-10-09T12:00:00Z');
 const ago = (days: number) => new Date(NOW - days * 86_400_000).toISOString();
 const hoursAgo = (h: number) => new Date(NOW - h * 3_600_000).toISOString();
 
-describe('cursors', () => {
-  it('advances to the newest updated_at and never moves backwards', () => {
-    const rows = [{ updated_at: '2026-10-09T10:00:00Z' }, { updated_at: '2026-10-09T11:00:00Z' }, { updated_at: '2026-10-09T09:00:00Z' }];
-    expect(advanceCursor(undefined, rows)).toBe('2026-10-09T11:00:00Z');
-    expect(advanceCursor('2026-10-10T00:00:00Z', rows)).toBe('2026-10-10T00:00:00Z');
-    expect(advanceCursor('2026-10-09T10:30:00Z', rows)).toBe('2026-10-09T11:00:00Z');
-  });
-  it('advances by the per-table cursor column, not always updated_at', () => {
-    const votes = [{ created_at: '2026-10-09T10:00:00Z' }, { created_at: '2026-10-09T12:00:00Z' }];
-    expect(advanceCursor(undefined, votes, 'created_at')).toBe('2026-10-09T12:00:00Z');
-    expect(advanceCursor(undefined, votes)).toBeUndefined(); // rows have no updated_at
-    expect(advanceCursor(undefined, [{ received_at: '2026-10-09T09:00:00Z' }], 'received_at')).toBe('2026-10-09T09:00:00Z');
-  });
-  it('ignores rows with missing or garbage stamps; empty keeps previous', () => {
-    expect(advanceCursor('2026-10-09T10:00:00Z', [{ updated_at: null }, { updated_at: 'nope' }, {}])).toBe('2026-10-09T10:00:00Z');
-    expect(advanceCursor(undefined, [])).toBeUndefined();
-  });
-  it('builds one inclusive pull per table (first sync has null bounds)', () => {
+describe('pull specs', () => {
+  it('one spec per feed source with its cursor column and keyset tie-breaker', () => {
     expect(pullSpecs({})).toEqual([
-      { table: 'pings', relation: 'ping_feed', cursorColumn: 'updated_at', gte: null },
-      { table: 'ping_votes', relation: 'ping_votes_feed', cursorColumn: 'created_at', gte: null },
-      { table: 'messages', relation: 'messages', cursorColumn: 'received_at', gte: null },
+      { table: 'pings', relation: 'ping_feed', cursorColumn: 'updated_at', tieColumn: 'id', gte: null },
+      { table: 'messages', relation: 'messages_feed', cursorColumn: 'received_at', tieColumn: 'id', gte: null },
     ]);
     expect(pullSpecs({ pings: '2026-10-09T10:00:00Z' })[0]).toMatchObject({ table: 'pings', gte: '2026-10-09T10:00:00Z' });
   });
-  it('dedupeById keeps the newest version of overlapping rows', () => {
-    const out = dedupeById([
-      { id: 'a', updated_at: '2026-10-09T10:00:00Z', v: 1 },
-      { id: 'a', updated_at: '2026-10-09T11:00:00Z', v: 2 },
-      { id: 'a', updated_at: '2026-10-09T10:30:00Z', v: 3 },
-      { id: 'b', updated_at: '2026-10-09T10:00:00Z', v: 4 },
-    ]);
-    expect(out.find((r) => r.id === 'a')!.v).toBe(2);
-    expect(out).toHaveLength(2);
+  it('there is no per-vote source (a vote feed de-anonymizes voters)', () => {
+    expect(pullSpecs({}).map((x) => x.relation)).not.toContain('ping_votes_feed');
   });
 });
 
@@ -95,6 +69,6 @@ describe('planSync', () => {
     });
     expect(plan.tideStationsToRefresh).toEqual(['9444900', '9449880']);
     expect(plan.pullTilesIndex).toBe(true);
-    expect(plan.pulls).toHaveLength(3);
+    expect(plan.pulls).toHaveLength(2);
   });
 });

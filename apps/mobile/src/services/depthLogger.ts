@@ -3,8 +3,9 @@
  * -> (periodically) H3/day aggregation -> outbox depth_batch. Raw soundings never leave the device.
  */
 import { useAppStore } from '../state/store';
-import { aggregateSoundings, buildUploadPayload, type CorrectedSounding } from '../lib/aggregate';
+import { buildUploadPayload, reaggregateTouched, utcDay, type CorrectedSounding } from '../lib/aggregate';
 import { soundingBatchId } from '../lib/outbox';
+import { MS_PER_DAY } from '@clearwater/shared';
 import { uuidv4 } from '../lib/uuid';
 import { DepthFilter } from '../lib/depthFilter';
 import type { InstrumentSnapshot } from '../lib/nmea';
@@ -94,20 +95,29 @@ export class DepthLogger {
   }
 
   /**
-   * Aggregate not-yet-uploaded soundings to H3-12 / UTC day and queue them.
+   * Queue depth uploads. Every upload is the COMPLETE UTC-day aggregate for each cell touched since the last batch
+   * (the server upserts-replace per cell and day): we re-aggregate ALL of the day's stored soundings for those cells,
+   * not just the new ones. A cell logged at 10:00 and again at 14:00 therefore uploads the combined n / median / p10.
+   * Raw soundings therefore have to outlive their upload (retention keeps aggregated ones 7 days).
+   *
    * Crash-safe and idempotent: the enqueue and the `aggregated` flag flip happen in ONE serialized transaction, and the
-   * batch id is derived from the sounding id range + a per-install random id, so a repeat can never double count.
+   * batch id is derived from the new soundings' id range + a per-install random id, so a repeat can never double count.
    */
   async aggregateAndEnqueue(): Promise<number> {
     const db = await getDb();
-    const rows = await db.getAllAsync<{ id: number; t_ms: number; lat: number; lon: number; mllw_depth_ft: number }>(
-      'SELECT id, t_ms, lat, lon, mllw_depth_ft FROM soundings WHERE aggregated = 0 ORDER BY id',
-    );
-    if (rows.length === 0) return 0;
-    const first = rows[0]!.id;
-    const last = rows[rows.length - 1]!.id;
-    const soundings: CorrectedSounding[] = rows.map((r) => ({ tMs: r.t_ms, lat: r.lat, lon: r.lon, mllwDepthFt: r.mllw_depth_ft }));
-    const payload = buildUploadPayload(aggregateSoundings(soundings));
+    const fresh = await db.getAllAsync<Sounding>('SELECT id, t_ms, lat, lon, mllw_depth_ft FROM soundings WHERE aggregated = 0 ORDER BY id');
+    if (fresh.length === 0) return 0;
+    const first = fresh[0]!.id;
+    const last = fresh[fresh.length - 1]!.id;
+    const toCorrected = (r: Sounding): CorrectedSounding => ({ tMs: r.t_ms, lat: r.lat, lon: r.lon, mllwDepthFt: r.mllw_depth_ft });
+    // All stored soundings of every UTC day the new ones touch.
+    const days = [...new Set(fresh.map((r) => utcDay(r.t_ms)))].filter((d) => !d.startsWith('Invalid'));
+    const dayRows: Sounding[] = [];
+    for (const d of days) {
+      const start = Date.parse(`${d}T00:00:00Z`);
+      dayRows.push(...(await db.getAllAsync<Sounding>('SELECT id, t_ms, lat, lon, mllw_depth_ft FROM soundings WHERE t_ms >= ? AND t_ms < ?', start, start + MS_PER_DAY)));
+    }
+    const payload = buildUploadPayload(reaggregateTouched(fresh.map(toCorrected), dayRows.map(toCorrected)));
     let installId = await kvGet<string>('install.id');
     if (!installId) {
       installId = uuidv4();
@@ -120,4 +130,12 @@ export class DepthLogger {
     });
     return payload.rows.length;
   }
+}
+
+interface Sounding {
+  id: number;
+  t_ms: number;
+  lat: number;
+  lon: number;
+  mllw_depth_ft: number;
 }

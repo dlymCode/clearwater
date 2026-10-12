@@ -31,8 +31,8 @@ function SyncStatus() {
       {errors.map((e) => (
         <Text key={e} style={[s.small, { color: c.warn }]}>{e}</Text>
       ))}
-      <Button label="Sync now" kind="secondary" onPress={() => void syncNow().then(refresh)} />
-      {failed.length > 0 ? <Button label="Retry rejected" onPress={() => void outbox.retryFailed().then(() => syncNow()).then(refresh)} /> : null}
+      <Button label="Sync now" kind="secondary" onPress={() => { syncNow().then(refresh).catch(() => refresh()); }} />
+      {failed.length > 0 ? <Button label="Retry rejected" onPress={() => { outbox.retryFailed().then(() => syncNow()).then(refresh).catch(() => refresh()); }} /> : null}
     </View>
   );
 }

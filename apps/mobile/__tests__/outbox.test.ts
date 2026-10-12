@@ -186,8 +186,9 @@ describe('depth coalescing (1 batch / 15 min server limit)', () => {
     expect(depthCalls).toHaveLength(1);
     expect(depthCalls[0]!.items).toHaveLength(1);
     const rows = (depthCalls[0]!.items[0]!.payload as { rows: DepthUploadRow[] }).rows;
-    expect(rows).toHaveLength(4); // cells 0,1(merged n=10),2 on the 9th + cell 3 on the 10th
-    expect(rows.find((r) => r.h3_cell === depthRow(1).h3_cell)!.n).toBe(10);
+    expect(rows).toHaveLength(4); // cells 0,1,2 on the 9th + cell 3 on the 10th
+    // cell 1 was in both batches: each upload is the complete day, so the later one REPLACES the earlier (never summed)
+    expect(rows.find((r) => r.h3_cell === depthRow(1).h3_cell)!.n).toBe(5);
   });
 });
 
@@ -206,10 +207,11 @@ describe('50 MB cap policy (scaled down)', () => {
     expect(cap.overCap).toBe(false);
     expect(cap.totalBytes).toBeLessThanOrEqual(4000);
     expect(await outbox.pending('ping')).toHaveLength(1);
-    // all soundings still accounted for: n is conserved
+    // every cell is still represented; repeated complete-day aggregates of the same cell collapse to the latest one
     const depth = await outbox.pending('depth_batch');
-    const total = depth.flatMap((r) => (r.payload as { rows: DepthUploadRow[] }).rows).reduce((s, r) => s + r.n, 0);
-    expect(total).toBe(12 * 6 * 5);
+    const rows = depth.flatMap((r) => (r.payload as { rows: DepthUploadRow[] }).rows);
+    expect(new Set(rows.map((r) => r.h3_cell)).size).toBe(6);
+    expect(rows.every((r) => r.n === 5)).toBe(true); // replaced, never summed: no row ever grows beyond one batch's n
   });
 
   it('when only pings exceed the cap nothing is dropped and overCap is reported', async () => {
@@ -276,8 +278,12 @@ describe('rows that were ever attempted are never merged or re-id\'d (no double 
   it('enqueue with an explicit id is idempotent', async () => {
     const { outbox } = mk();
     const a = await outbox.enqueue('depth_batch', { rows: [depthRow(0)] }, { id: 'fixed' });
-    const again = await outbox.enqueue('depth_batch', { rows: [depthRow(9)] }, { id: 'fixed' });
+    const again = await outbox.enqueue('depth_batch', { rows: [depthRow(0)] }, { id: 'fixed' });
     expect(again.seq).toBe(a.seq);
+    expect(await outbox.pending('depth_batch')).toHaveLength(1);
+    // same id, different payload or kind => a caller bug / collision: refuse instead of silently dropping the new data
+    await expect(outbox.enqueue('depth_batch', { rows: [depthRow(9)] }, { id: 'fixed' })).rejects.toThrow(/different payload/);
+    await expect(outbox.enqueue('ping', { rows: [depthRow(0)] }, { id: 'fixed' })).rejects.toThrow(/different kind/);
     expect(await outbox.pending('depth_batch')).toHaveLength(1);
   });
 });
@@ -302,13 +308,45 @@ describe('auth, silent votes, visible failures', () => {
     expect(ok.sent).toBe(2);
   });
 
-  it.each(['confirm_ineligible', 'cannot_vote_own_ping', 'ping_not_found'])('403 %s on a vote is swallowed silently', async (code) => {
+  it.each([
+    [403, 'confirm_ineligible'],
+    [403, 'cannot_vote_own_ping'],
+    [404, 'ping_not_found'], // cast_vote raises ping_not_found as PT404, not PT403
+  ])('%i %s on a vote is swallowed silently', async (status, code) => {
     const { outbox } = mk();
     await outbox.enqueue('vote', { v: 1 });
-    const r = await outbox.flush(async () => ({ status: 403, code }));
+    const r = await outbox.flush(async () => ({ status, code }));
     expect(r.swallowed).toBe(1);
     expect(r.failed).toBe(0);
     expect(await outbox.pending()).toHaveLength(0);
+    expect(await outbox.failed()).toHaveLength(0);
+  });
+
+  it.each([
+    [403, 'ping_not_found'], // wrong status for that code
+    [404, 'confirm_ineligible'],
+    [403, 'something_else'],
+    [403, undefined],
+  ])('%i %s is NOT swallowed (visible failure)', async (status, code) => {
+    const { outbox } = mk();
+    await outbox.enqueue('vote', { v: 1 });
+    const r = await outbox.flush(async () => ({ status, ...(code ? { code } : {}) }));
+    expect(r.swallowed).toBe(0);
+    expect(r.failed).toBe(1);
+    expect(await outbox.failed()).toHaveLength(1);
+  });
+
+  it('403 account_revoked stops sending as an auth-level failure; rows stay pending, nothing is failed', async () => {
+    const { outbox } = mk();
+    await outbox.enqueue('ping', {});
+    await outbox.enqueue('depth_batch', { rows: [depthRow(0)] });
+    const { calls } = recorder();
+    const r = await outbox.flush(async (b) => { calls.push(b); return { status: 403, code: 'account_revoked' }; });
+    expect(r.accountRevoked).toBe(true);
+    expect(r.authRequired).toBe(false);
+    expect(r.stopped).toBe(true);
+    expect(calls).toHaveLength(1);
+    expect(await outbox.pending()).toHaveLength(2);
     expect(await outbox.failed()).toHaveLength(0);
   });
 
@@ -395,5 +433,48 @@ describe('deterministic sounding batch ids + mutex', () => {
     const results = await Promise.allSettled([task('a'), task('b', true), task('c')]);
     expect(log).toEqual(['a:start', 'a:end', 'b:start', 'b:end', 'c:start', 'c:end']);
     expect(results.map((r) => r.status)).toEqual(['fulfilled', 'rejected', 'fulfilled']);
+  });
+});
+
+describe('B4 (battle 5f): a chunked row that failed after chunk 0 committed is never merged or re-id\'d', () => {
+  const bigRows = (n: number): DepthUploadRow[] =>
+    Array.from({ length: n }, (_, i) => ({ h3_cell: latLngToCell(48 + Math.floor(i / 1000) * 0.05, -122 + (i % 1000) * 0.0005, 12), day: '2026-10-09', median_ft: 5, p10_ft: 4, n: 2 }));
+
+  it('401 at chunk>0 marks the row attempted (non-mergeable) BEFORE returning auth; enforceCap then leaves it alone', async () => {
+    const { outbox, store } = mk({ maxDepthRowsPerBatch: 20000, capBytes: 1000 });
+    const row = await outbox.enqueue('depth_batch', { rows: bigRows(6000) });
+    const committed: string[] = [];
+    let call = 0;
+    const r = await outbox.flush(async (b) => {
+      call++;
+      if (call === 1) { committed.push(b.items[0]!.id); return { status: 200 }; } // chunk 0 is committed on the server
+      return { status: 401 };
+    });
+    expect(r.authRequired).toBe(true);
+    const after = await store.get(row.id);
+    expect(after!.attempts).toBeGreaterThan(0);
+    expect(isMergeable(after!)).toBe(false);
+    // a second depth row arrives and the cap is exceeded: the half-sent row must keep its id
+    await outbox.enqueue('depth_batch', { rows: [depthRow(0)] });
+    await outbox.enforceCap();
+    expect(await store.get(row.id)).not.toBeNull();
+    const ids: string[] = [];
+    await outbox.flush(async (b) => { ids.push(b.items[0]!.id); return { status: 200 }; });
+    expect(ids[0]).toBe(committed[0]); // chunk 0 is replayed under its ORIGINAL id => the server dedupes it
+  });
+
+  it('401 at chunk 0 (nothing committed) leaves the row untouched, as before', async () => {
+    const { outbox, store } = mk({ maxDepthRowsPerBatch: 20000 });
+    const row = await outbox.enqueue('depth_batch', { rows: bigRows(6000) });
+    await outbox.flush(async () => ({ status: 401 }));
+    expect((await store.get(row.id))!.attempts).toBe(0);
+  });
+
+  it('account_revoked and permanent 4xx at chunk>0 are not lost as mergeable either', async () => {
+    const { outbox, store } = mk({ maxDepthRowsPerBatch: 20000 });
+    const a = await outbox.enqueue('depth_batch', { rows: bigRows(6000) });
+    let n = 0;
+    await outbox.flush(async () => ({ status: ++n === 1 ? 200 : 403, code: 'account_revoked' }));
+    expect(isMergeable((await store.get(a.id))!)).toBe(false);
   });
 });

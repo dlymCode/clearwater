@@ -5,9 +5,8 @@
  */
 import * as FileSystem from 'expo-file-system/legacy';
 import type { TidePredictions, TideStation } from '@clearwater/shared';
-import { REFERENCE_TIDE_STATIONS } from '../lib/stations';
+import { REFERENCE_TIDE_STATIONS, mergeStationRegistry, type CachedStationMeta } from '../lib/stations';
 import { toSeries, type TideSeries } from '../lib/tide';
-import { mergeStationRegistry, type CachedStationMeta } from '../lib/tideStations';
 import { verifyDownload } from '../lib/downloadVerify';
 import { CONFIG } from './config';
 import { kvGet, kvSet } from './db';

@@ -3,17 +3,17 @@
  * The two-tap flow: tap 1 picks the type, tap 2 confirms. Note optional (<= 140 chars).
  */
 import {
+  CONFIRM_ELIGIBILITY_M,
   MESSAGE_BODY_MAX,
   PING_NOTE_MAX,
   isPingType,
   type Ping,
   type PingType,
   type MyVote,
-  type PingVote,
   type VoteValue,
 } from '@clearwater/shared';
 import { isValidLatLon } from './geo';
-import { fallbackScore, isVoteEligible, renderState, summarizePing, type Instant, type PingSummary, type ScoreVote } from './score';
+import { fallbackScore, isVoteEligible, renderState, summarizePing, type Instant, type PingSummary } from './score';
 
 const charLength = (s: string): number => Array.from(s).length;
 
@@ -119,22 +119,9 @@ export function buildMessagePayload(
 
 // --- Visibility --------------------------------------------------------------------------------
 
-export function toScoreVotes(votes: readonly PingVote[]): ScoreVote[] {
-  return votes.map((v) => ({
-    vote: v.vote,
-    // Callers must check reputationsKnown() first; these defaults are never used for display scoring.
-    voterReputation: v.voter_reputation ?? 0,
-    weight: v.weight ?? 0,
-    createdAt: v.created_at,
-  }));
-}
-
-/** True when the author's reputation and every vote's reputation AND server-computed weight came from the feeds. */
-export function reputationsKnown(ping: Ping, votes: readonly PingVote[]): boolean {
-  return (
-    typeof ping.author_reputation === 'number' &&
-    votes.every((v) => typeof v.voter_reputation === 'number' && typeof v.weight === 'number')
-  );
+/** True when ping_feed gave us both the author's reputation and the server's vote aggregate. */
+export function scoreInputsKnown(ping: Ping): boolean {
+  return typeof ping.author_reputation === 'number' && typeof ping.vote_sum === 'number';
 }
 
 export interface ScoredPing {
@@ -142,34 +129,34 @@ export interface ScoredPing {
   summary: PingSummary;
   /** Queued in the outbox and not yet accepted by the server (includes rows the server rejected: they need a retry). */
   pendingSync: boolean;
-  /** Score came from the server's cached value decayed to now (reputations were missing). */
+  /** Score came from the server's cached value decayed to now (reputation or vote_sum missing). */
   scoreIsFallback: boolean;
 }
 
 /**
  * Score every ping from timestamps alone (works offline), drop hidden ones, and mark pending-sync.
- * With reputations (ping_feed / ping_votes_feed) the full formula runs on-device. Without them, the server's
- * cached score decayed by exp(-lambda * (now - updated_at)) is used; never a default reputation of 1.0.
- * Pings the user just created and that are still unsynced are always shown (even if clocks drift).
+ * With author_reputation + vote_sum (ping_feed) the full formula runs on-device. Without them, the server's cached
+ * score decayed by exp(-lambda * (now - updated_at)) is used; never a default reputation of 1.0.
+ * Confirm / dispute counts are the server's columns. Pings the user just created and that are still unsynced are
+ * always shown (even if clocks drift).
  */
-export function visiblePings(
-  pings: readonly Ping[],
-  votesByPing: ReadonlyMap<string, readonly PingVote[]>,
-  nowMs: Instant,
-  unsyncedIds: ReadonlySet<string> = new Set(),
-): ScoredPing[] {
+export function visiblePings(pings: readonly Ping[], nowMs: Instant, unsyncedIds: ReadonlySet<string> = new Set()): ScoredPing[] {
   const out: ScoredPing[] = [];
   for (const ping of pings) {
-    const votes = votesByPing.get(ping.id) ?? [];
+    const confirmCount = ping.confirm_count ?? 0;
+    const disputeCount = ping.dispute_count ?? 0;
     let summary: PingSummary;
     let fallback = false;
-    if (reputationsKnown(ping, votes)) {
+    if (scoreInputsKnown(ping)) {
       summary = summarizePing({
         authorReputation: ping.author_reputation as number,
         createdAt: ping.created_at,
         receivedAt: ping.received_at ?? null,
-        votes: toScoreVotes(votes),
+        voteSum: ping.vote_sum as number,
+        lastConfirmedAt: ping.last_confirmed_at ?? null,
         now: nowMs,
+        confirmCount,
+        disputeCount,
       });
     } else {
       const fb = fallbackScore(ping.score, ping.updated_at ?? ping.created_at, nowMs);
@@ -178,7 +165,7 @@ export function visiblePings(
         if (!unsyncedIds.has(ping.id)) continue;
         summary = { score: 1, state: 'normal', confirms: 0, disputes: 0 };
       } else {
-        summary = { score: fb, state: renderState(fb), confirms: votes.filter((v) => v.vote === 1).length, disputes: votes.filter((v) => v.vote === -1).length };
+        summary = { score: fb, state: renderState(fb), confirms: confirmCount, disputes: disputeCount };
       }
       fallback = true;
     }
@@ -209,31 +196,12 @@ export function voteAvailability(i: {
   if (i.pendingSync) return { confirm: false, dispute: false, reason: 'Waiting to sync.' };
   if (i.alreadyVoted) return { confirm: false, dispute: false, reason: 'You already voted.' };
   const near = isVoteEligible(i.distanceToPingM);
-  return { confirm: near, dispute: true, reason: near ? null : 'Get within 500 m to confirm (position sharing must be on).' };
+  return { confirm: near, dispute: true, reason: near ? null : `Get within ${CONFIRM_ELIGIBILITY_M} m to confirm (position sharing must be on).` };
 }
 
 /** The user's own vote, recorded locally the moment it is queued (reconciled with ping_votes where voter_id = me). */
 export function optimisticVote(pingId: string, vote: VoteValue, nowMs: number): MyVote {
   return { ping_id: pingId, vote, created_at: new Date(nowMs).toISOString() };
-}
-
-/** Row of ping_votes_feed: (ping_id, vote, created_at, voter_reputation, weight). No voter id, no distance. */
-export function normalizeVoteRow(raw: unknown): PingVote | null {
-  const row = asObj(raw);
-  if (!row || typeof row.ping_id !== 'string' || typeof row.created_at !== 'string') return null;
-  if (row.vote !== 1 && row.vote !== -1) return null;
-  return {
-    ping_id: row.ping_id,
-    vote: row.vote,
-    created_at: row.created_at,
-    ...(typeof row.voter_reputation === 'number' ? { voter_reputation: row.voter_reputation } : {}),
-    ...(typeof row.weight === 'number' ? { weight: row.weight } : {}),
-  };
-}
-
-/** Stable local key for a feed vote row (the feed hides voter_id, so there is no natural key). */
-export function voteRowKey(row: Record<string, unknown>): string {
-  return `${String(row.ping_id)}|${String(row.created_at)}|${String(row.vote)}|${String(row.voter_reputation ?? '')}|${String(row.weight ?? '')}`;
 }
 
 // --- Wire <-> domain ---------------------------------------------------------------------------
@@ -251,7 +219,7 @@ export function pointOf(row: Record<string, unknown>): { lat: number; lon: numbe
 
 /**
  * Server `pings` row (or our own queued PingPayload) => Ping. Returns null for rows that cannot be drawn.
- * Read from the `ping_feed` view: it carries `author_reputation` and nulls author_id/handle on anonymous pings.
+ * Read from the `ping_feed` view: it carries `author_reputation`, the vote aggregates and nulls author_id/handle on anonymous pings.
  * A missing reputation is left undefined (visiblePings then uses the decayed server score, never a default 1.0).
  */
 export function normalizePingRow(raw: unknown): Ping | null {
@@ -259,6 +227,7 @@ export function normalizePingRow(raw: unknown): Ping | null {
   if (!row) return null;
   const pt = pointOf(row);
   if (!pt || typeof row.id !== 'string' || typeof row.created_at !== 'string' || !isPingType(row.type)) return null;
+  if (!Number.isFinite(Date.parse(row.created_at))) return null; // unparsable timestamps would score as NaN
   return {
     id: row.id,
     author_id: typeof row.author_id === 'string' ? row.author_id : null,
@@ -273,6 +242,10 @@ export function normalizePingRow(raw: unknown): Ping | null {
     score: typeof row.score === 'number' ? row.score : null,
     tide_ft: typeof row.tide_ft === 'number' ? row.tide_ft : null,
     ...(typeof row.author_reputation === 'number' ? { author_reputation: row.author_reputation } : {}),
+    ...(typeof row.vote_sum === 'number' ? { vote_sum: row.vote_sum } : {}),
+    ...(typeof row.last_confirmed_at === 'string' ? { last_confirmed_at: row.last_confirmed_at } : {}),
+    ...(typeof row.confirm_count === 'number' ? { confirm_count: row.confirm_count } : {}),
+    ...(typeof row.dispute_count === 'number' ? { dispute_count: row.dispute_count } : {}),
     ...(typeof row.author_handle === 'string' ? { author_handle: row.author_handle } : {}),
     ...(typeof row.updated_at === 'string' ? { updated_at: row.updated_at } : {}),
   };

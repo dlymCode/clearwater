@@ -13,6 +13,8 @@ const LAST_REPORT_KEY = 'position.lastReportMs';
 let lastReportMs: number | null = null;
 let lastAttemptMs: number | null = null;
 let inFlight = false;
+/** Position the server refused as out of range; we stay quiet until the boat moves (lib/positionReport). */
+let rejectedAt: { lat: number; lon: number } | null = null;
 let loaded = false;
 
 /** Call on every GPS fix (cheap: the policy short-circuits). */
@@ -23,7 +25,7 @@ export async function maybeReportPosition(): Promise<void> {
   }
   const { settings, gps } = useAppStore.getState();
   const decision = decidePositionReport(
-    { lastReportMs, lastAttemptMs, inFlight },
+    { lastReportMs, lastAttemptMs, inFlight, rejectedAt },
     {
       nowMs: Date.now(),
       sharingEnabled: settings.sharePosition,
@@ -41,7 +43,14 @@ export async function maybeReportPosition(): Promise<void> {
     const { error } = await sb.rpc('report_position', { p_lat: decision.position.lat, p_lon: decision.position.lon });
     if (!error) {
       lastReportMs = Date.now();
+      rejectedAt = null;
       await kvSet(LAST_REPORT_KEY, lastReportMs);
+    } else if (error.code === 'PT400' || /position_out_of_range/.test(error.message)) {
+      // Permanent for this position: drop the report ("outside coverage") instead of retrying forever. It resumes when
+      // the boat has moved (decidePositionReport clears the flag implicitly).
+      rejectedAt = decision.position;
+    } else if (/account_revoked/.test(error.message)) {
+      useAppStore.getState().setAccountRevoked(true);
     }
   } finally {
     inFlight = false;

@@ -71,3 +71,25 @@ describe('pipeline encoding mirror (pipeline/common.py, pipeline/tiles.py)', () 
     expect(UNKNOWN_UNC_INDEX).toBe(15);
   });
 });
+
+import { INVITE_CODE_ALPHABET, INVITE_CODE_LENGTH, MS_PER_DAY, MS_PER_HOUR, OWN_VOTES_SOURCE, SALISH_SEA_BBOX, SYNC_SOURCES } from '../src';
+
+describe('shared additions', () => {
+  it('invite alphabet matches the server: 32 symbols, no 0/O/1/I', () => {
+    expect(INVITE_CODE_ALPHABET).toHaveLength(32);
+    for (const bad of ['0', 'O', '1', 'I']) expect(INVITE_CODE_ALPHABET).not.toContain(bad);
+    expect(INVITE_CODE_LENGTH).toBe(8);
+  });
+  it('time units', () => {
+    expect(MS_PER_HOUR).toBe(3_600_000);
+    expect(MS_PER_DAY).toBe(24 * MS_PER_HOUR);
+  });
+  it('every sync source names a tie column; messages read the handle-bearing feed', () => {
+    for (const src of [...Object.values(SYNC_SOURCES), OWN_VOTES_SOURCE]) expect(src.tieColumn.length).toBeGreaterThan(0);
+    expect(SYNC_SOURCES.messages.relation).toBe('messages_feed');
+    expect(Object.keys(SYNC_SOURCES).sort()).toEqual(['messages', 'pings']); // no per-vote feed (de-anonymizes voters)
+  });
+  it('Salish bbox mirrors the server box', () => {
+    expect([...SALISH_SEA_BBOX]).toEqual([-124.0, 46.9, -121.9, 49.1]);
+  });
+});
