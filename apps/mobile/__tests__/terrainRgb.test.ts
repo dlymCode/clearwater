@@ -1,4 +1,4 @@
-import { buildInspectReadout, decodeMetaPixel, readoutFromPixels } from '../src/lib/inspect';
+import { buildInspectReadout, decodeMetaPixel, readoutFromFleetPixels, readoutFromPixels } from '../src/lib/inspect';
 import { decodeTerrainRgb, encodeTerrainRgb, lonLatToTilePixel } from '../src/lib/terrainRgb';
 
 describe('decodeTerrainRgb (pipeline contract: standard formula, value is FEET MLLW)', () => {
@@ -111,5 +111,30 @@ describe('inspect readout: never blank', () => {
     const r = readoutFromPixels(null, null, NOW);
     expect(r.hasData).toBe(false);
     expect(r.depth).toBe('unknown');
+  });
+});
+
+describe('fleet inspect (fleet.pmtiles decodes like depth; fleet_meta = boats + newest day)', () => {
+  const day = (iso: string) => Date.parse(iso) / 86_400_000 + 32872;
+  const meta = (boats: number, iso: string, a = 255) => ({ r: boats, g: day(iso) >> 8, b: day(iso) & 255, a });
+  const px = (ft: number) => {
+    const [r, g, b] = encodeTerrainRgb(ft);
+    return { r, g, b, a: 255 };
+  };
+  it('12 ft of water decodes as -12 and reads as 12 ft deep; a drying hump (+2) reads as drying', () => {
+    expect(readoutFromFleetPixels(px(-12), meta(5, '2026-10-08')).depth).toBe('12.0 ft deep (MLLW)');
+    expect(readoutFromFleetPixels(px(2), meta(5, '2026-10-08')).depth).toBe('Dries 2.0 ft above MLLW');
+  });
+  it('boats and newest day come from fleet_meta; < 3 boats is low confidence, >= 3 is not', () => {
+    const ok = readoutFromFleetPixels(px(-12), meta(5, '2026-10-08'));
+    expect(ok).toMatchObject({ boats: '5', newest: '2026-10-08', lowConfidence: false, hasData: true });
+    expect(readoutFromFleetPixels(px(-12), meta(2, '2026-10-08')).lowConfidence).toBe(true);
+    expect(readoutFromFleetPixels(px(-12), meta(3, '2026-10-08')).lowConfidence).toBe(false);
+    expect(readoutFromFleetPixels(px(-12), meta(255, '2026-10-08')).boats).toBe('255+');
+  });
+  it('missing tiles / holes read "unknown", never blank, and unknown boats is not flagged low confidence', () => {
+    const r = readoutFromFleetPixels(null, null);
+    expect(r).toMatchObject({ depth: 'unknown', boats: 'unknown', newest: 'unknown', lowConfidence: false, hasData: false });
+    expect(readoutFromFleetPixels({ r: 0, g: 0, b: 0, a: 255 }, meta(4, '2026-10-08', 0)).boats).toBe('unknown');
   });
 });

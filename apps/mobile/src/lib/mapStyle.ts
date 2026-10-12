@@ -15,15 +15,21 @@
  *  - waterline.pmtiles raster Terrain-RGB for elevation. OPTIONAL. TODO(pipeline): scene-count hatching (MAP-4, n < 5)
  *                   returns when the pipeline ships per-cell counts as a separate archive; today it masks cells with
  *                   fewer than 5 scenes entirely, so there is nothing to hatch.
- *  - fleet.pmtiles  vector, source-layer `fleet` (H3 cell polygons) with properties median_ft, n, boats. OPTIONAL.
+ *  - fleet.pmtiles  raster Terrain-RGB, decoded EXACTLY like depth.pmtiles (feet, positive up): the pipeline negates depth to
+ *                   elevation before encoding, so the same colour ramp applies. OPTIONAL.
+ *  - fleet_meta.pmtiles  per-cell boat count + newest day (RGBA), by path convention, OPTIONAL. Used (a) to wash out cells
+ *                   with fewer than 3 boats (below) and (b) by the fleet inspect popup.
  *
  * Optional products are included only when their URL is passed; the builder never references a source it did not
  * declare, so a missing land / waterline / fleet file cannot break the map.
  */
 import {
   DEPTH_COLOR_RAMP_FT,
+  FLEET_META_BOATS_SHIFT,
   FLEET_MIN_BOATS,
   METERS_PER_FOOT,
+  TERRAIN_RGB_BASE,
+  TERRAIN_RGB_INTERVAL,
   TILE_ZOOM,
 } from '@clearwater/shared';
 
@@ -56,6 +62,8 @@ export interface TileUrls {
   land?: string;
   waterline?: string;
   fleet?: string;
+  /** fleet_meta.pmtiles (optional); drives the low-confidence wash. */
+  fleetMeta?: string;
 }
 
 export interface StyleLayer {
@@ -124,6 +132,9 @@ export function depthLegend(): LegendStop[] {
 
 /** Ramp bands as [deepest..shallowest] depth-ft lower bounds: band d covers depth [d, next deeper-bound). */
 const BAND_EPS = 0.001;
+/** Anything below this decodes from a no-data pixel (RGB 0,0,0 = -10000 ft); real elevations are far above it. */
+const NODATA_BELOW_FT = -5000;
+const TRANSPARENT = 'rgba(0,0,0,0)';
 
 /**
  * color-relief expression over the decoded raster value. The depth tiles carry FEET MLLW (positive up) and
@@ -137,7 +148,12 @@ const BAND_EPS = 0.001;
  */
 export function colorReliefStops(): Array<[number, string]> {
   const ramp = [...DEPTH_COLOR_RAMP_FT].sort((a, b) => b - a); // 40,20,10,6,3,0
-  const stops: Array<[number, string]> = [[-ramp[0]! - 10, RAMP_COLORS[ramp[0] as number] as string]];
+  // No-data decodes to -10000 ft: transparent, so holes stay holes instead of clamping to the deepest colour.
+  const stops: Array<[number, string]> = [
+    [NODATA_BELOW_FT, TRANSPARENT],
+    [NODATA_BELOW_FT + BAND_EPS, RAMP_COLORS[ramp[0] as number] as string],
+    [-ramp[0]! - 10, RAMP_COLORS[ramp[0] as number] as string],
+  ];
   ramp.forEach((d, i) => {
     const color = RAMP_COLORS[d] as string;
     if (i === 0) stops.push([-d, color]); // everything at or below -40 stays deepest
@@ -181,13 +197,10 @@ const vis = (on: boolean): Record<string, unknown> => ({ visibility: on ? 'visib
 export interface BuildOptions {
   /** URL template for locally bundled glyphs (needed for region labels offline). */
   glyphs?: string;
-  /** Image id registered with <Images> for hatching. */
-  hatchImage?: string;
   dark?: boolean;
 }
 
 export function buildMapStyle(urls: TileUrls, toggles: LayerToggles = DEFAULT_TOGGLES, opts: BuildOptions = {}): MapStyleJson {
-  const hatch = opts.hatchImage ?? 'hatch';
   const sources: Record<string, StyleSource> = {
     base: { type: 'vector', url: urls.base, minzoom: TILE_ZOOM.base.min, maxzoom: TILE_ZOOM.base.max },
     depth: {
@@ -211,7 +224,11 @@ export function buildMapStyle(urls: TileUrls, toggles: LayerToggles = DEFAULT_TO
   }
   if (urls.land) sources.land = { type: 'vector', url: urls.land, minzoom: TILE_ZOOM.base.min, maxzoom: TILE_ZOOM.base.max };
   if (urls.fleet) {
-    sources.fleet = { type: 'vector', url: urls.fleet, minzoom: TILE_ZOOM.fleet.min, maxzoom: TILE_ZOOM.fleet.max };
+    sources.fleet = { type: 'raster-dem', url: urls.fleet, encoding: 'mapbox', tileSize: 256, minzoom: TILE_ZOOM.fleet.min, maxzoom: TILE_ZOOM.fleet.max };
+    if (urls.fleetMeta) {
+      // Read as terrain too: code = boats * 65536 + uint16 day, so "boats < 3" is a single elevation threshold.
+      sources.fleet_meta = { type: 'raster-dem', url: urls.fleetMeta, encoding: 'mapbox', tileSize: 256, minzoom: TILE_ZOOM.fleet.min, maxzoom: TILE_ZOOM.fleet.max };
+    }
   }
 
   const bg = opts.dark ? '#0b1620' : '#eef1f2';
@@ -234,27 +251,11 @@ export function buildMapStyle(urls: TileUrls, toggles: LayerToggles = DEFAULT_TO
     layers.push({ id: 'waterline-relief', type: 'color-relief', source: 'waterline', layout: vis(toggles.waterline), paint: { 'color-relief-color': colorReliefExpression(), 'color-relief-opacity': 0.85 } });
   }
   if (urls.fleet) {
-    layers.push(
-      {
-        id: 'fleet-solid',
-        type: 'fill',
-        source: 'fleet',
-        'source-layer': 'fleet',
-        filter: ['>=', ['get', 'boats'], FLEET_MIN_BOATS],
-        layout: vis(toggles.fleet),
-        paint: { 'fill-color': '#7b3fe4', 'fill-opacity': 0.45 },
-      },
-      {
-        // Defense in depth: the pipeline only publishes cells with >= 3 boats, but hatch anything below.
-        id: 'fleet-hatch',
-        type: 'fill',
-        source: 'fleet',
-        'source-layer': 'fleet',
-        filter: ['<', ['get', 'boats'], FLEET_MIN_BOATS],
-        layout: vis(toggles.fleet),
-        paint: { 'fill-pattern': hatch, 'fill-opacity': 0.7 },
-      },
-    );
+    layers.push({ id: 'fleet-relief', type: 'color-relief', source: 'fleet', layout: vis(toggles.fleet), paint: { 'color-relief-color': colorReliefExpression(), 'color-relief-opacity': 0.8 } });
+    if (urls.fleetMeta) {
+      // Defense in depth (the pipeline only publishes cells with >= 3 boats): wash out any cell with fewer.
+      layers.push({ id: 'fleet-lowconf', type: 'color-relief', source: 'fleet_meta', layout: vis(toggles.fleet), paint: { 'color-relief-color': fleetLowConfidenceExpression(), 'color-relief-opacity': 1 } });
+    }
   }
 
   layers.push(
@@ -295,4 +296,46 @@ export function layersForToggle(style: MapStyleJson, toggle: keyof LayerToggles)
     boundaries: ['boundaries', 'boundary-labels'],
   };
   return style.layers.filter((l) => prefixes[toggle].some((p) => l.id.startsWith(p)));
+}
+
+// --- Fleet low-confidence wash ----------------------------------------------------------------------------------------
+/** Washed-out overlay for cells with fewer than FLEET_MIN_BOATS boats (a colour wash: raster data cannot carry a pattern). */
+export const LOW_CONFIDENCE_WASH = 'rgba(245,245,245,0.6)';
+
+/**
+ * color-relief expression for the fleet_meta archive read as Terrain-RGB. Its code is boats * 65536 + uint16 day, so the
+ * decoded value is  -10000 + 0.1 * code  and boats = floor(code / 65536). Cells with 1..FLEET_MIN_BOATS-1 boats fall in
+ * [-10000 + 0.1*65536, -10000 + 0.1*FLEET_MIN_BOATS*65536) = [-3446.4, 9660.8); holes (RGB 0) decode to -10000 and
+ * cells with >= 3 boats are above the upper threshold: both are transparent.
+ */
+export function fleetLowConfidenceExpression(): unknown[] {
+  const lo = TERRAIN_RGB_BASE + TERRAIN_RGB_INTERVAL * FLEET_META_BOATS_SHIFT; // first valid boats=1 value
+  const hi = TERRAIN_RGB_BASE + TERRAIN_RGB_INTERVAL * FLEET_META_BOATS_SHIFT * FLEET_MIN_BOATS;
+  const e = 0.05; // half a code step is 0.05; codes are 0.1 apart
+  return [
+    'interpolate', ['linear'], ['elevation'],
+    lo - 1000, TRANSPARENT,
+    lo - e, TRANSPARENT,
+    lo, LOW_CONFIDENCE_WASH,
+    hi - 0.1, LOW_CONFIDENCE_WASH,
+    hi - e, TRANSPARENT,
+  ];
+}
+
+/** Evaluate which side of the threshold a (boats, day) pixel lands on, the way the expression above does. Tests only. */
+export function fleetPixelIsLowConfidence(boats: number, uint16Day: number): boolean {
+  const v = TERRAIN_RGB_BASE + TERRAIN_RGB_INTERVAL * (boats * FLEET_META_BOATS_SHIFT + uint16Day);
+  const ex = fleetLowConfidenceExpression();
+  const stops: Array<[number, string]> = [];
+  for (let i = 3; i < ex.length; i += 2) stops.push([ex[i] as number, ex[i + 1] as string]);
+  const washed = (c: string) => c === LOW_CONFIDENCE_WASH;
+  if (v <= stops[0]![0]) return washed(stops[0]![1]);
+  for (let i = 1; i < stops.length; i++) {
+    if (v <= stops[i]![0]) {
+      const [v0, c0] = stops[i - 1]!;
+      const [v1, c1] = stops[i]!;
+      return washed(v - v0 < v1 - v ? c0 : c1);
+    }
+  }
+  return washed(stops[stops.length - 1]![1]);
 }

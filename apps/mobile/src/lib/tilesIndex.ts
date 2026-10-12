@@ -3,7 +3,7 @@
  * Shape per docs/AGENT-PLAN.md; JSON Schema lives in pipeline/schemas/tiles_index.schema.json.
  */
 import { isSafeAoiSlug, isSafeSegment, isSafeTilePath } from './downloadVerify';
-import { DEPTH_META_FILENAME, TILE_LAYERS, type TileLayer, type TilesIndex, type TilesIndexAoi, type TilesIndexFile } from '@clearwater/shared';
+import { DEPTH_META_FILENAME, FLEET_META_FILENAME, TILE_LAYERS, type TileLayer, type TilesIndex, type TilesIndexAoi, type TilesIndexFile } from '@clearwater/shared';
 
 /** Layers needed for the map to be usable offline; waterline and fleet are optional extras. */
 export const REQUIRED_LAYERS: readonly TileLayer[] = ['base', 'depth'];
@@ -206,4 +206,12 @@ export function landPath(entry: TilesIndexAoi): string | null {
   if (!base) return null;
   const slash = base.lastIndexOf('/');
   return `${slash >= 0 ? base.slice(0, slash + 1) : ''}${LAND_FILENAME}`;
+}
+
+/** fleet_meta.pmtiles (boats per cell + newest day) sits next to fleet.pmtiles; only when the fleet product exists (bytes > 0). */
+export function fleetMetaPath(entry: TilesIndexAoi): string | null {
+  const f = entry.files.fleet;
+  if (!f || f.bytes <= 0) return null;
+  const slash = f.path.lastIndexOf('/');
+  return `${slash >= 0 ? f.path.slice(0, slash + 1) : ''}${FLEET_META_FILENAME}`;
 }

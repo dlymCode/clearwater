@@ -1,6 +1,6 @@
 /**
  * Tap-to-inspect pixel sampling. MapLibre RN cannot read raster values, so the app reads the tile bytes from
- * the local PMTiles files itself (depth.pmtiles for elevation, depth_meta.pmtiles for source/date/uncertainty),
+ * the local PMTiles files itself (depth.pmtiles / fleet.pmtiles for elevation, depth_meta.pmtiles for source/date/uncertainty, fleet_meta.pmtiles for boats/day),
  * decodes the PNG and returns the pixel under the tap. Decoding then goes through lib/inspect.ts.
  *
  * STUB: needs (a) a PMTiles reader that works on a local file (the `pmtiles` JS package with a FileSource over
@@ -11,7 +11,7 @@ import type { RgbaPixel } from '../lib/inspect';
 import { lonLatToTilePixel } from '../lib/terrainRgb';
 
 export interface TileSampler {
-  sample(archive: 'depth' | 'depth_meta', lon: number, lat: number, zoom: number): Promise<RgbaPixel | null>;
+  sample(archive: 'depth' | 'depth_meta' | 'fleet' | 'fleet_meta', lon: number, lat: number, zoom: number): Promise<RgbaPixel | null>;
 }
 
 export const stubTileSampler: TileSampler = {

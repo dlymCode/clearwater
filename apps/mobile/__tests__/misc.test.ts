@@ -1,6 +1,6 @@
 import { haversineM, roundPosition } from '../src/lib/geo';
 import { checkInviteCode, inviteStatusText, isInviteExpired, isValidInviteCode, normalizeInviteCode } from '../src/lib/groups';
-import { buildMapStyle, colorReliefExpression, depthLegend, DEFAULT_TOGGLES, layersForToggle, rampColorAtDepth } from '../src/lib/mapStyle';
+import { buildMapStyle, colorReliefExpression, depthLegend, DEFAULT_TOGGLES, fleetLowConfidenceExpression, fleetPixelIsLowConfidence, layersForToggle, rampColorAtDepth } from '../src/lib/mapStyle';
 import {
   buildMessagePayload,
   buildPingPayload,
@@ -160,11 +160,8 @@ describe('mapStyle', () => {
     expect(stops).toContain(-40);
     expect(stops).toContain(0);
   });
-  it('fleet hatch is for <3 boats; no waterline hatch until the pipeline ships counts (TODO)', () => {
-    const s = buildMapStyle(urls);
-    expect(s.layers.find((l) => l.id === 'waterline-hatch')).toBeUndefined();
-    expect(s.layers.find((l) => l.id === 'fleet-hatch')!.filter).toEqual(['<', ['get', 'boats'], 3]);
-    expect(s.layers.find((l) => l.id === 'fleet-solid')!.filter).toEqual(['>=', ['get', 'boats'], 3]);
+  it('no waterline hatch until the pipeline ships counts (TODO)', () => {
+    expect(buildMapStyle(urls).layers.find((l) => l.id === 'waterline-hatch')).toBeUndefined();
   });
   it('toggles control visibility; optional layers are omitted without URLs', () => {
     const off = buildMapStyle(urls, { ...DEFAULT_TOGGLES, waterline: false, fleet: false });
@@ -211,6 +208,48 @@ describe('mapStyle', () => {
     expect(withLand.sources.land).toMatchObject({ type: 'vector', url: 'pmtiles://land' });
     expect(withLand.layers.find((l) => l.id === 'land')!.source).toBe('land');
     expect(buildMapStyle(urls).layers.some((l) => l.id === 'land')).toBe(false);
+  });
+  it('fleet.pmtiles is raster Terrain-RGB decoded like depth: same ramp, no vector layers, no-data transparent', () => {
+    const style = buildMapStyle({ ...urls, fleetMeta: 'pmtiles://fleet_meta' });
+    expect(style.sources.fleet).toMatchObject({ type: 'raster-dem', encoding: 'mapbox', url: 'pmtiles://fleet' });
+    expect(style.sources.fleet_meta).toMatchObject({ type: 'raster-dem', encoding: 'mapbox', url: 'pmtiles://fleet_meta' });
+    const relief = style.layers.find((l) => l.id === 'fleet-relief')!;
+    expect(relief.type).toBe('color-relief');
+    expect(relief.paint!['color-relief-color']).toEqual(colorReliefExpression());
+    expect(style.layers.some((l) => l.id === 'fleet-hatch' || l.id === 'fleet-solid')).toBe(false);
+  });
+  it('fleet_meta is optional: without it there is a fleet layer but no low-confidence wash', () => {
+    const style = buildMapStyle(urls);
+    expect(style.layers.some((l) => l.id === 'fleet-relief')).toBe(true);
+    expect(style.layers.some((l) => l.id === 'fleet-lowconf')).toBe(false);
+    expect(style.sources.fleet_meta).toBeUndefined();
+    const withMeta = buildMapStyle({ ...urls, fleetMeta: 'pmtiles://m' });
+    expect(withMeta.layers.find((l) => l.id === 'fleet-lowconf')!.source).toBe('fleet_meta');
+  });
+  it('fleet layers follow the Fleet toggle and every fleet layer references a declared source', () => {
+    const off = buildMapStyle({ ...urls, fleetMeta: 'pmtiles://m' }, { ...DEFAULT_TOGGLES, fleet: false });
+    const fl = layersForToggle(off, 'fleet');
+    expect(fl.map((l) => l.id).sort()).toEqual(['fleet-lowconf', 'fleet-relief']);
+    for (const l of fl) expect(l.layout!.visibility).toBe('none');
+    for (const l of fl) expect(Object.keys(off.sources)).toContain(l.source);
+  });
+  it('low-confidence wash keys on boats < 3 via the meta archive code (boats*65536 + day), holes and >=3 boats stay clear', () => {
+    const day = 46_300; // ~ Oct 2026 as uint16 days since 1880
+    expect(fleetPixelIsLowConfidence(1, day)).toBe(true);
+    expect(fleetPixelIsLowConfidence(2, day)).toBe(true);
+    expect(fleetPixelIsLowConfidence(2, 65535)).toBe(true); // top of the 2-boat range
+    expect(fleetPixelIsLowConfidence(1, 0)).toBe(true); // bottom of the 1-boat range
+    expect(fleetPixelIsLowConfidence(3, 0)).toBe(false);
+    expect(fleetPixelIsLowConfidence(3, day)).toBe(false);
+    expect(fleetPixelIsLowConfidence(255, day)).toBe(false);
+    expect(fleetPixelIsLowConfidence(0, 0)).toBe(false); // hole: RGB 0 decodes to -10000
+    const ex = fleetLowConfidenceExpression();
+    const stops = ex.slice(3).filter((_, i) => i % 2 === 0) as number[];
+    expect([...stops].sort((a, b) => a - b)).toEqual(stops);
+  });
+  it('no-data (-10000 ft) is transparent in the depth ramp instead of clamping to the deepest colour', () => {
+    expect(colorReliefExpression()[3]).toBeLessThan(-1000);
+    expect(colorReliefExpression()[4]).toBe('rgba(0,0,0,0)');
   });
   it('hillshade exaggeration is scaled by 0.3048 because the tiles are feet', () => {
     const s = buildMapStyle(urls);

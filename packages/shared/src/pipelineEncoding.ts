@@ -52,3 +52,30 @@ export const META_DATE_EPOCH_SHIFT_DAYS = 32872;
  * tiles/index.json): tiles/<aoi>/<version>/depth_meta.pmtiles
  */
 export const DEPTH_META_FILENAME = 'depth_meta.pmtiles';
+
+/**
+ * fleet.pmtiles is Terrain-RGB with the SAME decoder as depth.pmtiles (feet, positive up): the pipeline NEGATES depth to
+ * elevation before encoding (12 ft of water decodes as -12; a drying hump at depth -2 decodes as +2). The charted depth
+ * to display is therefore -decoded, exactly as for the baseline.
+ *
+ * Per-cell boat count and freshness ship as a SEPARATE raster archive by path convention (not in tiles/index.json),
+ * tiles/<aoi>/<version>/fleet_meta.pmtiles. MIRROR of pipeline/tiles.py pack_fleet_meta / unpack_fleet_meta (source of
+ * truth): R = distinct-boat count clamped to 255; G,B = big-endian uint16 days since 1880-01-01 of the newest contributing
+ * day (same epoch as depth_meta); A = 255 valid / 0 hole (alpha is only a validity flag).
+ */
+export const FLEET_META_FILENAME = 'fleet_meta.pmtiles';
+export const FLEET_META_MAX_BOATS = 255;
+/** R sits above the 16 date bits, so a Terrain-RGB read of this archive has code = boats * 65536 + uint16 day. */
+export const FLEET_META_BOATS_SHIFT = 65536;
+
+export interface FleetMeta {
+  boats: number;
+  /** Newest contributing UTC day, days since 1970-01-01. */
+  newestDay1970: number;
+}
+
+/** null for holes (alpha != 255). */
+export function decodeFleetMetaPixel(r: number, g: number, b: number, a: number): FleetMeta | null {
+  if (a !== 255) return null;
+  return { boats: r, newestDay1970: g * 256 + b - META_DATE_EPOCH_SHIFT_DAYS };
+}

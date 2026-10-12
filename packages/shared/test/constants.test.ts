@@ -93,3 +93,22 @@ describe('shared additions', () => {
     expect([...SALISH_SEA_BBOX]).toEqual([-124.0, 46.9, -121.9, 49.1]);
   });
 });
+
+import { FLEET_META_BOATS_SHIFT, FLEET_META_FILENAME, decodeFleetMetaPixel } from '../src';
+
+describe('fleet_meta decode (mirror of pipeline/tiles.py pack_fleet_meta)', () => {
+  const d16 = (iso: string) => Date.parse(iso) / 86_400_000 + META_DATE_EPOCH_SHIFT_DAYS;
+  it('R = boats, GB = days since 1880, A = 255 valid', () => {
+    const v = d16('2026-10-08');
+    expect(decodeFleetMetaPixel(4, v >> 8, v & 255, 255)).toEqual({ boats: 4, newestDay1970: Date.parse('2026-10-08') / 86_400_000 });
+    expect(decodeFleetMetaPixel(255, 0, 0, 255)!.boats).toBe(255);
+  });
+  it('holes (alpha 0) decode to null', () => {
+    expect(decodeFleetMetaPixel(0, 0, 0, 0)).toBeNull();
+    expect(decodeFleetMetaPixel(3, 100, 100, 254)).toBeNull();
+  });
+  it('constants', () => {
+    expect(FLEET_META_FILENAME).toBe('fleet_meta.pmtiles');
+    expect(FLEET_META_BOATS_SHIFT).toBe(65536);
+  });
+});

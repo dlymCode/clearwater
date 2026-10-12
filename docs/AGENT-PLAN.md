@@ -176,19 +176,25 @@ Last-known position: rounded to 100 m, ≤ every 5 min, foreground only, retaine
    baseline rasters are elevation, positive up — any comparison (the server 15 ft hold
    rule, bias flags) must negate one side: `baseline_depth_ft = -merged_elev_ft`.
 5. **Client reads go through views, not tables** (secrecy): pings via `ping_feed`
-   (exposes `author_reputation`, `received_at`; author identity masked when anonymous;
-   direct `select author_id from pings` is 42501 by design — never `RETURNING *` on
-   insert), votes via `ping_votes_feed` with exactly
-   `(ping_id, vote, created_at, voter_reputation, weight)` — `weight` is the
-   server-precomputed w(d); voter identity and distance are never exposed. Own votes
-   reconcile from `ping_votes` where `voter_id = auth.uid()`. Sync cursor columns:
-   `ping_feed.updated_at`, `ping_votes_feed.created_at`, `messages.received_at`.
-6. **Votes**: clients enqueue optimistically; the server-side `cast_vote` RPC rejects
-   ineligible confirms (>500 m / >24 h) with PT403 codes the client swallows silently;
-   PT429 means retry later.
-7. **Score decay origin** (both scorers): t0 = `least(created_at, received_at)`;
-   local unsynced pings use `created_at`. Compare implementations with 1e-12 tolerance
-   (Postgres/V8 differ by 1 ulp).
+   (unique `id`, `author_reputation`, `received_at`, author identity masked when
+   anonymous; direct `select author_id from pings` is 42501 by design — never
+   `RETURNING *` on insert); messages via `messages_feed` (unique `id`,
+   `author_handle`, `received_at`). **Per-vote data never leaves the server**:
+   `ping_feed` carries `vote_sum` (Σ R_i·v_i·w(d_i), quantized to 0.25 server-side),
+   `last_confirmed_at`, `confirm_count`, `dispute_count` (future-dated votes excluded;
+   counts only weight > 0). A vote bumps `pings.updated_at` so cursor sync re-pulls.
+   Own votes reconcile from `ping_votes` where `voter_id = auth.uid()`.
+   Sync cursors are keyset pairs: `(updated_at, id)` on ping_feed,
+   `(received_at, id)` on messages_feed, `(created_at, ping_id)` on own votes.
+6. **Votes**: clients enqueue optimistically; `cast_vote` rejects with clean codes —
+   silently swallowed by clients: 403 `confirm_ineligible`, 403 `cannot_vote_own_ping`,
+   404 `ping_not_found`; PT429 = retry later; `account_revoked` = surfaced auth state.
+7. **Score** (both scorers, exact parity):
+   `S = R_a · (1 + vote_sum) · exp(−λ·(now − max(t0, last_confirmed_at)))` with
+   t0 = `least(created_at, received_at)`; local unsynced pings use `created_at`;
+   missing `author_reputation`/`vote_sum` → fall back to the server's cached `score`
+   decayed from `updated_at`, never a bare 1.0. Compare implementations with 1e-12
+   tolerance (Postgres/V8 differ by 1 ulp).
 8. **Positions**: written only via `report_position(p_lat, p_lon)` RPC (validates the
    Salish Sea bbox, snaps to 100 m, silent no-op inside the 5-min window).
 9. **Groups**: `join_group(p_code)` returns the group id, or NULL for a bad/expired/
@@ -197,9 +203,30 @@ Last-known position: rounded to 100 m, ≤ every 5 min, foreground only, retaine
 10. **Tides**: pipeline publishes `tides/<station_id>.json` (flat, unversioned, daily
     overwrite, includes station lat/lon); the tile-auth worker signs that path shape.
 11. **Depth trust deviations from the PRD** (deliberate, flagged to owner): hold-rule
-    corroboration requires the other boat's median within 5 ft; per-boat aggregate
-    weight capped at `least(n, 100)`; one row per (uploader_hash, cell_id, day) with
-    upsert-replace.
+    corroboration requires the other boat's median AND p10 within 5 ft; per-boat
+    aggregate weight capped at `least(n, 100)`; one row per (uploader_hash, cell_id,
+    day) with upsert-replace — correct because **each device upload is the complete
+    UTC-day aggregate per touched cell** (device re-aggregates all of the day's stored
+    soundings); CHECK p10_ft ≤ median_ft, both within ±2000 ft.
+12. **Fleet tiles** (nightly `pipeline/fleet_tiles.py`): only cells with ≥3 boats in
+    the last 90 days; `fleet.pmtiles` is Terrain-RGB of ELEVATION (depth negated), same
+    decoder as depth. `fleet_meta.pmtiles` sits beside it by convention (not in the
+    index): R = boats (clamped 255), G,B = newest contributing day uint16 since
+    1880-01-01, A = 255 valid / 0 hole. Source of truth `pipeline/tiles.py`
+    pack_fleet_meta, mirrored in `packages/shared`.
+13. **Baseline loader** (`pipeline/load_baseline.py`, gated by the same validation
+    report as publish): upserts (cell_id, baseline_elev_ft positive-up, source_date)
+    to `baseline_cells` via Supabase REST; the server negates when comparing.
+14. **Groups/profiles**: `join_group` returns the group id or NULL (bad/expired code —
+    no error, so the attempt throttle counts); invite codes are owner-only via
+    `get_invite_code`/`rotate_invite_code` (one-row table of invite_code,
+    invite_expires_at); codes rotate automatically on owner removal; charset
+    [A-HJ-NP-Z2-9]. A profiles row is auto-created on auth signup (trigger) and
+    completed at onboarding; writes are blocked client-side until the profile exists.
+15. **Paths the worker signs**: `tiles/<aoi>/<version>/*.pmtiles` (version segments
+    may contain `:` — ISO timestamps), `tiles/index.json`, `tides/<station>.json`;
+    companion files by convention: `depth_meta.pmtiles`, `fleet_meta.pmtiles`,
+    `land.pmtiles` (OSM, always its own archive — ODbL isolation).
 
 ## Definition of done per part
 

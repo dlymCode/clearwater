@@ -5,12 +5,14 @@
  * Terrain-RGB pixel (terrainRgb.ts).
  */
 import {
+  FLEET_MIN_BOATS,
   META_DATE_EPOCH_SHIFT_DAYS,
   MS_PER_DAY,
   SOURCE_LABELS_BY_CODE,
   UNC_LEVELS_FT,
   UNC_OPEN_ENDED_INDEX,
   UNKNOWN_UNC_INDEX,
+  decodeFleetMetaPixel,
 } from '@clearwater/shared';
 import { decodeTerrainRgb } from './terrainRgb';
 
@@ -114,4 +116,34 @@ export function readoutFromPixels(
   const elevationFt = terrain ? decodeTerrainRgb(terrain.r, terrain.g, terrain.b, terrain.a) : null;
   const m = meta ? decodeMetaPixel(meta) : { sourceCode: null, dateDays1970: null, uncertaintyFt: null, uncertaintyOpenEnded: false };
   return buildInspectReadout({ elevationFt, ...m }, nowMs);
+}
+
+// --- Fleet layer ------------------------------------------------------------------------------------------------------
+
+export interface FleetReadout {
+  /** Charted depth from fleet.pmtiles (decoded like depth.pmtiles, then negated to depth), or "unknown". */
+  depth: string;
+  boats: string;
+  newest: string;
+  /** Fewer than FLEET_MIN_BOATS contributing boats: shown as low confidence (and washed out on the map). */
+  lowConfidence: boolean;
+  hasData: boolean;
+}
+
+/**
+ * Fleet inspect: elevation from the fleet Terrain-RGB pixel (same decoder as depth; 12 ft of water decodes as -12) and
+ * boat count + newest day from the fleet_meta pixel. Anything missing reads "unknown", never blank.
+ */
+export function readoutFromFleetPixels(terrain: RgbaPixel | null, meta: RgbaPixel | null): FleetReadout {
+  const elevationFt = terrain ? decodeTerrainRgb(terrain.r, terrain.g, terrain.b, terrain.a) : null;
+  const m = meta ? decodeFleetMetaPixel(meta.r, meta.g, meta.b, meta.a) : null;
+  const depth =
+    elevationFt === null ? UNKNOWN : elevationFt > 0 ? `Dries ${elevationFt.toFixed(1)} ft above MLLW` : `${(-elevationFt).toFixed(1)} ft deep (MLLW)`;
+  return {
+    depth,
+    boats: m ? `${m.boats}${m.boats >= 255 ? '+' : ''}` : UNKNOWN,
+    newest: m ? formatDateDays(m.newestDay1970) : UNKNOWN,
+    lowConfidence: m !== null && m.boats < FLEET_MIN_BOATS,
+    hasData: elevationFt !== null,
+  };
 }

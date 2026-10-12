@@ -1,10 +1,10 @@
 import { Modal, Text, View } from 'react-native';
 import { Button } from '../components/Button';
 import { s, useColors } from '../components/theme';
-import type { InspectReadout } from '../lib/inspect';
+import type { FleetReadout, InspectReadout } from '../lib/inspect';
 
 /** MAP-3: depth, source, date, uncertainty. Every field is a non-empty string ("unknown" when absent). */
-export function InspectPopup({ readout, region, onClose }: { readout: InspectReadout | null; region: string | null; onClose: () => void }) {
+export function InspectPopup({ readout, fleet, region, onClose }: { readout: InspectReadout | null; fleet: FleetReadout | null; region: string | null; onClose: () => void }) {
   const c = useColors();
   if (!readout) return null;
   const rows: Array<[string, string]> = [
@@ -23,6 +23,13 @@ export function InspectPopup({ readout, region, onClose }: { readout: InspectRea
               <Text style={[s.h2, { color: c.text }]}>{v}</Text>
             </View>
           ))}
+          {fleet ? (
+            <View>
+              <Text style={[s.small, { color: c.sub }]}>Fleet layer</Text>
+              <Text style={[s.h2, { color: c.text }]}>{`${fleet.depth} · ${fleet.boats} boats · newest ${fleet.newest}`}</Text>
+              {fleet.lowConfidence ? <Text style={[s.body, { color: c.warn }]}>Low confidence: fewer than 3 boats contributed.</Text> : null}
+            </View>
+          ) : null}
           {readout.old ? <Text style={[s.body, { color: c.warn }]}>This data is more than 10 years old.</Text> : null}
           {region ? <Text style={[s.body, { color: c.text }]}>{region}</Text> : null}
           <Button label="Close" kind="secondary" onPress={onClose} />

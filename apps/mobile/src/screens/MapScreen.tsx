@@ -1,4 +1,4 @@
-import { Camera, Images, Map, Marker, type MapRef, type StyleSpecification } from '@maplibre/maplibre-react-native';
+import { Camera, Map, Marker, type MapRef, type StyleSpecification } from '@maplibre/maplibre-react-native';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { NativeSyntheticEvent } from 'react-native';
 import { Pressable, Text, View } from 'react-native';
@@ -10,7 +10,7 @@ import { DepthNumeral } from '../components/DepthNumeral';
 import { PingDetail } from '../components/PingDetail';
 import { s, useColors } from '../components/theme';
 import { haversineM, isGpsStale, shouldRender } from '../lib/geo';
-import { readoutFromPixels, type InspectReadout } from '../lib/inspect';
+import { readoutFromFleetPixels, readoutFromPixels, type FleetReadout, type InspectReadout } from '../lib/inspect';
 import { buildMapStyle, type LayerToggles } from '../lib/mapStyle';
 import { normalizePingRow, optimisticVote, visiblePings, buildVotePayload, voteAvailability, type ScoredPing } from '../lib/pingModel';
 import { canWrite } from '../lib/profile';
@@ -60,6 +60,7 @@ export function MapScreen() {
   const [shownGps, setShownGps] = useState(gps);
   const lastRender = useRef(0);
   const [readout, setReadout] = useState<InspectReadout | null>(null);
+  const [fleetReadout, setFleetReadout] = useState<FleetReadout | null>(null);
   const [regionText, setRegionText] = useState<string | null>(null);
   const [pingSheet, setPingSheet] = useState(false);
   const [placed, setPlaced] = useState<{ lat: number; lon: number } | null>(null);
@@ -107,9 +108,9 @@ export function MapScreen() {
         ...(installed.companions?.includes('land') ? { land: f('land.pmtiles') } : {}),
         ...(has('waterline') ? { waterline: f('waterline.pmtiles') } : {}),
         ...(has('fleet') ? { fleet: f('fleet.pmtiles') } : {}),
+        ...(has('fleet') && installed.companions?.includes('fleet_meta') ? { fleetMeta: f('fleet_meta.pmtiles') } : {}),
       },
       settings.toggles,
-      { hatchImage: 'hatch' },
     ) as unknown as StyleSpecification;
   }, [installed, settings.toggles]);
 
@@ -122,9 +123,18 @@ export function MapScreen() {
         stubTileSampler.sample('depth_meta', lon, lat, zoom),
       ]);
       setReadout(readoutFromPixels(terrain, meta, Date.now()));
+      if (settings.toggles.fleet && (installed?.layers ?? []).includes('fleet')) {
+        const [ft, fm] = await Promise.all([
+          stubTileSampler.sample('fleet', lon, lat, zoom),
+          stubTileSampler.sample('fleet_meta', lon, lat, zoom),
+        ]);
+        setFleetReadout(readoutFromFleetPixels(ft, fm));
+      } else {
+        setFleetReadout(null);
+      }
       setRegionText(safeRegionReadout({ lat, lon }, regions)?.text ?? null);
     },
-    [regions],
+    [regions, installed, settings.toggles.fleet],
   );
 
   async function vote(pingId: string, v: 1 | -1) {
@@ -147,7 +157,6 @@ export function MapScreen() {
     <View style={{ flex: 1, backgroundColor: c.bg }}>
       {style ? (
         <Map ref={mapRef} style={{ flex: 1 }} mapStyle={style} onPress={(e) => void onPress(e as NativeSyntheticEvent<{ lngLat: [number, number] }>)} onLongPress={(e) => setPlaced({ lat: e.nativeEvent.lngLat[1], lon: e.nativeEvent.lngLat[0] })}>
-          <Images images={{ hatch: require('../../assets/hatch.png') }} />
           <Camera initialViewState={{ center: [-122.45, 48.3], zoom: 11 }} minZoom={8} maxZoom={16} />
           {shownGps ? (
             <Marker id="me" lngLat={[shownGps.lon, shownGps.lat]}>
@@ -197,7 +206,7 @@ export function MapScreen() {
         <NotForNavigationLine />
       </View>
 
-      <InspectPopup readout={readout} region={regionText} onClose={() => setReadout(null)} />
+      <InspectPopup readout={readout} fleet={fleetReadout} region={regionText} onClose={() => { setReadout(null); setFleetReadout(null); }} />
       <PingSheet
         visible={pingSheet}
         position={placed ?? here}

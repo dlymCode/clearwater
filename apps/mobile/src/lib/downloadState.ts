@@ -5,15 +5,15 @@
  */
 import type { TileLayer } from '@clearwater/shared';
 import type { TilesIndexAoi } from '@clearwater/shared';
-import { depthMetaPath, landPath, layersToDownload, type InstalledAoi } from './tilesIndex';
+import { depthMetaPath, fleetMetaPath, landPath, layersToDownload, type InstalledAoi } from './tilesIndex';
 
 /**
  * Companion files by path convention (not in index.json; sizes unknown, listed with 0 bytes): `depth_meta` goes with
- * `depth`, `land` (OSM) with `base`. They are OPTIONAL: a 400/404 means the pipeline has not built them, and the map
+ * `depth`, `fleet_meta` with `fleet`, `land` (OSM) with `base`. They are OPTIONAL: a 400/404 means the pipeline has not built them, and the map
  * simply runs without them.
  */
-export type DownloadLayer = TileLayer | 'depth_meta' | 'land';
-export const COMPANION_LAYERS: readonly DownloadLayer[] = ['depth_meta', 'land'];
+export type DownloadLayer = TileLayer | 'depth_meta' | 'land' | 'fleet_meta';
+export const COMPANION_LAYERS: readonly DownloadLayer[] = ['depth_meta', 'land', 'fleet_meta'];
 
 export type FileStatus = 'pending' | 'partial' | 'done' | 'failed' | 'absent';
 
@@ -48,6 +48,10 @@ export function createJob(
   const meta = depthMetaPath(entry);
   if (meta && files.some((f) => f.layer === 'depth')) {
     files.push({ layer: 'depth_meta', path: meta, bytes: 0, status: 'pending', bytesDone: 0 });
+  }
+  const fleetMeta = fleetMetaPath(entry);
+  if (fleetMeta && files.some((f) => f.layer === 'fleet')) {
+    files.push({ layer: 'fleet_meta', path: fleetMeta, bytes: 0, status: 'pending', bytesDone: 0 });
   }
   const land = landPath(entry);
   if (land && files.some((f) => f.layer === 'base')) {

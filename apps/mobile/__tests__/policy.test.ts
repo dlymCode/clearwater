@@ -39,12 +39,21 @@ describe('position reporter policy', () => {
 
 describe('download job: optional companions', () => {
   const e: TilesIndexAoi = { aoi: 'skagit', version: 'v', files: { base: { path: 'tiles/skagit/v/base.pmtiles', bytes: 40 }, depth: { path: 'tiles/skagit/v/depth.pmtiles', bytes: 120 } } };
+  it('fleet_meta rides with the fleet layer only when fleet exists (bytes > 0)', () => {
+    const withFleet: TilesIndexAoi = { ...e, files: { ...e.files, fleet: { path: 'tiles/skagit/v/fleet.pmtiles', bytes: 10 } } };
+    const j = createJob(withFleet, ['base', 'depth', 'fleet'], undefined, 0);
+    expect(j.files.find((f) => f.layer === 'fleet_meta')!.path).toBe('tiles/skagit/v/fleet_meta.pmtiles');
+    expect(j.files.find((f) => f.layer === 'fleet_meta')!.bytes).toBe(0);
+    expect(createJob(e, ['base', 'depth', 'fleet'], undefined, 0).files.some((f) => f.layer === 'fleet_meta')).toBe(false);
+    const zero: TilesIndexAoi = { ...e, files: { ...e.files, fleet: { path: 'tiles/skagit/v/fleet.pmtiles', bytes: 0 } } };
+    expect(createJob(zero, ['base', 'depth', 'fleet'], undefined, 0).files.some((f) => f.layer === 'fleet_meta')).toBe(false);
+  });
   it('an absent companion (400/404) completes the job without it and never counts as failed', () => {
     let j = createJob(e, ['base', 'depth'], undefined, 0);
     j = markDone(markDone(j, 'base'), 'depth');
     expect(isComplete(j)).toBe(false); // companions still pending
     j = markAbsent(markAbsent(j, 'depth_meta'), 'land');
-    expect(isComplete(j)).toBe(true);
+    expect(isComplete(j)).toBe(true); // fleet_meta absent too would also complete
     expect(nextFile(j)).toBeNull();
     expect(totals(j).totalBytes).toBe(160);
   });

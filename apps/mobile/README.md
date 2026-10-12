@@ -42,15 +42,22 @@ contract is tested with a fake server).
 | `tilesIndex.ts`, `downloadState.ts`, `downloadVerify.ts` | tiles/index.json parsing (lenient, path-safe), sizes, version diff, resumable job state (optional companions), download + path verification |
 | `terrainRgb.ts`, `inspect.ts` | Terrain-RGB (feet) + depth_meta pixel decode, never-blank inspect readout |
 | `region.ts` | Point-in-polygon => "Region 2E"; `safeRegionReadout` never throws |
-| `mapStyle.ts` | MapLibre style JSON: hard-band ramp matching the legend, toggles, fleet hatching, optional sources |
+| `mapStyle.ts` | MapLibre style JSON: hard-band ramp matching the legend (no-data transparent), toggles, fleet raster + low-confidence wash, optional sources |
 | `groups.ts`, `profile.ts`, `settings.ts`, `positionReport.ts`, `retention.ts`, `geo.ts`, `uuid.ts`, `mutex.ts`, `http.ts`, `num.ts` | Invite codes, profile capture + write gate, settings, position-report policy, local retention cutoffs, geometry, ids, async mutex, `retryableStatus`, `round2` |
 
 ## Value conventions (read before touching depth / score code)
 
 * Terrain-RGB depth tiles are **feet MLLW, positive up** (`elev_ft = -10000 + 0.1*(R*65536 + G*256 + B)`; RGB 0,0,0 = no data).
   MapLibre assumes metres, so colour-ramp stops are raw feet and hillshade exaggeration is scaled by `METERS_PER_FOOT`.
+* **`fleet.pmtiles` is raster Terrain-RGB decoded exactly like `depth.pmtiles`** (feet, positive up). The pipeline negates depth to
+  elevation before encoding, so 12 ft of water decodes as -12 and a drying hump at depth -2 decodes as +2; the map uses the same ramp and
+  the popup shows depth = -decoded. **`fleet_meta.pmtiles`** (by path convention, not in `index.json`): R = boats (clamped 255), G/B =
+  newest contributing day as uint16 days since 1880-01-01, A = 255 valid / 0 hole (`decodeFleetMetaPixel` in shared mirrors
+  `pipeline/tiles.py` `pack_fleet_meta`). Cells with fewer than 3 boats are washed out on the map: the meta archive is read as terrain
+  (code = boats*65536 + day) and one elevation threshold selects `boats < 3`; raster data cannot carry a hatch pattern, so this is a
+  colour wash, not stripes. The fleet inspect popup shows depth, boat count and newest day from the two archives.
 * Per-cell source/date/uncertainty is `tiles/<aoi>/<version>/depth_meta.pmtiles` and OSM land is `.../land.pmtiles`; neither is
-  in `index.json`. Both are optional companions: a 400/404 marks them absent and the map runs without them. Encodings
+  in `index.json`. All companions (`depth_meta`, `land`, `fleet_meta`) are optional: a 400/404 marks them absent and the map runs without them. Encodings
   mirror `pipeline/common.py` / `pipeline/tiles.py` in `packages/shared/src/pipelineEncoding.ts`.
 * An index file entry with `bytes == 0` means "not available yet" and is treated as absent. Index paths are validated
   (`tiles/<aoi>/<version>/<file>.(pmtiles|geojson|json)`, safe segments) before they can touch the filesystem.
@@ -93,7 +100,7 @@ Run `npx expo prebuild` / `eas build` (EAS project, Apple Developer account, bun
 | --- | --- |
 | `services/tileSampler.ts` | **Stub**: returns null, so tap-to-inspect shows "unknown". Needs a PMTiles local-file reader + PNG decoder (lib decode is done and tested). |
 | `services/regions.ts` | Reads `regions.geojson` from the AOI folder; the pipeline does not produce WDFW/WAC polygons yet, so the readout shows nothing until it does. Property names: `region_id`, `kind`. |
-| Waterline hatching (MAP-4) | **TODO(pipeline)**: needs a per-cell scene count as its own archive (a PMTiles file holds one tile type); today the pipeline masks cells with < 5 scenes entirely. Fleet hatch (`boats < 3`) assumes a vector `fleet` layer with `boats`. |
+| Waterline hatching (MAP-4) | **TODO(pipeline)**: needs a per-cell scene count as its own archive (a PMTiles file holds one tile type); today the pipeline masks cells with < 5 scenes entirely. Fleet: see the contract above (`fleet.pmtiles` + `fleet_meta.pmtiles`). |
 | Base-layer source-layer names | `DEPARE, DEPCNT, SOUNDG, COALNE, BOYLAT, LIGHTS, OBSTRN, WRECKS, CBLSUB, boundaries` in `base.pmtiles`; `land` in `land.pmtiles`. Region labels need local glyphs (`glyphs` option) for offline text; not bundled. |
 | `services/downloads.ts` | File-level resume works; a file killed mid-flight restarts from byte 0. No background continuation. |
 | Sync triggers | Foreground, connectivity, auth and a 15 min timer only; no OS background task. `flush` sends one batch per kind per pass (loop until empty for long backlogs). |
@@ -127,5 +134,4 @@ src/services   NMEA socket, GPS, SQLCipher, Supabase, sync, downloads, depth log
 src/screens    Map, Ping sheet, Inspect, Tide, Download, Groups, Channel, Settings, Onboarding, Auth, Profile
 src/components Button, Banner, DepthLegend, DepthNumeral, PingDetail, theme
 src/state      Zustand store
-assets/hatch.png  hatching pattern for low-confidence cells
 ```
